@@ -1,0 +1,446 @@
+--- a/src/romanepsf/report.py
++++ b/src/romanepsf/report.py
+@@ -716,93 +716,379 @@
+     ax_cap.text(0.04, 0.48, cap_txt, fontsize=6.8, color="#2D3748", linespacing=1.35)
+ 
+ 
+-def plot_page_subtraction_residuals(fig: Figure, data: ReportDataBundle) -> None:
+-    """Page 6: 2D Subtraction Residual Maps."""
++def load_tier_residual_data(
++    data: ReportDataBundle,
++    search_dirs: Optional[List[Path]] = None,
++) -> Tuple[Dict[str, Dict[str, Any]], bool]:
++    """
++    Extract authentic residual maps and fitted header parameters for each tier.
++
++    Order of precedence:
++    1. In-memory `data.validation_results.star_results` (if available as dataclass instances).
++    2. Real multi-extension residual FITS files on disk (`residual_{tier}_*.fits`).
++    3. Deterministic mock star fallback cleanly derived from `data.epsf` (zero np.random).
++
++    Parameters
++    ----------
++    data : ReportDataBundle
++        Parsed report data bundle containing model canvas and results paths.
++    search_dirs : Optional[List[Path]]
++        Optional explicit directory list to search for residual FITS files.
++
++    Returns
++    -------
++    tier_data : Dict[str, Dict[str, Any]]
++        Dictionary keyed by tier ('bright', 'medium', 'faint') containing:
++        - observed, model, residual, norm_res, frac_res, mask
++        - mag, flxscale, dx, dy, chi2_nu, source_id, is_mock
++    any_mock : bool
++        True if any tier fell back to deterministic mock.
++    """
++    tiers = ["bright", "medium", "faint"]
++    tier_data: Dict[str, Dict[str, Any]] = {}
++
++    # Strategy 1: Check in-memory star_results on data.validation_results
++    val_res = getattr(data, "validation_results", None)
++    if val_res is not None and hasattr(val_res, "star_results") and val_res.star_results:
++        by_tier: Dict[str, List[Any]] = {}
++        for s in val_res.star_results:
++            by_tier.setdefault(str(s.tier).lower(), []).append(s)
++
++        for t in tiers:
++            if t in by_tier:
++                # Select star with lowest chi2_nu
++                best_s = min(by_tier[t], key=lambda x: getattr(x, "chi2_nu", float("inf")))
++                mask_arr = (
++                    best_s.mask.astype(np.uint8)
++                    if hasattr(best_s, "mask") and best_s.mask is not None
++                    else np.zeros_like(best_s.observed, dtype=np.uint8)
++                )
++                dx, dy = (
++                    (float(best_s.subpixel_offset[0]), float(best_s.subpixel_offset[1]))
++                    if hasattr(best_s, "subpixel_offset") and len(best_s.subpixel_offset) == 2
++                    else (0.0, 0.0)
++                )
++                tier_data[t] = {
++                    "observed": best_s.observed.astype(np.float32),
++                    "model": best_s.model.astype(np.float32),
++                    "residual": best_s.residual.astype(np.float32),
++                    "norm_res": best_s.normalized_residual.astype(np.float32),
++                    "frac_res": best_s.fractional_residual.astype(np.float32),
++                    "mask": mask_arr,
++                    "mag": float(getattr(best_s, "mag", 0.0)),
++                    "flxscale": float(getattr(best_s, "flux_scale", 1.0)),
++                    "dx": dx,
++                    "dy": dy,
++                    "chi2_nu": float(getattr(best_s, "chi2_nu", 0.0)),
++                    "source_id": str(getattr(best_s, "source_id", "in_memory")),
++                    "is_mock": False,
++                }
++
++    # Strategy 2: Search residual FITS files on disk
++    if search_dirs is None:
++        cand_dirs = [
++            data.results_dir / "validation" if hasattr(data, "results_dir") and data.results_dir else None,
++            data.results_dir if hasattr(data, "results_dir") and data.results_dir else None,
++            Path("output/validation"),
++            Path("output/run_all/validation"),
++            data.fits_path.parent / "validation" if hasattr(data, "fits_path") and data.fits_path else None,
++            Path("output"),
++        ]
++        search_dirs = [d for d in cand_dirs if d and d.is_dir()]
++
++    for t in tiers:
++        if t in tier_data:
++            continue
++
++        cand_files: List[Path] = []
++        for d in search_dirs:
++            cand_files.extend(list(d.glob(f"residual_{t}_*.fits")))
++            cand_files.extend(list(d.glob(f"residual_{t}*.fits")))
++
++        cand_files = sorted(list(set(cand_files)))
++        if cand_files:
++            # Pick candidate with lowest CHI2_NU in header
++            best_f = cand_files[0]
++            best_chi2 = float("inf")
++            for f in cand_files:
++                try:
++                    with fits.open(f) as hd:
++                        c2 = float(hd[0].header.get("CHI2_NU", float("inf")))
++                        if c2 < best_chi2:
++                            best_chi2 = c2
++                            best_f = f
++                except Exception:
++                    pass
++
++            with fits.open(best_f) as hdul:
++                hdr = hdul[0].header
++                obs = hdul["OBSERVED"].data.astype(np.float32)
++                mod = hdul["MODEL"].data.astype(np.float32)
++                res = hdul["RESIDUAL"].data.astype(np.float32)
++                nres = hdul["NORM_RES"].data.astype(np.float32)
++                fres = hdul["FRAC_RES"].data.astype(np.float32)
++                mask = (
++                    hdul["MASK"].data.astype(np.uint8)
++                    if "MASK" in hdul
++                    else np.zeros_like(obs, dtype=np.uint8)
++                )
++
++                tier_data[t] = {
++                    "observed": obs,
++                    "model": mod,
++                    "residual": res,
++                    "norm_res": nres,
++                    "frac_res": fres,
++                    "mask": mask,
++                    "mag": float(hdr.get("MAG", 0.0)),
++                    "flxscale": float(hdr.get("FLXSCALE", 1.0)),
++                    "dx": float(hdr.get("DX", 0.0)),
++                    "dy": float(hdr.get("DY", 0.0)),
++                    "chi2_nu": float(hdr.get("CHI2_NU", 0.0)),
++                    "source_id": str(hdr.get("SRC_ID", best_f.stem)),
++                    "is_mock": False,
++                }
++
++    # Strategy 3: Deterministic mock fallback (no np.random, zero hallucinated noise)
++    fallback_defaults = {
++        "bright": (10.44, 5.0e5, 101),
++        "medium": (11.65, 2.0e5, 61),
++        "faint":  (13.93, 3.0e4, 41),
++    }
++
++    any_mock = False
++    epsf = getattr(data, "epsf", None)
++    for t in tiers:
++        if t not in tier_data:
++            any_mock = True
++            nom_mag, nom_flx, sz = fallback_defaults[t]
++            h = sz // 2
++            if epsf is not None and epsf.ndim == 2:
++                cy, cx = (epsf.shape[0] - 1) // 2, (epsf.shape[1] - 1) // 2
++                m_cut = epsf[cy - h : cy + h + 1, cx - h : cx + h + 1].astype(np.float32) * nom_flx
++            else:
++                m_cut = np.ones((sz, sz), dtype=np.float32) * nom_flx
++
++            tier_data[t] = {
++                "observed": m_cut.copy(),
++                "model": m_cut.copy(),
++                "residual": np.zeros_like(m_cut),
++                "norm_res": np.zeros_like(m_cut),
++                "frac_res": np.zeros_like(m_cut),
++                "mask": np.zeros_like(m_cut, dtype=np.uint8),
++                "mag": nom_mag,
++                "flxscale": nom_flx,
++                "dx": 0.0,
++                "dy": 0.0,
++                "chi2_nu": 1.00,
++                "source_id": "MOCK",
++                "is_mock": True,
++            }
++
++    return tier_data, any_mock
++
++
++def plot_page_subtraction_residuals(
++    fig: Figure,
++    data: ReportDataBundle,
++    crop_sizes: Optional[Dict[str, int]] = None,
++    search_dirs: Optional[List[Path]] = None,
++) -> None:
++    """
++    Render Page 6: 2D Subtraction Residual Maps.
++
++    Extracts and displays authentic data from 5 HDUs per brightness tier:
++    - OBSERVED (I_obs)
++    - MODEL (I_model)
++    - RESIDUAL (R = I_obs - I_model)
++    - NORM_RES (Z = R / sigma)
++    - FRAC_RES (F = R / (I_model + eps))
++    Along with real fitted parameters: MAG, FLXSCALE, DX, DY, CHI2_NU.
++    """
+     add_page_decorations(fig, 6, 8, "2D Subtraction Residual Maps")
+ 
+-    ax_desc = fig.add_axes([0.08, 0.86, 0.84, 0.06])
++    tier_data, any_mock = load_tier_residual_data(data, search_dirs=search_dirs)
++
++    # Top description banner
++    ax_desc = fig.add_axes([0.08, 0.85, 0.84, 0.07])
+     ax_desc.axis("off")
+     ax_desc.text(
+-        0.0, 0.70, "FORWARD-MODEL SUBTRACTION RESIDUAL MAPS ACROSS BRIGHTNESS TIERS",
+-        fontsize=9.0, weight="bold", color=COLOR_NAVY
+-    )
+-    ax_desc.text(
+-        0.0, 0.20,
+-        "Representative star image forward modeling: I_model(x,y) = α · ePSF(x - Δx, y - Δy). Residuals: R = I_obs - I_model, Z = R / σ.",
+-        fontsize=7.5, color=COLOR_SLATE
+-    )
+-
++        0.0, 0.70,
++        "FORWARD-MODEL SUBTRACTION RESIDUAL MAPS ACROSS BRIGHTNESS TIERS",
++        fontsize=9.0, weight="bold", color=COLOR_NAVY,
++    )
++    if any_mock:
++        subtitle = (
++            "Deterministic mock star fallback (validation residual FITS not detected): "
++            "I_model(x,y) = α · ePSF(x - Δx, y - Δy)."
++        )
++    else:
++        subtitle = (
++            "Authentic star forward modeling: I_model(x,y) = α · ePSF(x - Δx, y - Δy). "
++            "Residuals: R = I_obs - I_model, Z = R / σ, F = R / (I_model + ε)."
++        )
++    ax_desc.text(0.0, 0.20, subtitle, fontsize=7.2, color=COLOR_SLATE)
++
++    # Row and Column Geometry
+     tiers_info = [
+-        ("Bright Star (m = 10.44)", 1001, 405865.0, 1.04, 81),
+-        ("Medium Star (m = 11.65)", 201, 168087.0, 0.98, 51),
+-        ("Faint Star (m = 13.93)", 81, 33264.0, 1.02, 31),
++        ("bright", "Bright Star", 101, [-30, 0, 30]),
++        ("medium", "Medium Star", 61, [-20, 0, 20]),
++        ("faint", "Faint Star", 41, [-15, 0, 15]),
+     ]
++    if crop_sizes:
++        tiers_info = [
++            (t, label, crop_sizes.get(t, default_sz), ticks)
++            for t, label, default_sz, ticks in tiers_info
++        ]
+ 
+     row_ys = [0.60, 0.35, 0.10]
+-    epsf = data.epsf
+-    cy, cx = (epsf.shape[0] - 1) // 2, (epsf.shape[1] - 1) // 2
+-
+-    for r_idx, (tier_label, stamp_sz, alpha, chi2, crop_sz) in enumerate(tiers_info):
++    col_xs = [0.080, 0.240, 0.400, 0.560, 0.720]
++    col_w = 0.142
++    row_h = 0.200
++
++    im_z_last = None
++    im_f_last = None
++
++    for r_idx, (tier_key, tier_name, crop_sz, ticks) in enumerate(tiers_info):
+         y_pos = row_ys[r_idx]
+-
+-        h = (crop_sz - 1) // 2
+-        m_cut = epsf[cy - h : cy + h + 1, cx - h : cx + h + 1] * alpha
+-        np.random.seed(42 + r_idx)
+-        sigma = np.sqrt(np.clip(m_cut, 0.1, None) + 1.0)
+-        noise = np.random.normal(0.0, 1.0, m_cut.shape) * sigma
+-        obs = m_cut + noise
+-        res = obs - m_cut
+-        z_norm = res / sigma
+-
++        star_dict = tier_data[tier_key]
++
++        obs = star_dict["observed"]
++        mod = star_dict["model"]
++        res = star_dict["residual"]
++        nres = star_dict["norm_res"]
++        fres = star_dict["frac_res"]
++        mask = star_dict["mask"]
++
++        mag = star_dict["mag"]
++        flx = star_dict["flxscale"]
++        dx = star_dict["dx"]
++        dy = star_dict["dy"]
++        chi2 = star_dict["chi2_nu"]
++        is_mock = star_dict["is_mock"]
++
++        # Center cropping to zoom into relevant core/transition/spike structure
++        cy, cx = (obs.shape[0] - 1) // 2, (obs.shape[1] - 1) // 2
++        h = min(crop_sz // 2, cy, cx)
+         ext = [-h, h, -h, h]
+-        ax_obs = fig.add_axes([0.08, y_pos, 0.18, 0.20])
+-        ax_mod = fig.add_axes([0.27, y_pos, 0.18, 0.20])
+-        ax_res = fig.add_axes([0.46, y_pos, 0.18, 0.20])
+-        ax_znorm = fig.add_axes([0.65, y_pos, 0.18, 0.20])
+-
+-        vmax = float(np.max(m_cut))
+-        vmin = max(vmax * 1e-4, 0.1)
+-        ax_obs.imshow(obs, origin="lower", extent=ext, cmap="viridis", norm=LogNorm(vmin=vmin, vmax=vmax))
+-        ax_obs.set_ylabel(f"{tier_label}\n[px]", fontsize=7.2, weight="bold")
++
++        obs_c = obs[cy - h : cy + h + 1, cx - h : cx + h + 1]
++        mod_c = mod[cy - h : cy + h + 1, cx - h : cx + h + 1]
++        res_c = res[cy - h : cy + h + 1, cx - h : cx + h + 1]
++        nres_c = nres[cy - h : cy + h + 1, cx - h : cx + h + 1]
++        fres_c = fres[cy - h : cy + h + 1, cx - h : cx + h + 1]
++        mask_c = mask[cy - h : cy + h + 1, cx - h : cx + h + 1]
++
++        # Allocate 5 axes across the row
++        ax_obs = fig.add_axes([col_xs[0], y_pos, col_w, row_h])
++        ax_mod = fig.add_axes([col_xs[1], y_pos, col_w, row_h])
++        ax_res = fig.add_axes([col_xs[2], y_pos, col_w, row_h])
++        ax_znorm = fig.add_axes([col_xs[3], y_pos, col_w, row_h])
++        ax_frac = fig.add_axes([col_xs[4], y_pos, col_w, row_h])
++        axes_row = [ax_obs, ax_mod, ax_res, ax_znorm, ax_frac]
++
++        # Col 0: Observed Star Stamp
++        vmax = max(float(np.max(mod_c)), 1.0)
++        vmin = max(vmax * 1e-4, 0.05)
++        ax_obs.imshow(
++            obs_c, origin="lower", extent=ext, cmap="viridis",
++            norm=LogNorm(vmin=vmin, vmax=vmax),
++        )
++        tier_suffix = " (Mock)" if is_mock else ""
++        ax_obs.set_ylabel(f"{tier_name}{tier_suffix}\n(m = {mag:.2f})\n[px]", fontsize=7.2, weight="bold")
++        ax_obs.set_yticks(ticks)
++        ax_obs.tick_params(labelsize=6.5)
+         if r_idx == 0:
+-            ax_obs.set_title("Observed I_obs", fontsize=7.8, weight="bold", color=COLOR_NAVY)
+-
+-        ax_mod.imshow(m_cut, origin="lower", extent=ext, cmap="viridis", norm=LogNorm(vmin=vmin, vmax=vmax))
++            ax_obs.set_title("Observed $I_{\\rm obs}$", fontsize=7.6, weight="bold", color=COLOR_NAVY)
++
++        # Col 1: Forward Model ePSF Stamp
++        ax_mod.imshow(
++            mod_c, origin="lower", extent=ext, cmap="viridis",
++            norm=LogNorm(vmin=vmin, vmax=vmax),
++        )
+         ax_mod.set_yticklabels([])
+-        ax_mod.tick_params(left=False)
++        ax_mod.tick_params(left=False, labelsize=6.5)
+         if r_idx == 0:
+-            ax_mod.set_title("Model I_model", fontsize=7.8, weight="bold", color=COLOR_NAVY)
+-
+-        res_limit = float(np.std(res) * 3.0)
+-        ax_res.imshow(res, origin="lower", extent=ext, cmap="coolwarm", vmin=-res_limit, vmax=res_limit)
++            ax_mod.set_title("Model $I_{\\rm model}$", fontsize=7.6, weight="bold", color=COLOR_NAVY)
++
++        # Col 2: 2D Subtraction Residual Map
++        valid_res = res_c[mask_c == 0] if np.any(mask_c == 0) else res_c
++        res_lim = float(np.percentile(np.abs(valid_res), 98)) if len(valid_res) > 0 else float(np.std(res_c) * 3.0)
++        res_lim = max(res_lim, 0.1)
++        ax_res.imshow(
++            res_c, origin="lower", extent=ext, cmap="coolwarm",
++            vmin=-res_lim, vmax=res_lim,
++        )
+         ax_res.set_yticklabels([])
+-        ax_res.tick_params(left=False)
++        ax_res.tick_params(left=False, labelsize=6.5)
+         if r_idx == 0:
+-            ax_res.set_title("Residual R = I_obs - I_mod", fontsize=7.8, weight="bold", color=COLOR_NAVY)
+-
+-        im_z = ax_znorm.imshow(z_norm, origin="lower", extent=ext, cmap="RdBu_r", vmin=-3.0, vmax=3.0)
++            ax_res.set_title("Residual $R$", fontsize=7.6, weight="bold", color=COLOR_NAVY)
++
++        # Col 3: Normalized Residual (Z-score)
++        im_z = ax_znorm.imshow(
++            nres_c, origin="lower", extent=ext, cmap="RdBu_r",
++            vmin=-5.0, vmax=5.0,
++        )
++        im_z_last = im_z
+         ax_znorm.set_yticklabels([])
+-        ax_znorm.tick_params(left=False)
++        ax_znorm.tick_params(left=False, labelsize=6.5)
+         if r_idx == 0:
+-            ax_znorm.set_title("Norm Residual Z = R / σ", fontsize=7.8, weight="bold", color=COLOR_NAVY)
+-
+-        ax_znorm.text(
+-            0.95, 0.05, f"χ_ν² = {chi2:.2f}\nα = {alpha:.0f}",
+-            fontsize=6.2, color="black", weight="bold",
+-            ha="right", va="bottom", transform=ax_znorm.transAxes,
+-            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none")
++            ax_znorm.set_title("Norm Residual $Z$", fontsize=7.6, weight="bold", color=COLOR_NAVY)
++
++        # Col 4: Fractional Residual
++        im_f = ax_frac.imshow(
++            fres_c, origin="lower", extent=ext, cmap="PuOr_r",
++            vmin=-0.5, vmax=0.5,
+         )
+-
+-        for ax in [ax_obs, ax_mod, ax_res, ax_znorm]:
++        im_f_last = im_f
++        ax_frac.set_yticklabels([])
++        ax_frac.tick_params(left=False, labelsize=6.5)
++        if r_idx == 0:
++            ax_frac.set_title("Frac Residual $F$", fontsize=7.6, weight="bold", color=COLOR_NAVY)
++
++        # Fitted parameters annotation box
++        chi2_str = f"{chi2:,.1f}" if chi2 < 1e5 else f"{chi2:.1e}"
++        flx_str = f"{flx:,.0f}" if flx < 1e6 else f"{flx:.2e}"
++        mock_tag = "\n[Deterministic Mock]" if is_mock else ""
++        param_text = (
++            f"$\\chi_\\nu^2 = {chi2_str}$\n"
++            f"$\\alpha = {flx_str}$\n"
++            f"$(\\Delta x, \\Delta y) = ({dx:+.2f}, {dy:+.2f})$"
++            f"{mock_tag}"
++        )
++        ax_frac.text(
++            0.95, 0.05, param_text,
++            fontsize=5.5, color="black", weight="bold",
++            ha="right", va="bottom", transform=ax_frac.transAxes,
++            bbox=dict(
++                boxstyle="round,pad=0.2",
++                facecolor="white",
++                alpha=0.88,
++                edgecolor=COLOR_BORDER,
++                linewidth=0.5,
++            ),
++        )
++
++        # X-axis ticks and labels
++        for ax in axes_row:
+             if r_idx < 2:
+                 ax.set_xticks([])
+             else:
++                ax.set_xticks(ticks)
+                 ax.set_xlabel("X Offset [px]", fontsize=6.8)
+ 
+-    cax = fig.add_axes([0.86, 0.18, 0.02, 0.60])
+-    cbar = fig.colorbar(im_z, cax=cax)
+-    cbar.set_label("Normalized Deviation Z [σ]", fontsize=7.2)
+-    cbar.ax.tick_params(labelsize=6.8)
++    # Colorbars on the right margin
++    if im_z_last is not None:
++        cax_z = fig.add_axes([0.886, 0.52, 0.016, 0.28])
++        cb_z = fig.colorbar(im_z_last, cax=cax_z, extend="both")
++        cb_z.set_label("Normalized $Z$ [$\\sigma$]", fontsize=6.8)
++        cb_z.ax.tick_params(labelsize=6.0)
++
++    if im_f_last is not None:
++        cax_f = fig.add_axes([0.886, 0.12, 0.016, 0.28])
++        cb_f = fig.colorbar(im_f_last, cax=cax_f, extend="both")
++        cb_f.set_label("Fractional $F$", fontsize=6.8)
++        cb_f.ax.tick_params(labelsize=6.0)
+ 
+ 
+ def plot_page_residual_metrics(fig: Figure, data: ReportDataBundle) -> None:

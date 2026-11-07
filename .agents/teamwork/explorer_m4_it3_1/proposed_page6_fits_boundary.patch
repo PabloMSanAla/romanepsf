@@ -1,0 +1,90 @@
+--- a/src/romanepsf/report.py
++++ b/src/romanepsf/report.py
+@@ -16,6 +16,7 @@
+ import os
+ import re
+ import glob
++import logging
+ import warnings
+ from pathlib import Path
+ from typing import Any, Dict, List, Optional, Tuple, Union
+@@ -34,6 +35,8 @@
+ from romanepsf import __version__
+ from romanepsf.config import Config, load_config
+ from romanepsf.masking import get_theoretical_spike_angles
++
++logger = logging.getLogger("romanepsf.report")
+ 
+ # Publication styling defaults
+ FONT_FAMILY = "sans-serif"
+@@ -871,34 +874,42 @@
+                 except Exception:
+                     pass
+ 
+-            with fits.open(best_f) as hdul:
+-                hdr = hdul[0].header
+-                obs = hdul["OBSERVED"].data.astype(np.float32)
+-                mod = hdul["MODEL"].data.astype(np.float32)
+-                res = hdul["RESIDUAL"].data.astype(np.float32)
+-                nres = hdul["NORM_RES"].data.astype(np.float32)
+-                fres = hdul["FRAC_RES"].data.astype(np.float32)
+-                mask = (
+-                    hdul["MASK"].data.astype(np.uint8)
+-                    if "MASK" in hdul
+-                    else np.zeros_like(obs, dtype=np.uint8)
+-                )
+-
+-                tier_data[t] = {
+-                    "observed": obs,
+-                    "model": mod,
+-                    "residual": res,
+-                    "norm_res": nres,
+-                    "frac_res": fres,
+-                    "mask": mask,
+-                    "mag": float(hdr.get("MAG", 0.0)),
+-                    "flxscale": float(hdr.get("FLXSCALE", 1.0)),
+-                    "dx": float(hdr.get("DX", 0.0)),
+-                    "dy": float(hdr.get("DY", 0.0)),
+-                    "chi2_nu": float(hdr.get("CHI2_NU", 0.0)),
+-                    "source_id": str(hdr.get("SRC_ID", best_f.stem)),
+-                    "is_mock": False,
+-                }
++            try:
++                with fits.open(best_f) as hdul:
++                    hdr = hdul[0].header
++                    obs = hdul["OBSERVED"].data.astype(np.float32)
++                    mod = hdul["MODEL"].data.astype(np.float32)
++                    res = hdul["RESIDUAL"].data.astype(np.float32)
++                    nres = hdul["NORM_RES"].data.astype(np.float32)
++                    fres = hdul["FRAC_RES"].data.astype(np.float32)
++                    mask = (
++                        hdul["MASK"].data.astype(np.uint8)
++                        if "MASK" in hdul
++                        else np.zeros_like(obs, dtype=np.uint8)
++                    )
++
++                    tier_data[t] = {
++                        "observed": obs,
++                        "model": mod,
++                        "residual": res,
++                        "norm_res": nres,
++                        "frac_res": fres,
++                        "mask": mask,
++                        "mag": float(hdr.get("MAG", 0.0)),
++                        "flxscale": float(hdr.get("FLXSCALE", 1.0)),
++                        "dx": float(hdr.get("DX", 0.0)),
++                        "dy": float(hdr.get("DY", 0.0)),
++                        "chi2_nu": float(hdr.get("CHI2_NU", 0.0)),
++                        "source_id": str(hdr.get("SRC_ID", best_f.stem)),
++                        "is_mock": False,
++                    }
++            except (OSError, KeyError, Exception) as exc:
++                logger.warning(
++                    "Failed to ingest residual FITS %s for tier '%s': %s. Falling back to deterministic mock.",
++                    best_f,
++                    t,
++                    exc,
++                )
+ 
+     # Strategy 3: Deterministic mock fallback (no np.random, zero hallucinated noise)
+     fallback_defaults = {

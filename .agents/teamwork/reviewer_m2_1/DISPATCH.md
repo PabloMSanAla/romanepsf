@@ -1,0 +1,20 @@
+## 2026-11-06T10:48:30Z
+You are Reviewer 1 for Milestone 2 (reviewer_m2_1).
+Your working directory is: /Users/pmsanch1/code/romanepsf/.agents/teamwork/reviewer_m2_1
+
+MANDATORY: First read the authoritative user request:
+/Users/pmsanch1/code/romanepsf/.agents/teamwork/ORIGINAL_REQUEST.md
+
+Next, read:
+- /Users/pmsanch1/code/romanepsf/.agents/teamwork/PROJECT.md (Milestone 2, Features 9-19)
+- /Users/pmsanch1/code/romanepsf/.agents/teamwork/worker_m2_1/handoff.md
+- /Users/pmsanch1/code/romanepsf/.agents/teamwork/TEST_READY.md
+
+Review all Milestone 2 code implementations:
+- `src/romanepsf/stamps.py`, `masking.py`, `profile.py`, `assembly.py` and top-level wrappers under `src/`
+- Unit tests: `tests/unit/test_stamps.py`, `test_masking.py`, `test_profile.py`, `test_assembly.py`
+Run builds and tests with /Users/pmsanch1/miniforge3/envs/rosalia-dev/bin/python:
+- `pytest tests/unit/ -v`
+- `pytest tests/e2e/ -v`
+Verify code quality, interface contracts, error handling, and lack of regressions.
+State your explicit gate verdict (APPROVE or REQUEST_CHANGES) in `/Users/pmsanch1/code/romanepsf/.agents/teamwork/reviewer_m2_1/handoff.md` and notify the parent orchestrator via send_message.

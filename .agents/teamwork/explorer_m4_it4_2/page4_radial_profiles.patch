@@ -1,0 +1,31 @@
+--- a/src/romanepsf/report.py
++++ b/src/romanepsf/report.py
+@@ -588,11 +588,12 @@
+ 
+     if not data.radial_profiles.empty and "RADIUS_PX" in data.radial_profiles:
+         df_p = data.radial_profiles
+-        r_px = df_p["RADIUS_PX"].values
+-        f_comp = df_p["FLUX_COMPOSITE"].values
+-        f_faint = df_p.get("FLUX_FAINT", pd.Series(np.nan)).values
+-        f_med = df_p.get("FLUX_MED_SCALED", pd.Series(np.nan)).values
+-        f_bright = df_p.get("FLUX_BRIGHT_SCALED", pd.Series(np.nan)).values
++        r_px = pd.to_numeric(df_p["RADIUS_PX"], errors="coerce").to_numpy(dtype=float)
++        n_r = len(r_px)
++        f_comp = pd.to_numeric(df_p["FLUX_COMPOSITE"], errors="coerce").to_numpy(dtype=float) if "FLUX_COMPOSITE" in df_p else np.full(n_r, np.nan)
++        f_faint = pd.to_numeric(df_p["FLUX_FAINT"], errors="coerce").to_numpy(dtype=float) if "FLUX_FAINT" in df_p else np.full(n_r, np.nan)
++        f_med = pd.to_numeric(df_p["FLUX_MED_SCALED"], errors="coerce").to_numpy(dtype=float) if "FLUX_MED_SCALED" in df_p else np.full(n_r, np.nan)
++        f_bright = pd.to_numeric(df_p["FLUX_BRIGHT_SCALED"], errors="coerce").to_numpy(dtype=float) if "FLUX_BRIGHT_SCALED" in df_p else np.full(n_r, np.nan)
+     else:
+         r_px = np.logspace(0, 2.7, 300)
+         f_comp = 0.06 / (1.0 + (r_px / 2.5)**2)**1.3
+@@ -605,8 +606,8 @@
+     mask_b = (r_px >= 20.0) & (f_bright > 0)
+ 
+     ax_prof.plot(r_px[mask_f], f_faint[mask_f], color=COLOR_BLUE, alpha=0.7, linestyle="--", linewidth=1.4, label="Faint Tier (Core r < 8 px)")
+-    ax_prof.plot(r_px[mask_m], f_med[mask_m], color=COLOR_AMBER, alpha=0.7, linestyle="-.", linewidth=1.4, label=f"Medium Tier (Scaled k_FM={data.header.get('SCALE_FM', 0.1937):.4f})")
+-    ax_prof.plot(r_px[mask_b], f_bright[mask_b], color=COLOR_CRIMSON, alpha=0.6, linestyle=":", linewidth=1.4, label=f"Bright Tier (Scaled k_MB={data.header.get('SCALE_MB', 0.0255):.4f})")
++    ax_prof.plot(r_px[mask_m], f_med[mask_m], color=COLOR_AMBER, alpha=0.7, linestyle="-.", linewidth=1.4, label=f"Medium Tier (Scaled k_FM={float(data.header.get('SCALE_FM') or 0.1937):.4f})")
++    ax_prof.plot(r_px[mask_b], f_bright[mask_b], color=COLOR_CRIMSON, alpha=0.6, linestyle=":", linewidth=1.4, label=f"Bright Tier (Scaled k_MB={float(data.header.get('SCALE_MB') or 0.0255):.4f})")
+     ax_prof.plot(r_px, f_comp, color="#1A202C", linewidth=2.0, label="Composite Extended PSF (Unit Flux)")
+ 
+     ax_prof.axvline(8.0, color=COLOR_AMBER, linestyle=":", linewidth=1.2)

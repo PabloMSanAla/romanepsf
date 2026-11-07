@@ -1,0 +1,578 @@
+"""
+Stellar Catalog Ingestion, Astrometric Projection, Centroid Refinement, and Multi-Tier Partitioning.
+
+Handles precomputed and queried catalogs for the Roman Space Telescope WFI:
+- Column deduplication and sanitization (fixing phot_g_mean_mag_AB vs phot_g_mean_mag collisions)
+- Astrometric projection with mandatory forward roundtrip WCS verification (Delta theta < 0.5'')
+- Subpixel centroid refinement via background-subtracted first moments with divergence guarding
+- Pairwise Moffat extension isolation filtering (depth 28 mag/arcsec^2, safety factor 1.3)
+- Multi-tier classification (Bright < 11.0, Medium 11.0-13.0, Faint >= 13.0) using F146 mag_lambda
+"""
+
+from pathlib import Path
+from typing import Optional, Tuple, Union
+import numpy as np
+import pandas as pd
+from astroquery.gaia import Gaia
+
+try:
+    from romanepsf.loader import RomanL2Data
+    from romanepsf.profile import get_psf_extension_moffat
+except ImportError:
+    from src.loader import RomanL2Data
+    from src.profile import get_psf_extension_moffat
+
+
+def sanitize_source_catalog(
+    df: pd.DataFrame,
+    mag_col: str = "mag_lambda",
+) -> pd.DataFrame:
+    """
+    Sanitize and deduplicate source catalog columns and rows.
+
+    Fixes the duplicate column collision between `phot_g_mean_mag_AB` and `phot_g_mean_mag`.
+    Filters out non-stellar solar system objects (e.g. Sun, Moon, planets) with negative
+    magnitudes or non-numeric/NaN coordinates.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw input catalog DataFrame.
+    mag_col : str, default "mag_lambda"
+        Primary magnitude column to validate.
+
+    Returns
+    -------
+    pd.DataFrame
+        Sanitized DataFrame with unique columns and valid stellar objects.
+    """
+    clean_df = df.copy()
+
+    # 1. Resolve duplicate column names if already duplicated in memory
+    if clean_df.columns.has_duplicates:
+        clean_df = clean_df.loc[:, ~clean_df.columns.duplicated()].copy()
+
+    # 2. Fix phot_g_mean_mag_AB vs phot_g_mean_mag renaming without collision
+    has_g = "phot_g_mean_mag" in clean_df.columns
+    has_g_ab = "phot_g_mean_mag_AB" in clean_df.columns
+
+    if has_g_ab and not has_g:
+        clean_df = clean_df.rename(columns={"phot_g_mean_mag_AB": "phot_g_mean_mag"})
+    elif has_g_ab and has_g:
+        # Both exist: keep phot_g_mean_mag as standard, leave phot_g_mean_mag_AB untouched
+        pass
+
+    # 3. Ensure mandatory astrometric columns exist
+    if "ra" not in clean_df.columns or "dec" not in clean_df.columns:
+        raise ValueError("Source catalog must contain 'ra' and 'dec' coordinate columns.")
+
+    clean_df["ra"] = pd.to_numeric(clean_df["ra"], errors="coerce")
+    clean_df["dec"] = pd.to_numeric(clean_df["dec"], errors="coerce")
+
+    # Filter out invalid coordinates
+    valid_coords = (
+        clean_df["ra"].notna()
+        & clean_df["dec"].notna()
+        & np.isfinite(clean_df["ra"])
+        & np.isfinite(clean_df["dec"])
+        & (clean_df["ra"] >= 0.0)
+        & (clean_df["ra"] <= 360.0)
+        & (clean_df["dec"] >= -90.0)
+        & (clean_df["dec"] <= 90.0)
+    )
+    clean_df = clean_df[valid_coords].copy()
+
+    # 4. Validate magnitude column and filter out unphysical solar system objects (mag < 0)
+    if mag_col in clean_df.columns:
+        clean_df[mag_col] = pd.to_numeric(clean_df[mag_col], errors="coerce")
+        # Commissioning catalog contains Sun (mag=-26.9), Moon (-4.7), Earth (-9.3)
+        valid_mag = clean_df[mag_col].notna() & np.isfinite(clean_df[mag_col]) & (clean_df[mag_col] >= 0.0)
+        clean_df = clean_df[valid_mag].copy()
+
+    if "phot_g_mean_mag" in clean_df.columns:
+        clean_df["phot_g_mean_mag"] = pd.to_numeric(clean_df["phot_g_mean_mag"], errors="coerce")
+
+    # 5. Drop duplicate source_id if present
+    if "source_id" in clean_df.columns:
+        clean_df = clean_df.drop_duplicates(subset=["source_id"]).copy()
+
+    return clean_df.reset_index(drop=True)
+
+
+def get_detector_sky_bounds(
+    l2_data: RomanL2Data,
+    margin_deg: float = 0.02,
+) -> Tuple[float, float, float, float, float, float, float]:
+    """
+    Compute RA/Dec center and bounding box for the detector active science area.
+
+    Parameters
+    ----------
+    l2_data : RomanL2Data
+        Calibrated detector data container with GWCS.
+    margin_deg : float, default 0.02
+        Angular margin in degrees added to detector boundary box.
+
+    Returns
+    -------
+    Tuple[float, float, float, float, float, float, float]
+        (ra_cen, dec_cen, radius_deg, ra_min, ra_max, dec_min, dec_max)
+    """
+    wcs = l2_data.wcs
+    ny, nx = l2_data.data.shape
+
+    # Sample corners, edge midpoints, and center
+    pts_x = [0.0, float(nx - 1), float(nx - 1), 0.0, float(nx / 2.0)]
+    pts_y = [0.0, 0.0, float(ny - 1), float(ny - 1), float(ny / 2.0)]
+
+    ras, decs = [], []
+    for px, py in zip(pts_x, pts_y):
+        r, d = wcs(px, py)
+        ras.append(float(r))
+        decs.append(float(d))
+
+    ra_cen, dec_cen = float(wcs(nx / 2.0, ny / 2.0)[0]), float(wcs(nx / 2.0, ny / 2.0)[1])
+    # Approximate radius: 4088 px * 0.11" / 3600 ~ 0.125 deg; add margin -> ~0.16 deg
+    diag_deg = np.hypot(max(ras) - min(ras), max(decs) - min(decs))
+    radius_deg = (diag_deg / 2.0) + margin_deg
+
+    return (
+        ra_cen,
+        dec_cen,
+        radius_deg,
+        min(ras) - margin_deg,
+        max(ras) + margin_deg,
+        min(decs) - margin_deg,
+        max(decs) + margin_deg,
+    )
+
+
+def query_gaia_for_detector(
+    l2_data: RomanL2Data,
+    mag_limit: float = 20.0,
+    cache_dir: Optional[Union[str, Path]] = "cache",
+    precomputed_catalog: Optional[Union[str, Path]] = None,
+    mag_col: str = "mag_lambda",
+) -> pd.DataFrame:
+    """
+    Fetch stellar catalog for the detector field of view with disk caching.
+
+    Parameters
+    ----------
+    l2_data : RomanL2Data
+        Calibrated detector dataset.
+    mag_limit : float, default 20.0
+        Faintest magnitude threshold to include.
+    cache_dir : str or Path, optional
+        Directory to store cached query results.
+    precomputed_catalog : str or Path, optional
+        Path to an existing CSV file (e.g. commissioning master catalog).
+    mag_col : str, default "mag_lambda"
+        Magnitude column name.
+
+    Returns
+    -------
+    pd.DataFrame
+        Sanitized catalog filtered to the detector vicinity.
+    """
+    det_name = l2_data.detector.lower()
+    cache_file = None
+    if cache_dir:
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_path / f"gaia_dr3_{det_name}_g{int(mag_limit)}.csv"
+        if cache_file.is_file():
+            df_cached = pd.read_csv(cache_file)
+            return sanitize_source_catalog(df_cached, mag_col=mag_col)
+
+    ra_cen, dec_cen, radius_deg, ra_min, ra_max, dec_min, dec_max = get_detector_sky_bounds(l2_data)
+
+    # 1. Pull from precomputed master catalog if provided
+    if precomputed_catalog and Path(precomputed_catalog).is_file():
+        full_df = pd.read_csv(precomputed_catalog, low_memory=False)
+        full_df = sanitize_source_catalog(full_df, mag_col=mag_col)
+
+        effective_mag_col = mag_col if mag_col in full_df.columns else "phot_g_mean_mag"
+        sub = full_df[
+            (full_df["ra"] >= ra_min)
+            & (full_df["ra"] <= ra_max)
+            & (full_df["dec"] >= dec_min)
+            & (full_df["dec"] <= dec_max)
+        ].copy()
+
+        if effective_mag_col in sub.columns:
+            sub = sub[sub[effective_mag_col] <= mag_limit].copy()
+
+        if len(sub) > 0:
+            if cache_file:
+                sub.to_csv(cache_file, index=False)
+            return sub.reset_index(drop=True)
+
+    # 2. Fallback to online Gaia DR3 query via TAP ADQL
+    adql = f"""
+    SELECT source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag
+    FROM gaiadr3.gaia_source
+    WHERE 1 = CONTAINS(
+        POINT('ICRS', ra, dec),
+        CIRCLE('ICRS', {ra_cen:.6f}, {dec_cen:.6f}, {radius_deg:.4f})
+    )
+    AND phot_g_mean_mag <= {mag_limit:.2f}
+    ORDER BY phot_g_mean_mag ASC
+    """
+    job = Gaia.launch_job_async(adql)
+    res = job.get_results()
+    df_gaia = res.to_pandas()
+    df_clean = sanitize_source_catalog(df_gaia, mag_col="phot_g_mean_mag")
+
+    if cache_file:
+        df_clean.to_csv(cache_file, index=False)
+
+    return df_clean
+
+
+def project_catalog_to_pixels(
+    l2_data: RomanL2Data,
+    catalog_df: pd.DataFrame,
+    margin_px: int = 50,
+    tolerance_arcsec: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Project celestial coordinates (RA, Dec) to detector pixel coordinates (x, y)
+    with mandatory forward roundtrip WCS verification.
+
+    Parameters
+    ----------
+    l2_data : RomanL2Data
+        Calibrated detector dataset containing GWCS object and detector identifier.
+    catalog_df : pd.DataFrame
+        Source catalog containing 'ra', 'dec', and 'source_id'.
+    margin_px : int, default 50
+        Exclusion margin in pixels from detector active edges [0, 4088].
+    tolerance_arcsec : float, default 0.5
+        Maximum permitted angular roundtrip difference between catalog (ra, dec)
+        and forward wcs(x, y). Eliminates false out-of-footprint matches.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing verified stars with columns:
+        ['source_id', 'ra', 'dec', 'mag_lambda', 'x', 'y', 'detector', 'delta_theta_arcsec']
+    """
+    if catalog_df.empty or "ra" not in catalog_df.columns or "dec" not in catalog_df.columns:
+        return pd.DataFrame(
+            columns=["source_id", "ra", "dec", "mag_lambda", "x", "y", "detector", "delta_theta_arcsec"]
+        )
+
+    wcs = l2_data.wcs
+    ny, nx = l2_data.data.shape
+
+    ra_vals = catalog_df["ra"].to_numpy(dtype=float)
+    dec_vals = catalog_df["dec"].to_numpy(dtype=float)
+
+    # 1. Vectorized backward transform (sky -> detector pixels)
+    if hasattr(wcs, "backward_transform"):
+        x_cand, y_cand = wcs.backward_transform(ra_vals, dec_vals)
+    elif hasattr(wcs, "invert"):
+        x_cand, y_cand = wcs.invert(ra_vals, dec_vals)
+    else:
+        raise AttributeError("WCS object does not provide backward_transform or invert method.")
+
+    x_cand = np.asarray(x_cand, dtype=float)
+    y_cand = np.asarray(y_cand, dtype=float)
+
+    # 2. Filter pixels within active boundary margin
+    finite_mask = np.isfinite(x_cand) & np.isfinite(y_cand)
+    in_bounds = (
+        finite_mask
+        & (x_cand >= margin_px)
+        & (x_cand <= (nx - margin_px))
+        & (y_cand >= margin_px)
+        & (y_cand <= (ny - margin_px))
+    )
+
+    cand_indices = np.where(in_bounds)[0]
+    if len(cand_indices) == 0:
+        return pd.DataFrame(
+            columns=["source_id", "ra", "dec", "mag_lambda", "x", "y", "detector", "delta_theta_arcsec"]
+        )
+
+    x_sub = x_cand[cand_indices]
+    y_sub = y_cand[cand_indices]
+    ra_cand = ra_vals[cand_indices]
+    dec_cand = dec_vals[cand_indices]
+
+    # 3. Mandatory forward roundtrip verification (pixels -> sky)
+    ra_back, dec_back = wcs(x_sub, y_sub)
+    ra_back = np.asarray(ra_back, dtype=float)
+    dec_back = np.asarray(dec_back, dtype=float)
+
+    cos_dec = np.cos(np.radians(dec_cand))
+    delta_ra_arcsec = (ra_back - ra_cand) * cos_dec * 3600.0
+    delta_dec_arcsec = (dec_back - dec_cand) * 3600.0
+    delta_theta_arcsec = np.hypot(delta_ra_arcsec, delta_dec_arcsec)
+
+    verified_mask = delta_theta_arcsec < tolerance_arcsec
+    verified_indices = cand_indices[verified_mask]
+    verified_sub_idx = np.where(verified_mask)[0]
+
+    # 4. Construct verified DataFrame preserving catalog attributes
+    sub_df = catalog_df.iloc[verified_indices].copy().reset_index(drop=True)
+    sub_df["x"] = x_sub[verified_sub_idx]
+    sub_df["y"] = y_sub[verified_sub_idx]
+    sub_df["detector"] = l2_data.detector
+    sub_df["delta_theta_arcsec"] = delta_theta_arcsec[verified_sub_idx]
+
+    # Guarantee canonical columns are present
+    if "mag_lambda" not in sub_df.columns:
+        if "phot_g_mean_mag" in sub_df.columns:
+            sub_df["mag_lambda"] = sub_df["phot_g_mean_mag"]
+        else:
+            sub_df["mag_lambda"] = np.nan
+
+    return sub_df
+
+
+def refine_stellar_centroids(
+    l2_data: RomanL2Data,
+    df: pd.DataFrame,
+    box_radius: int = 5,
+    max_shift_px: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Refine stellar subpixel centers using background-subtracted first moments.
+
+    Parameters
+    ----------
+    l2_data : RomanL2Data
+        Calibrated detector dataset with science flux array.
+    df : pd.DataFrame
+        Catalog with projected 'x' and 'y' coordinates.
+    box_radius : int, default 5
+        Radius in pixels around integer center defining bounding box (2*box_radius + 1).
+    max_shift_px : float, default 3.0
+        Maximum allowable shift from initial catalog coordinates before falling back.
+
+    Returns
+    -------
+    pd.DataFrame
+        Updated DataFrame with refined 'x' and 'y', plus 'peak_flux' and 'centroid_shift_px'.
+    """
+    if df.empty:
+        df_out = df.copy()
+        df_out["peak_flux"] = []
+        df_out["centroid_shift_px"] = []
+        return df_out
+
+    data = l2_data.data
+    height, width = data.shape
+
+    x_refined, y_refined = [], []
+    peak_fluxes, shifts = [], []
+
+    for _, row in df.iterrows():
+        x_init = float(row["x"])
+        y_init = float(row["y"])
+
+        ix = int(round(x_init))
+        iy = int(round(y_init))
+
+        x0 = max(0, ix - box_radius)
+        x1 = min(width, ix + box_radius + 1)
+        y0 = max(0, iy - box_radius)
+        y1 = min(height, iy + box_radius + 1)
+
+        box = data[y0:y1, x0:x1]
+
+        if box.size == 0 or np.all(np.isnan(box)):
+            x_refined.append(x_init)
+            y_refined.append(y_init)
+            peak_fluxes.append(0.0)
+            shifts.append(0.0)
+            continue
+
+        peak = float(np.nanmax(box))
+
+        # Robust local background (10th percentile of valid pixels)
+        valid_pix = box[np.isfinite(box)]
+        if len(valid_pix) > 0:
+            bkg = float(np.percentile(valid_pix, 10))
+        else:
+            bkg = 0.0
+
+        weights = np.maximum(box - bkg, 0.0)
+        # Saturated pixels or ramp failures: NaNs set to zero weight in moment sum
+        weights = np.where(np.isfinite(weights), weights, 0.0)
+        total_w = np.sum(weights)
+
+        if total_w > 0:
+            grid_y, grid_x = np.indices(box.shape)
+            cx = x0 + (np.sum(grid_x * weights) / total_w)
+            cy = y0 + (np.sum(grid_y * weights) / total_w)
+
+            shift = float(np.hypot(cx - x_init, cy - y_init))
+            # Guard against divergent centroid shifts
+            if np.isfinite(cx) and np.isfinite(cy) and (shift <= max_shift_px):
+                x_refined.append(float(cx))
+                y_refined.append(float(cy))
+                shifts.append(shift)
+            else:
+                x_refined.append(x_init)
+                y_refined.append(y_init)
+                shifts.append(0.0)
+        else:
+            x_refined.append(x_init)
+            y_refined.append(y_init)
+            shifts.append(0.0)
+
+        peak_fluxes.append(peak)
+
+    df_out = df.copy()
+    df_out["x"] = x_refined
+    df_out["y"] = y_refined
+    df_out["peak_flux"] = peak_fluxes
+    df_out["centroid_shift_px"] = shifts
+    return df_out
+
+
+def filter_isolated_stars(
+    df: pd.DataFrame,
+    pixel_scale: float = 0.11,
+    isolation_safety_factor: float = 1.3,
+    min_dist_arcsec: float = 2.0,
+    mag_col: str = "mag_lambda",
+    depth: float = 28.0,
+) -> pd.DataFrame:
+    """
+    Reject stars contaminated by nearby neighbors based on analytic Moffat PSF extension.
+
+    Sorts stars by ascending magnitude (brightest first) and enforces:
+        dist_px >= max(isolation_safety_factor * (ext_i + ext_j), min_dist_arcsec / pixel_scale)
+    When two stars violate clearance, the brighter star is preserved and the fainter is rejected.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Catalog with 'x', 'y', and magnitude column.
+    pixel_scale : float, default 0.11
+        Pixel scale in arcsec/pixel.
+    isolation_safety_factor : float, default 1.3
+        Multiplier applied to combined Moffat extension radii.
+    min_dist_arcsec : float, default 2.0
+        Hard minimum distance between any two stars in arcseconds.
+    mag_col : str, default "mag_lambda"
+        Magnitude column used to compute PSF extension.
+    depth : float, default 28.0
+        Surface brightness depth in mag/arcsec^2.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered catalog containing only isolated stars.
+    """
+    if len(df) <= 1:
+        return df.copy().reset_index(drop=True)
+
+    effective_mag_col = mag_col if mag_col in df.columns else "phot_g_mean_mag"
+    if effective_mag_col not in df.columns:
+        return df.copy().reset_index(drop=True)
+
+    # Sort brightest first (ascending magnitude). Break ties with source_id for determinism.
+    sort_cols = [effective_mag_col]
+    if "source_id" in df.columns:
+        sort_cols.append("source_id")
+    df_sorted = df.sort_values(by=sort_cols).reset_index(drop=True)
+
+    coords = df_sorted[["x", "y"]].to_numpy(dtype=float)
+    mags = df_sorted[effective_mag_col].to_numpy(dtype=float)
+
+    # Calculate Moffat extent in arcseconds and pixels
+    extensions_arcsec = get_psf_extension_moffat(mags, depth=depth)
+    extensions_px = np.asarray(extensions_arcsec, dtype=float) / pixel_scale
+
+    n = len(df_sorted)
+    is_kept = np.ones(n, dtype=bool)
+    min_clearance_px = min_dist_arcsec / pixel_scale
+
+    for i in range(n):
+        if not is_kept[i]:
+            continue
+
+        dx = coords[:, 0] - coords[i, 0]
+        dy = coords[:, 1] - coords[i, 1]
+        dist_px = np.hypot(dx, dy)
+        dist_px[i] = np.inf  # Ignore self
+
+        required_clearance = np.maximum(
+            isolation_safety_factor * (extensions_px[i] + extensions_px),
+            min_clearance_px,
+        )
+
+        # Check only against currently active/kept stars
+        violators = np.where((dist_px < required_clearance) & is_kept)[0]
+        if len(violators) > 0:
+            # If any brighter star (index < i) violates clearance, star i must be rejected
+            if np.any(violators < i):
+                is_kept[i] = False
+            else:
+                # Violators are fainter (index > i); reject them to protect primary star i
+                is_kept[violators] = False
+
+    return df_sorted[is_kept].copy().reset_index(drop=True)
+
+
+def assign_stellar_tiers(
+    df: pd.DataFrame,
+    bright_limit: float = 11.0,
+    faint_limit: float = 13.0,
+    mag_col: str = "mag_lambda",
+) -> pd.DataFrame:
+    """
+    Categorize stars into Bright, Medium, and Faint tiers based on Roman F146 mag_lambda.
+
+    Tiers:
+    - 'bright': mag < bright_limit (< 11.0)
+        Used for extended PSF wings and 6-fold diffraction spikes out to r > 500 px.
+    - 'medium': bright_limit <= mag < faint_limit (11.0 <= mag < 13.0)
+        Used for transition overlap normalization (8 < r < 45 px).
+    - 'faint' : mag >= faint_limit (mag >= 13.0)
+        Used for unsaturated central core (r < 10 px).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Catalog with magnitude column.
+    bright_limit : float, default 11.0
+        Upper brightness boundary for bright tier.
+    faint_limit : float, default 13.0
+        Lower boundary for faint tier.
+    mag_col : str, default "mag_lambda"
+        Primary magnitude column.
+
+    Returns
+    -------
+    pd.DataFrame
+        Catalog with added 'tier' column containing 'bright', 'medium', or 'faint'.
+    """
+    df_out = df.copy()
+    if df_out.empty:
+        df_out["tier"] = []
+        return df_out
+
+    effective_mag_col = mag_col if mag_col in df_out.columns else "phot_g_mean_mag"
+    if effective_mag_col not in df_out.columns:
+        df_out["tier"] = "faint"
+        return df_out
+
+    mags = pd.to_numeric(df_out[effective_mag_col], errors="coerce").to_numpy(dtype=float)
+    tiers = np.full(len(df_out), "faint", dtype=object)
+
+    valid_mask = np.isfinite(mags)
+    bright_mask = valid_mask & (mags < bright_limit)
+    medium_mask = valid_mask & (mags >= bright_limit) & (mags < faint_limit)
+
+    tiers[bright_mask] = "bright"
+    tiers[medium_mask] = "medium"
+    # Remaining valid (mags >= faint_limit) and invalid/NaN remain 'faint'
+
+    df_out["tier"] = tiers
+    return df_out

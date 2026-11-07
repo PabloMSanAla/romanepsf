@@ -1,0 +1,143 @@
+--- a/src/romanepsf/catalog.py
++++ b/src/romanepsf/catalog.py
+@@ -15,7 +15,7 @@
+ from typing import Optional, Tuple, Union
+ import numpy as np
+ import pandas as pd
+-from romanepsf.loader import RomanL2Data
++from romanepsf.loader import RomanL2Data, DQ_FLAGS
+ 
+ 
+ def get_psf_extension_moffat(mag, depth=28.0, alpha=0.08, beta=1.52):
+@@ -73,6 +73,9 @@
+     """
+     clean_df = df.copy()
+ 
++    # Strip whitespace from column names
++    clean_df.columns = clean_df.columns.astype(str).str.strip()
++
+     # 1. Resolve duplicate column names if already duplicated in memory
+     if clean_df.columns.has_duplicates:
+         clean_df = clean_df.loc[:, ~clean_df.columns.duplicated()].copy()
+@@ -116,6 +119,11 @@
+ 
+     if "phot_g_mean_mag" in clean_df.columns:
+         clean_df["phot_g_mean_mag"] = pd.to_numeric(clean_df["phot_g_mean_mag"], errors="coerce")
++        if mag_col not in clean_df.columns:
++            valid_g = clean_df["phot_g_mean_mag"].notna() & np.isfinite(clean_df["phot_g_mean_mag"]) & (clean_df["phot_g_mean_mag"] >= 0.0)
++            clean_df = clean_df[valid_g].copy()
++        else:
++            clean_df = clean_df[clean_df["phot_g_mean_mag"].isna() | (clean_df["phot_g_mean_mag"] >= 0.0)].copy()
+ 
+     # 5. Drop duplicate source_id if present
+     if "source_id" in clean_df.columns:
+@@ -292,12 +300,20 @@
+ 
+     ra_vals = catalog_df["ra"].to_numpy(dtype=float)
+     dec_vals = catalog_df["dec"].to_numpy(dtype=float)
++
++    # Wrap RA relative to detector center to handle 0/360 boundary in backward transform
++    try:
++        center_ra, _ = wcs(nx / 2.0, ny / 2.0)
++        center_ra = float(np.asarray(center_ra).flat[0])
++        ra_for_transform = center_ra + ((ra_vals - center_ra + 180.0) % 360.0 - 180.0)
++    except Exception:
++        ra_for_transform = ra_vals
+ 
+     # 1. Vectorized backward transform (sky -> detector pixels)
+     if hasattr(wcs, "backward_transform"):
+-        x_cand, y_cand = wcs.backward_transform(ra_vals, dec_vals)
++        x_cand, y_cand = wcs.backward_transform(ra_for_transform, dec_vals)
+     elif hasattr(wcs, "invert"):
+-        x_cand, y_cand = wcs.invert(ra_vals, dec_vals)
++        x_cand, y_cand = wcs.invert(ra_for_transform, dec_vals)
+     else:
+         raise AttributeError("WCS object does not provide backward_transform or invert method.")
+ 
+@@ -331,7 +347,8 @@
+     dec_back = np.asarray(dec_back, dtype=float)
+ 
+     cos_dec = np.cos(np.radians(dec_cand))
+-    delta_ra_arcsec = (ra_back - ra_cand) * cos_dec * 3600.0
++    delta_ra = (ra_back - ra_cand + 180.0) % 360.0 - 180.0
++    delta_ra_arcsec = delta_ra * cos_dec * 3600.0
+     delta_dec_arcsec = (dec_back - dec_cand) * 3600.0
+     delta_theta_arcsec = np.hypot(delta_ra_arcsec, delta_dec_arcsec)
+ 
+@@ -419,35 +436,50 @@
+             shifts.append(0.0)
+             continue
+ 
+-        peak = float(np.nanmax(box)) if np.any(np.isfinite(box)) else 0.0
+-
+-        # Robust local background (10th percentile of valid pixels)
+-        valid_pix = box[np.isfinite(box)]
+-        if len(valid_pix) > 0:
+-            bkg = float(np.percentile(valid_pix, 10))
++        # Mask bad DQ pixels (e.g. DO_NOT_USE=1, JUMP_DET=4 cosmic rays)
++        if hasattr(l2_data, "dq") and l2_data.dq is not None:
++            dq_box = l2_data.dq[y0:y1, x0:x1]
++            bad_mask = (dq_box & (DQ_FLAGS.get("DO_NOT_USE", 1) | DQ_FLAGS.get("JUMP_DET", 4))) > 0
+         else:
+-            bkg = 0.0
++            bad_mask = np.zeros(box.shape, dtype=bool)
+ 
+-        weights = np.maximum(box - bkg, 0.0)
+-        # Saturated pixels or ramp failures: NaNs set to zero weight in moment sum
+-        weights = np.where(np.isfinite(weights), weights, 0.0)
+-        total_w = np.sum(weights)
+-
+-        if total_w > 0:
+-            grid_y, grid_x = np.indices(box.shape)
+-            cx = x0 + (np.sum(grid_x * weights) / total_w)
+-            cy = y0 + (np.sum(grid_y * weights) / total_w)
++        valid_mask = np.isfinite(box) & (~bad_mask)
++        valid_pix = box[valid_mask]
+ 
+-            shift = float(np.hypot(cx - x_init, cy - y_init))
+-            # Guard against divergent centroid shifts
+-            if np.isfinite(cx) and np.isfinite(cy) and (shift <= max_shift_px):
+-                x_refined.append(float(cx))
+-                y_refined.append(float(cy))
+-                shifts.append(shift)
+-            else:
+-                x_refined.append(x_init)
+-                y_refined.append(y_init)
+-                shifts.append(0.0)
++        if len(valid_pix) == 0:
++            x_refined.append(x_init)
++            y_refined.append(y_init)
++            peak_fluxes.append(0.0)
++            shifts.append(0.0)
++            continue
++
++        peak = float(np.max(valid_pix))
++
++        # Robust local background (10th percentile of valid pixels)
++        bkg = float(np.percentile(valid_pix, 10))
++
++        weights = np.maximum(box - bkg, 0.0)
++        weights[~valid_mask] = 0.0
++        total_w = float(np.sum(weights))
++
++        # Fallback to catalog position when peak flux is non-positive or total weight is zero
++        if peak <= 0.0 or total_w <= 0.0:
++            x_refined.append(x_init)
++            y_refined.append(y_init)
++            peak_fluxes.append(peak)
++            shifts.append(0.0)
++            continue
++
++        grid_y, grid_x = np.indices(box.shape)
++        cx = x0 + (np.sum(grid_x * weights) / total_w)
++        cy = y0 + (np.sum(grid_y * weights) / total_w)
++
++        shift = float(np.hypot(cx - x_init, cy - y_init))
++        # Guard against divergent centroid shifts
++        if np.isfinite(cx) and np.isfinite(cy) and (shift <= max_shift_px):
++            x_refined.append(float(cx))
++            y_refined.append(float(cy))
++            shifts.append(shift)
+         else:
+             x_refined.append(x_init)
+             y_refined.append(y_init)

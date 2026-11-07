@@ -1,0 +1,30 @@
+--- a/src/romanepsf/masking.py
++++ b/src/romanepsf/masking.py
+@@ -248,3 +248,6 @@ def fit_moffat_model(
+-    outer = valid & (r > np.percentile(r[valid], 75))
+-    bkg = float(np.median(stamp[outer])) if np.any(outer) else 0.0
++    # Estimate background from the outer perimeter of the cutout rather than the truncated fitting region
++    outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
++    if dq_mask is not None:
++        outer_cutout &= (~dq_mask)
++    bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
+@@ -423,4 +426,17 @@ def mask_contaminants_with_spikes_protected(
+-    contaminants = (residual - res_med) > (detection_sigma * res_std)
+-    if np.any(contaminants):
+-        contaminants = binary_dilation(contaminants, iterations=1)
++    # Scale detection threshold radially: sigma(r) = sigma_0 * (1 + A * exp(-r / r0))
++    # Prevents legitimate diffuse stellar halo flux from exceeding sky noise threshold
++    t_str = str(tier).lower().strip() if tier is not None else "medium"
++    if t_str == "faint":
++        amp_scale = float(getattr(spikes_cfg, "radial_scale_amplitude_faint", 50.0))
++        r0_scale = float(getattr(spikes_cfg, "radial_scale_radius_px_faint", 15.0))
++    elif t_str == "bright":
++        amp_scale = float(getattr(spikes_cfg, "radial_scale_amplitude_bright", 200.0))
++        r0_scale = float(getattr(spikes_cfg, "radial_scale_radius_px_bright", 20.0))
++    else:  # medium or default
++        amp_scale = float(getattr(spikes_cfg, "radial_scale_amplitude_medium", 200.0))
++        r0_scale = float(getattr(spikes_cfg, "radial_scale_radius_px_medium", 15.0))
++
++    sigma_r = detection_sigma * (1.0 + amp_scale * np.exp(-r / r0_scale))
++    contam_raw = (residual - res_med) > (sigma_r * res_std)
++    contaminants = binary_dilation(contam_raw, iterations=1) if np.any(contam_raw) else contam_raw

@@ -1,0 +1,20 @@
+diff --git a/src/romanepsf/assembly.py b/src/romanepsf/assembly.py
+--- a/src/romanepsf/assembly.py
++++ b/src/romanepsf/assembly.py
+@@ -414,9 +414,13 @@
+     psf_bright, cov_bright = stack_tier_stamps_torch(tier_stamps["bright"], device=device, sigma_clip=stack_sigma)
+ 
+     # 2. Extract 1D radial profiles strictly for overlap calibration
+-    r_f, prof_f, _ = measure_radial_profile_1d(psf_faint, device=device)
+-    r_m, prof_m, _ = measure_radial_profile_1d(psf_medium, device=device)
+-    r_b, prof_b, _ = measure_radial_profile_1d(psf_bright, device=device)
++    mask_faint = (cov_faint == 0) if cov_faint is not None else None
++    mask_medium = (cov_medium == 0) if cov_medium is not None else None
++    mask_bright = (cov_bright == 0) if cov_bright is not None else None
++
++    r_f, prof_f, _ = measure_radial_profile_1d(psf_faint, mask=mask_faint, device=device)
++    r_m, prof_m, _ = measure_radial_profile_1d(psf_medium, mask=mask_medium, device=device)
++    r_b, prof_b, _ = measure_radial_profile_1d(psf_bright, mask=mask_bright, device=device)
+ 
+     # Overlap 1: Faint <-> Medium (dual-radius matching)
+     k_fm = determine_overlap_scale_factor_dual(prof_f, prof_m, r_f, r_m, r_min=r_fm_min, r_max=r_fm_max)
