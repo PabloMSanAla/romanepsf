@@ -393,3 +393,43 @@ class TestGaiaCompanionMasking:
         # Companion star is masked
         assert final_mask[50, 75]
 
+
+class TestUnsharpMaskResidual:
+    """Tests for normalized Gaussian unsharp masking residual computation."""
+
+    def test_isolates_compact_point_source(self):
+        from romanepsf.masking import compute_unsharp_mask_residual
+
+        sz = 81
+        cx, cy = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        # Broad smooth halo
+        smooth_halo = (200.0 / (1.0 + (r / 10.0)**2)).astype(np.float32)
+        # Compact companion point source at (60, 40)
+        comp_r = np.hypot(gx - 60.0, gy - 40.0)
+        compact_source = (50.0 * np.exp(-comp_r**2 / (2 * 1.5**2))).astype(np.float32)
+        stamp = smooth_halo + compact_source
+
+        res = compute_unsharp_mask_residual(stamp, sigma=7.0)
+
+        # Unsharp residual should be strongly positive at the compact companion
+        assert res[40, 60] > 20.0
+        # In the smooth halo far from core (e.g. radius 25 px away from companion), residual is near zero
+        assert abs(res[40, 15]) < 5.0
+
+    def test_handles_nan_and_dq_mask(self):
+        from romanepsf.masking import compute_unsharp_mask_residual
+
+        stamp = np.ones((51, 51), dtype=np.float32) * 10.0
+        stamp[25, 25] = np.nan
+        dq = np.zeros((51, 51), dtype=bool)
+        dq[10, 10] = True
+
+        res = compute_unsharp_mask_residual(stamp, sigma=3.0, dq_mask=dq)
+        assert np.isnan(res[25, 25])
+        assert np.isfinite(res[25, 24])
+        # Background is flat, so finite residuals should be virtually 0
+        np.testing.assert_allclose(res[np.isfinite(res)], 0.0, atol=1e-4)
+
+

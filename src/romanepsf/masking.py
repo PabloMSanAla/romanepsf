@@ -416,6 +416,52 @@ def fit_moffat_model(
         return fallback_img, init_moffat
 
 
+def compute_unsharp_mask_residual(
+    stamp: np.ndarray,
+    sigma: float = 7.0,
+    dq_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Compute high-pass residual image via unsharp masking (normalized Gaussian subtraction).
+
+    Removes smooth, diffuse stellar halo and broad background structure without relying
+    on an idealized parametric profile, preserving genuine stellar wings while isolating
+    compact point sources, companion stars, diffraction spikes, and sharp contaminants.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D flux array.
+    sigma : float, default 7.0
+        Gaussian smoothing kernel standard deviation in pixels.
+    dq_mask : np.ndarray, optional
+        Boolean mask of known bad pixels to exclude from smoothing weights.
+
+    Returns
+    -------
+    residual : np.ndarray (float32)
+        Unsharp-masked residual (stamp - gaussian_filtered(stamp)).
+    """
+    from scipy.ndimage import gaussian_filter
+
+    valid = np.isfinite(stamp)
+    if dq_mask is not None:
+        valid &= (~dq_mask)
+
+    weights = valid.astype(np.float32)
+    filled = np.where(valid, stamp, 0.0).astype(np.float32)
+
+    smooth_data = gaussian_filter(filled, sigma=sigma)
+    smooth_weights = gaussian_filter(weights, sigma=sigma)
+
+    smooth = np.zeros_like(smooth_data)
+    nonzero = smooth_weights > 1e-6
+    smooth[nonzero] = smooth_data[nonzero] / smooth_weights[nonzero]
+
+    unsharp_res = np.where(np.isfinite(stamp), stamp - smooth, np.nan).astype(np.float32)
+    return unsharp_res
+
+
 def mask_gaia_companion_stars(
     shape: Tuple[int, int],
     center: Tuple[float, float],
@@ -531,6 +577,8 @@ def mask_contaminants_with_spikes_protected(
     target_center_xy: Optional[Tuple[float, float]] = None,
     pixel_scale: float = 0.11,
     companion_depth: float = 28.0,
+    method: str = "unsharp",
+    unsharp_sigma: float = 7.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
@@ -624,10 +672,15 @@ def mask_contaminants_with_spikes_protected(
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
 
-    # 2. Fit Moffat model & compute residuals
-    max_fit_r = min(max(cx * 0.3, 20.0), 50.0)
-    moffat_img, _ = fit_moffat_model(stamp, dq_mask=dq_mask, max_radius=max_fit_r)
-    residual = (stamp - moffat_img).astype(np.float32)
+    # 2. Compute residual map (via unsharp masking or Moffat model subtraction)
+    method_lower = str(method).lower().strip()
+    if method_lower == "moffat":
+        max_fit_r = min(max(cx * 0.3, 20.0), 50.0)
+        moffat_img, _ = fit_moffat_model(stamp, dq_mask=dq_mask, max_radius=max_fit_r)
+        residual = (stamp - moffat_img).astype(np.float32)
+    else:
+        # Default: Unsharp masking (normalized Gaussian high-pass filtering)
+        residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
 
     # 3. Dual-prior spike protection covering both 1st and 2nd order spikes
     spike_order = getattr(spikes_cfg, "spike_order", None)
@@ -744,6 +797,7 @@ __all__ = [
     "refine_spike_angles",
     "create_geometric_spike_mask",
     "detect_morphological_spikes",
+    "compute_unsharp_mask_residual",
     "fit_moffat_model",
     "mask_gaia_companion_stars",
     "mask_contaminants_with_spikes_protected",

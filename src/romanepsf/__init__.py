@@ -51,6 +51,7 @@ from .masking import (
     refine_spike_angles,
     create_geometric_spike_mask,
     detect_morphological_spikes,
+    compute_unsharp_mask_residual,
     fit_moffat_model,
     mask_gaia_companion_stars,
     mask_contaminants_with_spikes_protected,
