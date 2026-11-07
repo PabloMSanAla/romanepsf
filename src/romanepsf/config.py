@@ -168,6 +168,7 @@ class SpikesSection:
     detector_alignment_offset_deg: float = -9.70
     angular_half_width_deg: float = 4.0
     spike_width_px: float = 4.0
+    width_growth_rate: float = 0.025
     core_protection_radius_px: CoreProtectionRadius = field(default_factory=CoreProtectionRadius)
     morphological: MorphologicalConfig = field(default_factory=MorphologicalConfig)
     contaminant_detection_sigma: float = 3.0
