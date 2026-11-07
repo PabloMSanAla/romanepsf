@@ -23,7 +23,8 @@ import logging
 import numpy as np
 import pandas as pd
 from astropy.modeling import fitting, models
-from scipy.ndimage import binary_dilation, generate_binary_structure, label
+from scipy.ndimage import binary_dilation, generate_binary_structure, label, gaussian_filter, map_coordinates
+from scipy.signal import find_peaks
 
 from romanepsf.config import SpikesConfig, SpikesSection
 
@@ -462,6 +463,241 @@ def compute_unsharp_mask_residual(
     return unsharp_res
 
 
+def radial_hough_transform(
+    sharp_image: np.ndarray,
+    center: Tuple[float, float],
+    r_min: float = 8.0,
+    r_max: Optional[float] = None,
+    num_angles: int = 720,
+    symmetric_fold: bool = True,
+    corridor_half_width_px: float = 1.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Star-Centered Radial Rolling Hough Transform (RHT) along rays radiating from center.
+
+    Integrates high-pass sharp flux along linear paths at angle theta from the stellar centroid.
+    Antipodal folding (theta + 180 deg) exploits opposing spider strut symmetry and strongly
+    suppresses asymmetric point sources or companion stars.
+
+    Parameters
+    ----------
+    sharp_image : np.ndarray
+        2D high-pass / unsharp-masked flux image.
+    center : (cx, cy)
+        Stellar centroid in pixel coordinates.
+    r_min : float, default 8.0
+        Inner radius to avoid the saturated / core region.
+    r_max : float, optional
+        Outer radius for integration. Defaults to 0.85 * distance to nearest boundary.
+    num_angles : int, default 720
+        Number of angular samples across [0, 360) (0.5 deg resolution).
+    symmetric_fold : bool, default True
+        If True, combines antipodal rays theta and theta + 180 deg.
+    corridor_half_width_px : float, default 1.0
+        Half-width for transverse sampling across each ray.
+
+    Returns
+    -------
+    angles_deg : np.ndarray
+        Sampled angles in degrees [0, 360).
+    rht_power : np.ndarray
+        Normalized RHT accumulator power [0, 1] as a function of angle.
+    """
+    ny, nx = sharp_image.shape
+    cx, cy = center
+    if r_max is None:
+        r_max = min(cx, cy, nx - cx - 1, ny - cy - 1) * 0.9
+
+    thetas_deg = np.linspace(0, 360.0, num_angles, endpoint=False)
+    num_radial = max(int(r_max - r_min), 15)
+    radii = np.linspace(r_min, r_max, num_radial)
+
+    clean_sharp = np.nan_to_num(sharp_image, nan=0.0)
+    offsets = [-corridor_half_width_px, 0.0, corridor_half_width_px] if corridor_half_width_px > 0 else [0.0]
+    rht_power = np.zeros(num_angles, dtype=np.float64)
+
+    for i, th_deg in enumerate(thetas_deg):
+        th = np.radians(th_deg)
+        cos_t, sin_t = np.cos(th), np.sin(th)
+        perp_x, perp_y = -sin_t, cos_t
+
+        line_sum = 0.0
+        for off in offsets:
+            xs = cx + radii * cos_t + off * perp_x
+            ys = cy + radii * sin_t + off * perp_y
+            v = map_coordinates(clean_sharp, [ys, xs], order=1, mode="constant", cval=0.0)
+            line_sum += np.sum(np.maximum(v, 0.0))
+
+        rht_power[i] = line_sum / (len(offsets) * num_radial)
+
+    if symmetric_fold:
+        half_shift = num_angles // 2
+        rht_power = 0.5 * (rht_power + np.roll(rht_power, half_shift))
+
+    p_min, p_max = np.min(rht_power), np.max(rht_power)
+    if p_max > p_min:
+        rht_norm = (rht_power - p_min) / (p_max - p_min)
+    else:
+        rht_norm = rht_power
+
+    return thetas_deg, rht_norm
+
+
+def detect_spikes_rht(
+    sharp_image: np.ndarray,
+    center: Tuple[float, float],
+    r_min: float = 8.0,
+    r_max: Optional[float] = None,
+    min_peak_distance_deg: float = 6.0,
+    prominence_rel: float = 0.15,
+    symmetric_fold: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Detect empirical spike angles from Star-Centered RHT angular power spectrum peaks.
+
+    Parameters
+    ----------
+    sharp_image : np.ndarray
+        2D high-pass unsharp flux image.
+    center : (cx, cy)
+        Stellar centroid in pixel coordinates.
+    r_min : float, default 8.0
+        Inner radius to avoid the central core.
+    r_max : float, optional
+        Outer radius for integration.
+    min_peak_distance_deg : float, default 6.0
+        Minimum angular separation between adjacent detected peaks.
+    prominence_rel : float, default 0.15
+        Relative prominence threshold for peak detection.
+    symmetric_fold : bool, default True
+        If True, enforces antipodal symmetry across opposing spider strut rays.
+
+    Returns
+    -------
+    detected_angles : np.ndarray
+        Array of detected spike angles in degrees [0, 360).
+    angles_deg : np.ndarray
+        Full angular grid [0, 360).
+    rht_power : np.ndarray
+        Normalized RHT angular power spectrum.
+    """
+    angles_deg, rht_power = radial_hough_transform(
+        sharp_image,
+        center,
+        r_min=r_min,
+        r_max=r_max,
+        num_angles=720,
+        symmetric_fold=symmetric_fold,
+    )
+
+    dist_bins = int(round(min_peak_distance_deg / (360.0 / len(angles_deg))))
+    prominence = max(prominence_rel * (np.percentile(rht_power, 85) - np.percentile(rht_power, 15)), 0.02)
+
+    if symmetric_fold:
+        idx_180 = len(angles_deg) // 2
+        angles_180 = angles_deg[:idx_180]
+        power_180 = rht_power[:idx_180]
+
+        pad = 20
+        wrapped_power = np.concatenate([power_180[-pad:], power_180, power_180[:pad]])
+        peaks, _ = find_peaks(wrapped_power, distance=dist_bins, prominence=prominence)
+
+        valid_peaks_180 = []
+        for p in peaks:
+            idx = p - pad
+            if 0 <= idx < len(angles_180):
+                valid_peaks_180.append(idx)
+
+        base_angles = angles_180[valid_peaks_180]
+        detected_angles = np.sort(np.unique(np.concatenate([base_angles, (base_angles + 180.0) % 360.0])))
+    else:
+        pad = 30
+        wrapped_power = np.concatenate([rht_power[-pad:], rht_power, rht_power[:pad]])
+        peaks, _ = find_peaks(wrapped_power, distance=dist_bins, prominence=prominence)
+        valid_peaks = []
+        for p in peaks:
+            idx = p - pad
+            if 0 <= idx < len(angles_deg):
+                valid_peaks.append(idx)
+        detected_angles = angles_deg[valid_peaks]
+
+    return detected_angles, angles_deg, rht_power
+
+
+def create_rht_spike_mask(
+    shape: Tuple[int, int],
+    center: Tuple[float, float],
+    detected_angles_deg: np.ndarray,
+    sharp_image: Optional[np.ndarray] = None,
+    angular_half_width_deg: float = 1.8,
+    spike_width_px: float = 6.0,
+    r_min: float = 6.0,
+    r_max: Optional[float] = None,
+    adaptive_flux_filter: bool = False,
+) -> np.ndarray:
+    """
+    Create 2D binary spike protection mask from detected RHT angles.
+
+    Parameters
+    ----------
+    shape : (ny, nx)
+        Postage stamp shape.
+    center : (cx, cy)
+        Stellar centroid in pixel coordinates.
+    detected_angles_deg : np.ndarray
+        Array of spike angles detected by RHT.
+    sharp_image : np.ndarray, optional
+        High-pass sharp flux image used for optional adaptive thresholding.
+    angular_half_width_deg : float, default 1.8
+        Angular corridor half-width in degrees.
+    spike_width_px : float, default 6.0
+        Perpendicular corridor width in pixels.
+    r_min : float, default 6.0
+        Inner radius boundary.
+    r_max : float, optional
+        Outer radius boundary.
+    adaptive_flux_filter : bool, default False
+        If True, restricts the corridor to positive sharp flux pixels.
+
+    Returns
+    -------
+    spike_mask : np.ndarray (bool)
+        Binary mask covering all detected spike corridors.
+    """
+    ny, nx = shape
+    cx, cy = center
+    gy, gx = np.ogrid[:ny, :nx]
+    dx = gx - cx
+    dy = gy - cy
+    r = np.hypot(dx, dy)
+
+    if r_max is None:
+        r_max = np.hypot(cx, cy)
+
+    pixel_angles = (np.degrees(np.arctan2(dy, dx)) + 360.0) % 360.0
+    spike_mask = np.zeros(shape, dtype=bool)
+
+    for ang in detected_angles_deg:
+        ang_rad = np.radians(ang)
+        cos_a, sin_a = np.cos(ang_rad), np.sin(ang_rad)
+
+        ang_diff = np.abs((pixel_angles - ang + 180.0) % 360.0 - 180.0)
+        d_perp = np.abs(-dx * sin_a + dy * cos_a)
+        d_along = dx * cos_a + dy * sin_a
+
+        in_corridor = (ang_diff <= angular_half_width_deg) | (d_perp <= (spike_width_px / 2.0))
+        in_ray = in_corridor & (d_along >= r_min) & (r <= r_max)
+
+        if adaptive_flux_filter and sharp_image is not None:
+            close_axis = d_perp <= 1.5
+            pos_flux = sharp_image > 0.0
+            in_ray &= (close_axis | pos_flux)
+
+        spike_mask |= in_ray
+
+    return spike_mask
+
+
 def mask_gaia_companion_stars(
     shape: Tuple[int, int],
     center: Tuple[float, float],
@@ -798,6 +1034,9 @@ __all__ = [
     "create_geometric_spike_mask",
     "detect_morphological_spikes",
     "compute_unsharp_mask_residual",
+    "radial_hough_transform",
+    "detect_spikes_rht",
+    "create_rht_spike_mask",
     "fit_moffat_model",
     "mask_gaia_companion_stars",
     "mask_contaminants_with_spikes_protected",

@@ -433,3 +433,48 @@ class TestUnsharpMaskResidual:
         np.testing.assert_allclose(res[np.isfinite(res)], 0.0, atol=1e-4)
 
 
+class TestRadialHoughTransform:
+    """Tests for Star-Centered Rolling Hough Transform spike detection and masking."""
+
+    def test_recovers_synthetic_radial_spikes(self):
+        from romanepsf.masking import detect_spikes_rht, create_rht_spike_mask
+
+        sz = 101
+        cx, cy = 50.0, 50.0
+        gy, gx = np.ogrid[:sz, :sz]
+        dx = gx - cx
+        dy = gy - cy
+        r = np.hypot(dx, dy)
+
+        # Inject 4 linear spikes at 30 deg (+210 deg) and 120 deg (+300 deg)
+        synth_sharp = np.zeros((sz, sz), dtype=np.float32)
+        test_angles = [30.0, 120.0]
+        for ang in test_angles:
+            ang_rad = np.radians(ang)
+            d_perp = np.abs(-dx * np.sin(ang_rad) + dy * np.cos(ang_rad))
+            synth_sharp += (20.0 * np.exp(-d_perp**2 / (2 * 1.0**2)) * (r >= 6.0)).astype(np.float32)
+
+        det_angles, angles_grid, rht_power = detect_spikes_rht(
+            synth_sharp,
+            (cx, cy),
+            r_min=8.0,
+            r_max=45.0,
+            symmetric_fold=True,
+        )
+
+        # Must recover angles near 30, 120, 210, 300 deg
+        for expected in [30.0, 120.0, 210.0, 300.0]:
+            diffs = np.abs((det_angles - expected + 180.0) % 360.0 - 180.0)
+            assert np.min(diffs) <= 1.5, f"Expected angle {expected} not detected by RHT"
+
+        # Check mask creation
+        spike_mask = create_rht_spike_mask((sz, sz), (cx, cy), det_angles, r_min=8.0, r_max=45.0)
+        assert spike_mask.shape == (sz, sz)
+        # Center core should remain clear in spike corridor
+        assert not spike_mask[50, 50]
+        # Pixels along the 30 deg line should be masked
+        px_30 = (int(round(50 + 25 * np.sin(np.radians(30)))), int(round(50 + 25 * np.cos(np.radians(30)))))
+        assert spike_mask[px_30]
+
+
+
