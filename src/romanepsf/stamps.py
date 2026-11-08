@@ -422,6 +422,10 @@ def process_star_stamps(
             raw_cutout, (ix, iy) = extract_cutout(l2_data.data, (cx, cy), sz, fill_value=np.nan)
             raw_hard_dq, _ = extract_cutout(dq_hard_bad.astype(np.uint8), (cx, cy), sz, fill_value=1)
             raw_sat_dq, _ = extract_cutout(dq_saturated.astype(np.uint8), (cx, cy), sz, fill_value=1)
+            raw_vp = None
+            var_p = getattr(l2_data, "var_poisson", None)
+            if isinstance(var_p, np.ndarray) and var_p.ndim == 2:
+                raw_vp, _ = extract_cutout(var_p, (cx, cy), sz, fill_value=np.nan)
 
             # 3. DQ Mask construction & Faint Core Protection
             dq_mask_bool = raw_hard_dq.astype(bool)
@@ -466,6 +470,7 @@ def process_star_stamps(
                         companion_depth=companion_depth,
                         detector=det_id,
                         bandpass=bp_id,
+                        var_poisson=raw_vp,
                     )
                 else:
                     mask, _, _ = mask_contaminants_with_spikes_protected(
@@ -480,6 +485,7 @@ def process_star_stamps(
                         companion_depth=companion_depth,
                         detector=det_id,
                         bandpass=bp_id,
+                        var_poisson=raw_vp,
                     )
             else:
                 mask = dq_mask_bool | (~np.isfinite(flux_cutout))

@@ -465,7 +465,7 @@ def fit_moffat_astrophot(
     if variance is None:
         var_img = np.maximum(flux_sub, 0.0) + max(bkg_rms, 1.0)**2
     else:
-        var_img = np.maximum(variance, 0.01)
+        var_img = np.where(np.isfinite(variance), np.maximum(variance, 0.01), 1e6).astype(np.float32)
 
     # Sub-window extraction around center to ensure high fitting speed on large stamps
     fit_r = max_radius if max_radius is not None else min(cx, cy) * 0.8
@@ -521,6 +521,7 @@ def fit_moffat_astropy(
     min_radius: Optional[float] = None,
     mask: Optional[np.ndarray] = None,
     sigma_image: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
     bkg_rms: Optional[float] = None,
 ) -> Tuple[np.ndarray, Any]:
     """
@@ -564,8 +565,11 @@ def fit_moffat_astropy(
     peak_val = max(peak_val, 1.0)
 
     if sigma_image is None:
-        flux_excess = np.maximum(stamp - bkg, 0.0)
-        sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
+        if variance is not None:
+            sigma_image = np.sqrt(np.maximum(np.nan_to_num(variance, nan=1.0), 0.01))
+        else:
+            flux_excess = np.maximum(stamp - bkg, 0.0)
+            sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
 
     weights = 1.0 / np.clip(sigma_image[valid], 0.1, None)
 
@@ -657,6 +661,7 @@ def fit_moffat_model(
         min_radius=min_radius,
         mask=mask,
         sigma_image=sigma_image,
+        variance=variance,
         bkg_rms=bkg_rms,
     )
 
@@ -1475,6 +1480,54 @@ def mask_gaia_companion_stars(
     return comp_mask
 
 
+def _detect_contaminants_erosion_dilation(
+    residual: np.ndarray,
+    protected_area: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    detection_sigma: float = 1.5,
+) -> np.ndarray:
+    """
+    Detect non-stellar contaminants using sigma-clipped thresholding followed by
+    morphological opening (1x1 erosion) and dilation (3x3), strictly excluding protected areas.
+
+    Formula:
+        _, median, std = sigma_clipped_stats(residual)
+        mask = residual > median + 1.5 * std
+        mask = cv2.dilate(cv2.erode(mask, (1, 1)), (3, 3))
+        mask[protected_spikes > 0] = 0
+    """
+    clean_area = (~protected_area) & np.isfinite(residual)
+    if dq_mask is not None:
+        clean_area &= (~dq_mask)
+
+    valid_res = residual[clean_area]
+    if len(valid_res) > 20:
+        from astropy.stats import sigma_clipped_stats
+        _, res_med, res_std = sigma_clipped_stats(valid_res, sigma=3.0, maxiters=5)
+    else:
+        res_med = 0.0
+        res_std = float(np.nanstd(residual)) if np.any(np.isfinite(residual)) else 1.0
+
+    threshold_val = res_med + max(detection_sigma * res_std, 0.1)
+    contam_raw = (residual > threshold_val).astype(np.uint8)
+
+    # Morphological erosion (1x1) then dilation (3x3)
+    try:
+        import cv2
+        contam_opened = cv2.erode(contam_raw, np.ones((1, 1), np.uint8), iterations=1)
+        contam_dilated = cv2.dilate(contam_opened, np.ones((3, 3), np.uint8), iterations=1)
+        contaminants = contam_dilated.astype(bool)
+    except Exception:
+        from scipy.ndimage import binary_erosion, binary_dilation
+        contam_opened = binary_erosion(contam_raw.astype(bool), structure=np.ones((1, 1), dtype=bool), iterations=1)
+        contam_dilated = binary_dilation(contam_opened, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        contaminants = contam_dilated
+
+    # Strictly exclude protected spikes and core
+    contaminants[protected_area] = False
+    return contaminants
+
+
 def mask_contaminants_with_spikes_protected(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
@@ -1489,15 +1542,21 @@ def mask_contaminants_with_spikes_protected(
     target_center_xy: Optional[Tuple[float, float]] = None,
     pixel_scale: float = 0.11,
     companion_depth: float = 28.0,
-    method: str = "auto",
+    method: str = "moffat",
     unsharp_sigma: float = 7.0,
     width_growth_rate: Optional[float] = None,
     detector: Optional[Union[str, int]] = None,
     bandpass: str = "F146",
     engine: str = "astrophot",
+    var_poisson: Optional[np.ndarray] = None,
+    n_iterations: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
+
+    Performs 2-iteration profile fitting (AstroPhot 2D Moffat by default) weighted by Poisson
+    noise variance (var_poisson from Level 2 ASDF). The 2nd iteration re-fits with an updated mask
+    excluding detected contaminants, neighbor Gaia stars, and bad/saturated pixels.
 
     Harmonizes both the authoritative pipeline contract:
       `mask_contaminants_with_spikes_protected(stamp, dq_mask, pa_aperture, cfg)`
@@ -1519,10 +1578,34 @@ def mask_contaminants_with_spikes_protected(
     core_protection_radius_px : float, optional
         Inner stellar core radius protected from contaminant masking.
     detection_sigma : float, optional
-        Threshold above residual background to flag contaminants.
+        Threshold above residual background to flag contaminants (default 1.5).
     tier : str, optional
         Stellar tier ('bright', 'medium', 'faint') for tier-dependent core radii and masking.
         For faint stars, residual-based contaminant masking is omitted to preserve genuine stellar flux.
+    companion_stars : DataFrame or list, optional
+        Neighbor Gaia stars to mask with circular apertures via get_psf_extension_moffat.
+    target_center_xy : tuple of float, optional
+        Centroid (x, y) of the primary star.
+    pixel_scale : float, default 0.11
+        Detector pixel scale in arcsec/pixel.
+    companion_depth : float, default 28.0
+        Surface brightness limiting depth in mag/arcsec^2 for companion apertures.
+    method : str, default 'moffat'
+        Fitting method: 'moffat', 'auto', 'superback', 'stpsf', or 'unsharp'.
+    unsharp_sigma : float, default 7.0
+        Smoothing sigma for unsharp masking if method='unsharp'.
+    width_growth_rate : float, optional
+        Radial growth rate of diffraction spike protection corridors.
+    detector : str or int, optional
+        Detector identifier (e.g. 'WFI01').
+    bandpass : str, default 'F146'
+        Filter bandpass name.
+    engine : str, default 'astrophot'
+        Moffat fitting engine ('astrophot' or 'astropy').
+    var_poisson : np.ndarray, optional
+        Poisson noise variance cutout from Level 2 ASDF for optimal pixel weighting.
+    n_iterations : int, default 2
+        Number of profile fitting iterations (default 2, updating contaminant mask).
 
     Returns
     -------
@@ -1570,9 +1653,9 @@ def mask_contaminants_with_spikes_protected(
     else:
         core_protection_radius_px = float(core_protection_radius_px)
 
-    # Resolve detection threshold
+    # Resolve detection threshold (user formula: median + 1.5 * std)
     if detection_sigma is None:
-        detection_sigma = float(getattr(spikes_cfg, "contaminant_detection_sigma", 3.0))
+        detection_sigma = float(getattr(spikes_cfg, "contaminant_detection_sigma", 1.5))
     else:
         detection_sigma = float(detection_sigma)
 
@@ -1606,7 +1689,12 @@ def mask_contaminants_with_spikes_protected(
         final_mask |= (~np.isfinite(stamp))
         return final_mask, protected_stellar_area, residual
 
-    # Pre-compute circular aperture masks for neighbor Gaia stars (used for both Moffat fitting and contaminant masking)
+    # Dynamic central saturation detection: expand core protection if central pixels are NaN
+    nan_in_core = (~np.isfinite(stamp)) & (r < min(cx, 50.0))
+    if np.any(nan_in_core):
+        core_protection_radius_px = max(core_protection_radius_px, float(np.max(r[nan_in_core])) + 1.5)
+
+    # Pre-compute circular aperture masks for neighbor Gaia stars (used for fitting exclusion & contaminant mask)
     comp_mask = None
     if companion_stars is not None:
         comp_mask = mask_gaia_companion_stars(
@@ -1619,20 +1707,58 @@ def mask_contaminants_with_spikes_protected(
             core_exclusion_radius_px=core_protection_radius_px,
         )
 
-    # 2. Compute residual map (via Superback, STPSF, Moffat model subtraction, or unsharp masking)
+    # Resolve base spike angles (theoretical dual-12 rays)
+    spike_order = getattr(spikes_cfg, "spike_order", None)
+    if spike_order is not None and str(spike_order).lower() in ("both", "all", "combined"):
+        base_spike_angles = get_all_spike_angles(net_rotation)
+    elif spike_order is not None and str(spike_order).lower() in ("primary", "1"):
+        base_spike_angles = get_theoretical_spike_angles(net_rotation, order="primary")
+    else:
+        order_to_use = spike_order if spike_order is not None else "secondary"
+        base_spike_angles = get_theoretical_spike_angles(net_rotation, order=order_to_use)
+
+    def _build_spike_and_core_protection(res_map: np.ndarray) -> np.ndarray:
+        refined_angles = refine_spike_angles(
+            res_map,
+            (cx, cy),
+            base_spike_angles,
+            search_window_deg=float(getattr(spikes_cfg, "refine_search_window_deg", 3.5)),
+            step_deg=float(getattr(spikes_cfg, "refine_step_deg", 0.5)),
+            r_min=max(core_protection_radius_px, 15.0),
+            r_max=min(max(cx * 0.8, 35.0), 150.0),
+        )
+        geom_mask = create_geometric_spike_mask(
+            (ny, nx),
+            (cx, cy),
+            refined_angles,
+            angular_half_width_deg=angular_half_width,
+            radial_min=max(core_protection_radius_px, 1.0),
+            spike_width_px=spike_width,
+            width_growth_rate=effective_growth_rate,
+        )
+        morph_mask = detect_morphological_spikes(
+            res_map,
+            (cx, cy),
+            threshold_sigma=morph_sigma,
+            min_length_px=morph_length,
+            dilation_iterations=morph_dil,
+        )
+        return geom_mask | morph_mask | (r <= core_protection_radius_px)
+
     method_lower = str(method).lower().strip()
     if method_lower == "unsharp":
         residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
+        protected_stellar_area = _build_spike_and_core_protection(residual)
+        contaminants = _detect_contaminants_erosion_dilation(
+            residual,
+            protected_stellar_area,
+            dq_mask=dq_mask,
+            detection_sigma=detection_sigma,
+        )
     else:
-        # Mask the central core region during the fit for bright and medium stars
-        tier_str = str(tier).lower().strip() if tier is not None else ""
-        if tier_str in ("bright", "medium"):
-            min_fit_r = float(core_protection_radius_px)
-        else:
-            min_fit_r = None
-
+        # 2-iteration Moffat fitting (or physical model fit) weighted by var_poisson
+        min_fit_r = float(core_protection_radius_px)
         max_fit_r = min(max(cx * 0.4, 30.0), 100.0)
-
         sub_offset = None
         if target_center_xy is not None:
             sub_offset = (
@@ -1640,6 +1766,7 @@ def mask_contaminants_with_spikes_protected(
                 float(target_center_xy[1] - round(target_center_xy[1])),
             )
 
+        # Iteration 1: Fit profile weighted by Poisson variance, excluding core and Gaia companion stars
         fitted_img, _ = fit_stellar_model(
             stamp,
             tier=tier,
@@ -1650,105 +1777,51 @@ def mask_contaminants_with_spikes_protected(
             max_radius=max_fit_r,
             min_radius=min_fit_r,
             mask=comp_mask,
+            variance=var_poisson,
             subpixel_offset=sub_offset,
             method=method,
             engine=engine,
         )
         residual = (stamp - fitted_img).astype(np.float32)
-
-    # 3. Spike protection covering theoretical spikes + empirical refinement
-    spike_order = getattr(spikes_cfg, "spike_order", None)
-    if spike_order is not None and str(spike_order).lower() in ("both", "all", "combined"):
-        base_spike_angles = get_all_spike_angles(net_rotation)
-    elif spike_order is not None and str(spike_order).lower() in ("primary", "1"):
-        base_spike_angles = get_theoretical_spike_angles(net_rotation, order="primary")
-    else:
-        # Default: secondary (12 rays) unless configured as "both" or "primary"
-        order_to_use = spike_order if spike_order is not None else "secondary"
-        base_spike_angles = get_theoretical_spike_angles(net_rotation, order=order_to_use)
-
-    if is_faint:
-        # Faint stars do not exhibit detectable diffraction spikes; omit spike protection
-        geom_spike_mask = np.zeros(stamp.shape, dtype=bool)
-        morph_spike_mask = np.zeros(stamp.shape, dtype=bool)
-    else:
-        refined_spike_angles = refine_spike_angles(
+        protected_stellar_area = _build_spike_and_core_protection(residual)
+        contam_1 = _detect_contaminants_erosion_dilation(
             residual,
-            (cx, cy),
-            base_spike_angles,
-            search_window_deg=float(getattr(spikes_cfg, "refine_search_window_deg", 3.5)),
-            step_deg=float(getattr(spikes_cfg, "refine_step_deg", 0.5)),
-            r_min=max(core_protection_radius_px, 15.0),
-            r_max=min(max(cx * 0.8, 35.0), 150.0),
-        )
-        geom_spike_mask = create_geometric_spike_mask(
-            (ny, nx),
-            (cx, cy),
-            refined_spike_angles,
-            angular_half_width_deg=angular_half_width,
-            radial_min=max(core_protection_radius_px, 1.0),
-            spike_width_px=spike_width,
-            width_growth_rate=effective_growth_rate,
-        )
-        morph_spike_mask = detect_morphological_spikes(
-            residual,
-            (cx, cy),
-            threshold_sigma=morph_sigma,
-            min_length_px=morph_length,
-            dilation_iterations=morph_dil,
+            protected_stellar_area,
+            dq_mask=dq_mask,
+            detection_sigma=detection_sigma,
         )
 
-    spike_protection = geom_spike_mask | morph_spike_mask
-    core_protection = (r <= core_protection_radius_px)
-    protected_stellar_area = spike_protection | core_protection
+        # Iteration 2: Re-fit profile with updated mask excluding initial contaminants & companions
+        if n_iterations >= 2 and method_lower in ("moffat", "auto"):
+            iter2_mask = contam_1.copy()
+            if comp_mask is not None:
+                iter2_mask |= comp_mask
 
-    # 4. Detect extraneous non-star contaminants
-    # Note: For faint stars, residual contaminant masking is omitted to preserve faint stellar wings
-    if is_faint:
-        contaminants = np.zeros(stamp.shape, dtype=bool)
-    else:
-        clean_area = ~protected_stellar_area
-        if dq_mask is not None:
-            clean_area &= (~dq_mask)
-
-        try:
-            from astropy.stats import sigma_clipped_stats
-            import cv2
-
-            valid_res = residual[clean_area & np.isfinite(residual)]
-            if len(valid_res) > 20:
-                _, res_med, res_std = sigma_clipped_stats(valid_res, sigma=3.0, maxiters=5)
-            else:
-                res_med, res_std = 0.0, float(np.nanstd(residual)) or 1.0
-
-            # User new mask method: residual > median + 1.5 * std (with floor for noiseless/synthetic data)
-            threshold_val = res_med + max(1.5 * res_std, 0.1)
-            contam_raw = (residual > threshold_val).astype(np.uint8)
-
-            # Morphological opening and dilation: erode 1x1 then dilate 3x3
-            contam_opened = cv2.erode(contam_raw, np.ones((1, 1), np.uint8), iterations=1)
-            contam_dilated = cv2.dilate(contam_opened, np.ones((3, 3), np.uint8), iterations=1)
-            contaminants = contam_dilated.astype(bool)
-
-            # Strict Invariant: Exclude protected spikes & core from contaminant mask
-            contaminants[protected_stellar_area] = False
-
-        except Exception as exc:
-            logger.warning("Falling back to standard contaminant detection: %s", exc)
-            valid_res = residual[clean_area & np.isfinite(residual)]
-            if len(valid_res) > 20:
-                res_med = float(np.median(valid_res))
-                res_std = float(1.4826 * np.median(np.abs(valid_res - res_med)))
-                if res_std <= 0.0:
-                    res_std = float(np.nanstd(valid_res)) or 1.0
-            else:
-                res_med = 0.0
-                res_std = float(np.nanstd(residual)) if np.any(np.isfinite(residual)) else 1.0
-
-            sigma_r = detection_sigma * (1.0 + 50.0 * np.exp(-r / 15.0))
-            contam_raw = (residual - res_med) > (sigma_r * res_std)
-            contaminants = binary_dilation(contam_raw, iterations=1) if np.any(contam_raw) else contam_raw
-            contaminants &= (~protected_stellar_area)
+            fitted_img, _ = fit_stellar_model(
+                stamp,
+                tier=tier,
+                detector=detector,
+                position=target_center_xy,
+                bandpass=bandpass,
+                dq_mask=dq_mask,
+                max_radius=max_fit_r,
+                min_radius=min_fit_r,
+                mask=iter2_mask,
+                variance=var_poisson,
+                subpixel_offset=sub_offset,
+                method=method,
+                engine=engine,
+            )
+            residual = (stamp - fitted_img).astype(np.float32)
+            protected_stellar_area = _build_spike_and_core_protection(residual)
+            contaminants = _detect_contaminants_erosion_dilation(
+                residual,
+                protected_stellar_area,
+                dq_mask=dq_mask,
+                detection_sigma=detection_sigma,
+            )
+        else:
+            contaminants = contam_1
 
     # 5. Include circular aperture masks for other Gaia stars using get_psf_extension_moffat
     if comp_mask is not None:
@@ -1758,6 +1831,8 @@ def mask_contaminants_with_spikes_protected(
     final_mask = contaminants.copy()
     if dq_mask is not None:
         final_mask |= dq_mask
+    final_mask |= (~np.isfinite(stamp))
+
     final_mask |= (~np.isfinite(stamp))
 
     return final_mask, protected_stellar_area, residual

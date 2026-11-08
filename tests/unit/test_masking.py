@@ -586,4 +586,60 @@ class TestSuperbackAndStpsfFitting:
         assert not final_mask[40, 40]
 
 
+class TestTwoIterationMoffatFitting:
+    """Tests for 2-iteration Moffat fitting weighted by var_poisson with updated mask."""
+
+    def test_two_iteration_moffat_with_var_poisson(self):
+        sz = 81
+        cy, cx = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+
+        # True Moffat profile
+        moffat_true = 500.0 / (1.0 + (r / 3.0)**2)**1.5 + 2.0
+        stamp = moffat_true.copy().astype(np.float32)
+
+        # Add off-axis contaminant
+        stamp[20, 20] = 150.0
+
+        # Construct Poisson noise variance array
+        var_poisson = np.maximum(stamp, 0.01).astype(np.float32)
+
+        # 2-iteration fit
+        final_mask, prot_area, residual = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="bright",
+            method="moffat",
+            var_poisson=var_poisson,
+            n_iterations=2,
+        )
+
+        assert final_mask.shape == (sz, sz)
+        assert prot_area.shape == (sz, sz)
+        assert residual.shape == (sz, sz)
+
+        # Off-axis contaminant detected and masked
+        assert final_mask[20, 20]
+        # Core is strictly protected
+        assert not final_mask[40, 40]
+        assert prot_area[40, 40]
+
+    def test_faint_tier_bypasses_moffat(self):
+        sz = 81
+        stamp = np.full((sz, sz), 5.0, dtype=np.float32)
+        stamp[40, 40] = 50.0
+        stamp[20, 20] = 100.0  # contaminant
+
+        final_mask, prot_area, residual = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="faint",
+            method="moffat",
+        )
+
+        # Faint stars must not have contaminant masking applied
+        assert not final_mask[20, 20]
+        assert np.array_equal(residual, stamp)
+
+
+
 

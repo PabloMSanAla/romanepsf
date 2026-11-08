@@ -59,6 +59,7 @@ class RomanL2Data:
     zp_ab: float                # Photometric zero-point in AB magnitude
     meta: Dict[str, Any]        # Complete metadata dictionary
     is_calibrated: bool = True  # True if data is in surface brightness units (MJy/sr)
+    var_poisson: Optional[np.ndarray] = None  # Poisson variance array from Level 2 ASDF
 
     def __post_init__(self) -> None:
         if self.data is not None:
@@ -279,13 +280,24 @@ def load_l2_image(
         elif wcsinfo_meta is not None and hasattr(wcsinfo_meta, "roll_ref") and wcsinfo_meta.roll_ref is not None:
             pa_aperture = float(wcsinfo_meta.roll_ref)
 
+        # Extract var_poisson if available in Level 2 ASDF
+        var_poisson = (
+            np.asarray(dm.var_poisson, dtype=np.float32)
+            if hasattr(dm, "var_poisson") and dm.var_poisson is not None
+            else None
+        )
+        if var_poisson is not None and var_poisson.shape != raw_data.shape:
+            var_poisson = None
+
         # Apply photometric calibration to science arrays if requested
         if calibrate:
             cal_data = raw_data * conv_factor
             cal_err = err * conv_factor
+            cal_var_poisson = (var_poisson * (conv_factor ** 2)).astype(np.float32) if var_poisson is not None else None
         else:
             cal_data = raw_data.copy()
             cal_err = err.copy()
+            cal_var_poisson = var_poisson.copy() if var_poisson is not None else None
 
         # Compile metadata dictionary
         meta_dict: Dict[str, Any] = {
@@ -317,4 +329,5 @@ def load_l2_image(
         zp_ab=zp_ab,
         meta=meta_dict,
         is_calibrated=calibrate,
+        var_poisson=cal_var_poisson,
     )

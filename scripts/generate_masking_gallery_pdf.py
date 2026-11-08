@@ -1,13 +1,13 @@
 """
 Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking,
-SUPERBACK (rosalia) & STPSF Physical Model Residual Fitting, and Contaminant Filtering.
+2-Iteration AstroPhot Moffat Fitting Weighted by var_poisson, and Contaminant Filtering.
 
 Visualizes 3 panels per star:
   1. Normal: Log stretched stamp flux
-  2. Residual: Physical model residual map (delta I = I_obs - I_model):
-     - Bright stars: SUPERBACK optical model (rosalia.superback_pytorch)
-     - Medium stars: STPSF instrumental model (stpsf.WFI)
-     - Faint stars: direct pass-through (model fit omitted)
+  2. Residual: AstroPhot 2-iteration Moffat residual map (delta I = I_obs - I_moffat):
+     - Weighted by Level 2 ASDF var_poisson extension
+     - Second iteration updates fit mask with erosion-dilation detected contaminants
+     - Faint stars: direct pass-through (Moffat fit omitted)
   3. Normal + Mask: Stamp flux with semi-transparent uniform yellow overlay highlighting
      masked contaminant pixels & circular Gaia companion apertures, strictly
      preserving Roman diffraction spikes and stellar core.
@@ -138,6 +138,9 @@ def main():
         sz = get_adaptive_stamp_size(mag, tier, max_size=1001, pixel_scale=0.11)
         raw_cutout, (ix, iy) = extract_cutout(l2.data, (cx, cy), sz, fill_value=np.nan)
         raw_dq, _ = extract_cutout(l2.dq, (cx, cy), sz, fill_value=1)
+        vp_cutout = None
+        if getattr(l2, "var_poisson", None) is not None:
+            vp_cutout, _ = extract_cutout(l2.var_poisson, (cx, cy), sz, fill_value=np.nan)
         
         dq_mask = (raw_dq & 1) > 0  # Saturated or bad
         core_rad = 6.0 if tier == "bright" else 4.0
@@ -163,7 +166,7 @@ def main():
         in_stamp = (dist > core_rad) & (np.abs(dx) <= half + 10) & (np.abs(dy) <= half + 10)
         n_comps = int(np.sum(in_stamp))
         
-        # Apply spike protection and contaminant + Gaia circular companion masking using SUPERBACK / STPSF fitting
+        # Apply spike protection and contaminant + Gaia circular companion masking using 2-iteration AstroPhot Moffat fitting
         final_mask, protected_spikes, res_img = mask_contaminants_with_spikes_protected(
             flux_sub,
             dq_mask=dq_mask,
@@ -174,9 +177,11 @@ def main():
             target_center_xy=(cx, cy),
             pixel_scale=l2.pixel_scale,
             companion_depth=28.0,
-            method="auto",
+            method="moffat",
             detector=det,
             bandpass="F146",
+            var_poisson=vp_cutout,
+            n_iterations=2,
         )
         residual = res_img
         
@@ -190,29 +195,13 @@ def main():
             depth=28.0,
             core_exclusion_radius_px=core_rad,
         )
-        
-        # Retrieve fitted forward model amplitude
-        fitted_amp = 0.0
-        if tier != "faint":
-            _, fitted_amp = fit_stellar_model(
-                flux_sub,
-                tier=tier,
-                detector=det,
-                position=(cx, cy),
-                bandpass="F146",
-                dq_mask=dq_mask,
-                min_radius=core_rad,
-                mask=comp_only_mask,
-                bkg_rms=bkg_rms,
-                method="auto",
-            )
 
         masked_pct = 100.0 * np.sum(final_mask) / flux_sub.size
         prot_pct = 100.0 * np.sum(protected_spikes) / flux_sub.size
         comp_masked_px = int(np.sum(comp_only_mask))
         
         print(f"[{idx+1:02d}/{len(sample_df)}] {tier.upper():6s} Star {source_id} ({det}, mag={mag:.2f}, {sz}x{sz}): "
-              f"Scale A={fitted_amp:.2e}, Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
+              f"Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
               
         processed_stars.append({
             "idx": idx + 1,
@@ -229,7 +218,6 @@ def main():
             "n_comps": n_comps,
             "masked_pct": masked_pct,
             "prot_pct": prot_pct,
-            "fitted_amp": fitted_amp,
         })
 
     # Render Multi-Page PDF
@@ -294,20 +282,15 @@ def main():
                 ax_res.set_facecolor("#161b22")
                 clean_res = np.maximum(res, 1e-4)
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
-                if star_tier == "bright":
+                if star_tier == "faint":
                     res_title = (
-                        rf"SUPERBACK Forward Model Residual ($\Delta I = I_{{obs}} - A \cdot I_{{sb}}$)" "\n"
-                        rf"Scale $A = {star['fitted_amp']:.2e}$ MJy/sr | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
-                    )
-                elif star_tier == "medium":
-                    res_title = (
-                        rf"STPSF Forward Model Residual ($\Delta I = I_{{obs}} - A \cdot I_{{stpsf}}$)" "\n"
-                        rf"Scale $A = {star['fitted_amp']:.2e}$ MJy/sr | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"Faint Tier: Moffat Fit Skipped" "\n"
+                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 else:
                     res_title = (
-                        rf"Faint Tier: Forward Model Skipped" "\n"
-                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"AstroPhot 2-Iter Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
+                        rf"Weighted with var_poisson | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_res.tick_params(colors="#8b949e", labelsize=8)
@@ -347,7 +330,7 @@ def main():
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
             fig.suptitle(
                 f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages} "
-                f"(Forward-Modeled SUPERBACK [Bright] & STPSF [Medium] | Spikes & Cores Protected)",
+                f"(2-Iter AstroPhot Moffat + var_poisson Weighting | Spikes & Cores Protected)",
                 fontsize=13, color="#58a6ff", fontweight="bold", y=0.97
             )
             
