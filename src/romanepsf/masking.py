@@ -757,20 +757,23 @@ def fit_superback_model(
     else:
         dx, dy = 0.0, 0.0
 
-    if abs(dx) > 1e-4 or abs(dy) > 1e-4:
-        psf_model = shift(psf_model, shift=(dy, dx), order=3)
-
-    # Build fitting mask
+    # Build fitting mask with dynamic core saturation detection
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r = np.sqrt((grid_x - half_x)**2 + (grid_y - half_y)**2)
+
+    # Detect any central saturation / NaN core dynamically
+    nan_in_core = (~np.isfinite(stamp)) & (r < min(half_x, 50.0))
+    eff_min_r = min_radius if min_radius is not None else 0.0
+    if np.any(nan_in_core):
+        eff_min_r = max(eff_min_r, float(np.max(r[nan_in_core])) + 1.5)
 
     fit_mask = np.isfinite(stamp)
     if dq_mask is not None:
         fit_mask &= (~dq_mask)
     if mask is not None:
         fit_mask &= (~mask)
-    if min_radius is not None and min_radius > 0:
-        fit_mask &= (r >= min_radius)
+    if eff_min_r > 0:
+        fit_mask &= (r >= eff_min_r)
     if max_radius is not None and max_radius > 0:
         fit_mask &= (r <= max_radius)
 
@@ -778,26 +781,35 @@ def fit_superback_model(
 
     if np.sum(fit_mask) < 10 or np.sum(psf_model[fit_mask]**2) < 1e-12:
         logger.warning("Insufficient valid pixels for SUPERBACK fit; returning unscaled model.")
-        return psf_model.astype(np.float32), 1.0
+        return np.clip(psf_model, 0.0, None).astype(np.float32), 1.0
 
-    p = psf_model[fit_mask]
-    y = stamp[fit_mask]
+    y_obs = stamp[fit_mask]
     sig_floor = bkg_rms if bkg_rms is not None and bkg_rms > 0 else 0.1
-    w = 1.0 / np.sqrt(np.maximum(y, 0.1) + sig_floor**2)
+    w = 1.0 / np.sqrt(np.maximum(y_obs, 0.1) + sig_floor**2)
 
-    X = np.column_stack([p, np.ones_like(p)])
-    try:
-        params, _, _, _ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
-        A, b = float(params[0]), float(params[1])
-        if A <= 0 or abs(b) > 0.5 * max(float(np.nanpercentile(y, 90)), 1.0):
-            A = float(np.sum(w * y * p) / np.sum(w * p**2))
-            b = 0.0
-    except Exception:
-        A = float(np.sum(w * y * p) / np.sum(w * p**2))
-        b = 0.0
+    # Forward-model: fine-tune subpixel alignment and scale A on image pixels
+    best_loss = 1e30
+    best_A = 1.0
+    best_p_shifted = psf_model
 
-    fitted_image = (A * psf_model + b).astype(np.float32)
-    return fitted_image, A
+    for sub_dy in [dy - 0.05, dy, dy + 0.05]:
+        for sub_dx in [dx - 0.05, dx, dx + 0.05]:
+            p_cand = np.clip(shift(psf_model, (sub_dy, sub_dx), order=1), 0.0, None)
+            p = p_cand[fit_mask]
+            denom = np.sum(w * p**2)
+            if denom <= 0:
+                continue
+            cand_A = float(np.sum(w * y_obs * p) / denom)
+            if cand_A <= 0:
+                continue
+            loss = float(np.sum(w**2 * (y_obs - cand_A * p)**2))
+            if loss < best_loss:
+                best_loss = loss
+                best_A = cand_A
+                best_p_shifted = p_cand
+
+    fitted_image = np.clip(best_A * best_p_shifted, 0.0, None).astype(np.float32)
+    return fitted_image, best_A
 
 
 def fit_stpsf_model(
@@ -904,20 +916,22 @@ def fit_stpsf_model(
     else:
         dx, dy = 0.0, 0.0
 
-    if abs(dx) > 1e-4 or abs(dy) > 1e-4:
-        psf_model = shift(psf_model, shift=(dy, dx), order=3)
-
-    # Build fitting mask
+    # Build fitting mask with dynamic core saturation detection
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r = np.sqrt((grid_x - half_x)**2 + (grid_y - half_y)**2)
+
+    nan_in_core = (~np.isfinite(stamp)) & (r < min(half_x, 50.0))
+    eff_min_r = min_radius if min_radius is not None else 0.0
+    if np.any(nan_in_core):
+        eff_min_r = max(eff_min_r, float(np.max(r[nan_in_core])) + 1.5)
 
     fit_mask = np.isfinite(stamp)
     if dq_mask is not None:
         fit_mask &= (~dq_mask)
     if mask is not None:
         fit_mask &= (~mask)
-    if min_radius is not None and min_radius > 0:
-        fit_mask &= (r >= min_radius)
+    if eff_min_r > 0:
+        fit_mask &= (r >= eff_min_r)
     if max_radius is not None and max_radius > 0:
         fit_mask &= (r <= max_radius)
 
@@ -925,26 +939,34 @@ def fit_stpsf_model(
 
     if np.sum(fit_mask) < 10 or np.sum(psf_model[fit_mask]**2) < 1e-12:
         logger.warning("Insufficient valid pixels for STPSF fit; returning unscaled model.")
-        return psf_model.astype(np.float32), 1.0
+        return np.clip(psf_model, 0.0, None).astype(np.float32), 1.0
 
-    p = psf_model[fit_mask]
-    y = stamp[fit_mask]
+    y_obs = stamp[fit_mask]
     sig_floor = bkg_rms if bkg_rms is not None and bkg_rms > 0 else 0.1
-    w = 1.0 / np.sqrt(np.maximum(y, 0.1) + sig_floor**2)
+    w = 1.0 / np.sqrt(np.maximum(y_obs, 0.1) + sig_floor**2)
 
-    X = np.column_stack([p, np.ones_like(p)])
-    try:
-        params, _, _, _ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
-        A, b = float(params[0]), float(params[1])
-        if A <= 0 or abs(b) > 0.5 * max(float(np.nanpercentile(y, 90)), 1.0):
-            A = float(np.sum(w * y * p) / np.sum(w * p**2))
-            b = 0.0
-    except Exception:
-        A = float(np.sum(w * y * p) / np.sum(w * p**2))
-        b = 0.0
+    best_loss = 1e30
+    best_A = 1.0
+    best_p_shifted = psf_model
 
-    fitted_image = (A * psf_model + b).astype(np.float32)
-    return fitted_image, A
+    for sub_dy in [dy - 0.05, dy, dy + 0.05]:
+        for sub_dx in [dx - 0.05, dx, dx + 0.05]:
+            p_cand = np.clip(shift(psf_model, (sub_dy, sub_dx), order=1), 0.0, None)
+            p = p_cand[fit_mask]
+            denom = np.sum(w * p**2)
+            if denom <= 0:
+                continue
+            cand_A = float(np.sum(w * y_obs * p) / denom)
+            if cand_A <= 0:
+                continue
+            loss = float(np.sum(w**2 * (y_obs - cand_A * p)**2))
+            if loss < best_loss:
+                best_loss = loss
+                best_A = cand_A
+                best_p_shifted = p_cand
+
+    fitted_image = np.clip(best_A * best_p_shifted, 0.0, None).astype(np.float32)
+    return fitted_image, best_A
 
 
 def fit_stellar_model(

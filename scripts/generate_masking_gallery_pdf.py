@@ -37,6 +37,7 @@ from romanepsf.stamps import (
 )
 from romanepsf.masking import (
     fit_moffat_model,
+    fit_stellar_model,
     mask_contaminants_with_spikes_protected,
     mask_gaia_companion_stars,
 )
@@ -190,12 +191,28 @@ def main():
             core_exclusion_radius_px=core_rad,
         )
         
+        # Retrieve fitted forward model amplitude
+        fitted_amp = 0.0
+        if tier != "faint":
+            _, fitted_amp = fit_stellar_model(
+                flux_sub,
+                tier=tier,
+                detector=det,
+                position=(cx, cy),
+                bandpass="F146",
+                dq_mask=dq_mask,
+                min_radius=core_rad,
+                mask=comp_only_mask,
+                bkg_rms=bkg_rms,
+                method="auto",
+            )
+
         masked_pct = 100.0 * np.sum(final_mask) / flux_sub.size
         prot_pct = 100.0 * np.sum(protected_spikes) / flux_sub.size
         comp_masked_px = int(np.sum(comp_only_mask))
         
         print(f"[{idx+1:02d}/{len(sample_df)}] {tier.upper():6s} Star {source_id} ({det}, mag={mag:.2f}, {sz}x{sz}): "
-              f"Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
+              f"Scale A={fitted_amp:.2e}, Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
               
         processed_stars.append({
             "idx": idx + 1,
@@ -212,6 +229,7 @@ def main():
             "n_comps": n_comps,
             "masked_pct": masked_pct,
             "prot_pct": prot_pct,
+            "fitted_amp": fitted_amp,
         })
 
     # Render Multi-Page PDF
@@ -271,24 +289,24 @@ def main():
                 cb1.ax.tick_params(colors="#8b949e", labelsize=7.5)
                 cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
                 
-                # ----------------- Panel 2: Physical Model Residual Map (Same Stretch) -----------------
+                # ----------------- Panel 2: Forward Model Residual Map (Same Stretch) -----------------
                 ax_res = axes[row_idx, 1]
                 ax_res.set_facecolor("#161b22")
                 clean_res = np.maximum(res, 1e-4)
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
                 if star_tier == "bright":
                     res_title = (
-                        rf"SUPERBACK Residual ($\Delta I = I_{{obs}} - I_{{sb}}$)" "\n"
-                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"SUPERBACK Forward Model Residual ($\Delta I = I_{{obs}} - A \cdot I_{{sb}}$)" "\n"
+                        rf"Scale $A = {star['fitted_amp']:.2e}$ MJy/sr | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 elif star_tier == "medium":
                     res_title = (
-                        rf"STPSF Residual ($\Delta I = I_{{obs}} - I_{{stpsf}}$)" "\n"
-                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"STPSF Forward Model Residual ($\Delta I = I_{{obs}} - A \cdot I_{{stpsf}}$)" "\n"
+                        rf"Scale $A = {star['fitted_amp']:.2e}$ MJy/sr | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 else:
                     res_title = (
-                        rf"Faint Tier: Model Fit Skipped" "\n"
+                        rf"Faint Tier: Forward Model Skipped" "\n"
                         rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
@@ -329,7 +347,7 @@ def main():
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
             fig.suptitle(
                 f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages} "
-                f"(Bright: SUPERBACK | Medium: STPSF | Faint: Direct | Spikes & Cores Protected)",
+                f"(Forward-Modeled SUPERBACK [Bright] & STPSF [Medium] | Spikes & Cores Protected)",
                 fontsize=13, color="#58a6ff", fontweight="bold", y=0.97
             )
             
