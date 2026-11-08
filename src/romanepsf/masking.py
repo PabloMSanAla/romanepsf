@@ -359,9 +359,18 @@ def fit_moffat_model(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
     max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    sigma_image: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
 ) -> Tuple[np.ndarray, Any]:
     """
-    Fit a 2D circularly symmetric Moffat profile to the stellar core.
+    Fit a 2D Moffat profile to stellar flux, weighting by Poisson noise and masking central/neighbor stars.
+
+    Generates a Poisson noise uncertainty map (sigma = sqrt(max(I - bkg, 0) + bkg_rms^2))
+    to ensure proper weighting across both stellar wings and outskirts. Excludes masked pixels
+    (e.g., companion Gaia stars, DQ flags) and optionally masks the central core region
+    (for bright and medium stars) so non-Moffat core structure does not distort the wing fit.
 
     Parameters
     ----------
@@ -371,6 +380,14 @@ def fit_moffat_model(
         Boolean mask of invalid/saturated pixels (True = bad).
     max_radius : float, optional
         Maximum radius from stamp center included in fit (limits computation on large stamps).
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit (masks the central core).
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude from the fit (e.g., companion Gaia stars).
+    sigma_image : np.ndarray, optional
+        Pre-computed 2D noise / uncertainty image. If None, constructed as Poisson noise.
+    bkg_rms : float, optional
+        Background RMS noise estimate. If None, robustly estimated from perimeter pixels.
 
     Returns
     -------
@@ -385,6 +402,10 @@ def fit_moffat_model(
     valid = np.isfinite(stamp)
     if dq_mask is not None:
         valid &= (~dq_mask)
+    if mask is not None:
+        valid &= (~mask)
+    if min_radius is not None and min_radius > 0:
+        valid &= (r >= min_radius)
     if max_radius is not None:
         valid &= (r <= max_radius)
 
@@ -397,10 +418,31 @@ def fit_moffat_model(
         outer_cutout &= (~dq_mask)
     bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
 
-    peak_val = float(np.nanmax(stamp[valid])) - bkg
+    if bkg_rms is None:
+        if np.any(outer_cutout):
+            outer_vals = stamp[outer_cutout]
+            bkg_rms = float(1.4826 * np.median(np.abs(outer_vals - bkg)))
+            if bkg_rms <= 0.0:
+                bkg_rms = float(np.std(outer_vals)) or 0.5
+        else:
+            bkg_rms = 0.5
+    bkg_rms = max(float(bkg_rms), 0.1)
+
+    finite_stamp = stamp[np.isfinite(stamp)]
+    peak_val = float(np.nanmax(finite_stamp)) - bkg if len(finite_stamp) > 0 else 1.0
+    peak_val = max(peak_val, 1.0)
+
+    # Poisson noise sigma image:
+    # sigma = sqrt(max(stamp - bkg, 0) + bkg_rms^2)
+    # Properly weights the outskirts so the fit captures the wings rather than just the core
+    if sigma_image is None:
+        flux_excess = np.maximum(stamp - bkg, 0.0)
+        sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
+
+    weights = 1.0 / np.clip(sigma_image[valid], 0.1, None)
 
     init_moffat = models.Moffat2D(
-        amplitude=max(peak_val, 1.0),
+        amplitude=peak_val,
         x_0=float(cx),
         y_0=float(cy),
         gamma=2.5,
@@ -409,12 +451,11 @@ def fit_moffat_model(
     init_moffat.x_0.bounds = (cx - 5.0, cx + 5.0)
     init_moffat.y_0.bounds = (cy - 5.0, cy + 5.0)
     init_moffat.amplitude.bounds = (0.0, None)
-    init_moffat.gamma.bounds = (0.5, 20.0)
+    init_moffat.gamma.bounds = (0.5, 30.0)
     init_moffat.alpha.bounds = (1.1, 4.0)
 
     fitter = fitting.LevMarLSQFitter()
     try:
-        weights = 1.0 / np.sqrt(np.clip(stamp[valid] + max(bkg, 0.0) + 1.0, 1.0, None))
         fitted = fitter(init_moffat, grid_x[valid], grid_y[valid], stamp[valid] - bkg, weights=weights)
         fitted_image = (fitted(grid_x, grid_y) + bkg).astype(np.float32)
         return fitted_image, fitted
@@ -922,14 +963,41 @@ def mask_contaminants_with_spikes_protected(
 
     is_faint = (tier is not None and str(tier).lower().strip() == "faint")
 
+    # Pre-compute circular aperture masks for neighbor Gaia stars (used for both Moffat fitting and contaminant masking)
+    comp_mask = None
+    if companion_stars is not None:
+        comp_mask = mask_gaia_companion_stars(
+            (ny, nx),
+            (cx, cy),
+            companion_stars,
+            target_center_xy=target_center_xy,
+            pixel_scale=pixel_scale,
+            depth=companion_depth,
+            core_exclusion_radius_px=core_protection_radius_px,
+        )
+
     # 2. Compute residual map (via Moffat model subtraction or unsharp masking)
     method_lower = str(method).lower().strip()
     if method_lower == "unsharp":
         residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
     else:
         # Default: Moffat analytical model subtraction
-        max_fit_r = min(max(cx * 0.3, 20.0), 50.0)
-        moffat_img, _ = fit_moffat_model(stamp, dq_mask=dq_mask, max_radius=max_fit_r)
+        # For bright and medium stars: mask the central core region during the fit
+        tier_str = str(tier).lower().strip() if tier is not None else ""
+        if tier_str in ("bright", "medium"):
+            min_fit_r = float(core_protection_radius_px)
+        else:
+            min_fit_r = None
+
+        max_fit_r = min(max(cx * 0.4, 30.0), 100.0)
+
+        moffat_img, _ = fit_moffat_model(
+            stamp,
+            dq_mask=dq_mask,
+            max_radius=max_fit_r,
+            min_radius=min_fit_r,
+            mask=comp_mask,
+        )
         residual = (stamp - moffat_img).astype(np.float32)
 
     # 3. Spike protection covering theoretical spikes + empirical refinement
@@ -997,8 +1065,8 @@ def mask_contaminants_with_spikes_protected(
             else:
                 res_med, res_std = 0.0, float(np.nanstd(residual)) or 1.0
 
-            # User new mask method: residual > median + 1.5 * std
-            threshold_val = res_med + 1.5 * res_std
+            # User new mask method: residual > median + 1.5 * std (with floor for noiseless/synthetic data)
+            threshold_val = res_med + max(1.5 * res_std, 0.1)
             contam_raw = (residual > threshold_val).astype(np.uint8)
 
             # Morphological opening and dilation: erode 1x1 then dilate 3x3
@@ -1027,16 +1095,7 @@ def mask_contaminants_with_spikes_protected(
             contaminants &= (~protected_stellar_area)
 
     # 5. Include circular aperture masks for other Gaia stars using get_psf_extension_moffat
-    if companion_stars is not None:
-        comp_mask = mask_gaia_companion_stars(
-            (ny, nx),
-            (cx, cy),
-            companion_stars,
-            target_center_xy=target_center_xy,
-            pixel_scale=pixel_scale,
-            depth=companion_depth,
-            core_exclusion_radius_px=core_protection_radius_px,
-        )
+    if comp_mask is not None:
         contaminants |= comp_mask
 
     # 6. Assemble final mask

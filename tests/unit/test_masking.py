@@ -136,6 +136,33 @@ class TestMoffatFitting:
         assert fitted_img.shape == (51, 51)
         assert model is None
 
+    def test_fit_with_masked_central_core(self):
+        sz = 81
+        cx, cy = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.sqrt((gx - cx)**2 + (gy - cy)**2)
+        star = (300.0 / (1.0 + (r / 2.5)**2)**1.52).astype(np.float32)
+        # Fit with core r < 5.0 masked
+        fitted_img, model = fit_moffat_model(star, min_radius=5.0)
+        assert model is not None
+        assert model.amplitude.value > 100.0
+        assert 0.5 <= model.gamma.value <= 30.0
+
+    def test_fit_masks_neighbor_star(self):
+        sz = 81
+        cx, cy = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.sqrt((gx - cx)**2 + (gy - cy)**2)
+        star = (300.0 / (1.0 + (r / 2.5)**2)**1.52).astype(np.float32)
+        # Add neighbor star at (65, 40)
+        neighbor = (100.0 * np.exp(-((gx - 65)**2 + (gy - 40)**2) / 8.0)).astype(np.float32)
+        stamp = star + neighbor
+        neighbor_mask = np.hypot(gx - 65, gy - 40) <= 6.0
+
+        fitted_img, model = fit_moffat_model(stamp, mask=neighbor_mask)
+        assert model is not None
+        assert abs(model.amplitude.value - 300.0) < 50.0
+
 
 class TestMorphologicalRidgeFilter:
     """Tests for continuous directional ridge detection and contaminant rejection."""
