@@ -1,11 +1,12 @@
 """
-Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking
-and Residual-Threshold Contaminant Filtering Across 15 Roman Stars.
+Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking,
+AstroPhot 2D Moffat Fitting, and Residual-Threshold Contaminant Filtering Across ~20 Roman Stars.
 
 Visualizes 3 panels per star:
-  1. Normal: Log/Asinh stretched stamp flux
-  2. Residual: Moffat analytical model residual map (delta I = I_obs - I_moffat)
-  3. Normal + Mask: Stamp flux with semi-transparent overlay highlighting all
+  1. Normal: Log stretched stamp flux
+  2. Residual: AstroPhot Moffat analytical model residual map (delta I = I_obs - I_moffat)
+     for bright/medium stars; direct pass-through for faint stars.
+  3. Normal + Mask: Stamp flux with semi-transparent uniform yellow overlay highlighting
      masked contaminant pixels & circular Gaia companion apertures, strictly
      preserving Roman diffraction spikes and stellar core.
 """
@@ -40,12 +41,12 @@ from romanepsf.masking import (
 from romanepsf.config import load_config
 
 
-def select_sample_stars(tiered_catalog_path: str, n_bright: int = 5, n_medium: int = 5, n_faint: int = 5):
-    """Select a balanced set of 15 stars across tiers and detectors."""
+def select_sample_stars(tiered_catalog_path: str, n_bright: int = 10, n_medium: int = 8, n_faint: int = 2):
+    """Select a representative set of ~20 stars (mostly bright and medium, plus faint) across detectors."""
     df = pd.read_csv(tiered_catalog_path)
     
     # Priority detectors with cached Gaia data
-    preferred_detectors = ["WFI01", "WFI02", "WFI05", "WFI09", "WFI12"]
+    preferred_detectors = ["WFI01", "WFI02", "WFI04", "WFI05", "WFI09", "WFI10", "WFI12"]
     
     selected_rows = []
     
@@ -60,7 +61,7 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 5, n_medium: i
         used_dets = set()
         for _, row in sub.iterrows():
             det = row["detector"]
-            if det in preferred_detectors:
+            if det not in used_dets:
                 picked.append(row)
                 used_dets.add(det)
                 if len(picked) == count:
@@ -79,7 +80,7 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 5, n_medium: i
 
 
 def main():
-    print("=== Starting Gaia Companion & Contaminant Masking PDF Generator ===")
+    print("=== Starting AstroPhot Moffat & Gaia Masking PDF Generator ===")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = out_dir / "gaia_masking_gallery.pdf"
@@ -93,7 +94,7 @@ def main():
     if not tiered_csv.exists():
         raise FileNotFoundError("Could not locate all_stars_tiered.csv")
         
-    sample_df = select_sample_stars(str(tiered_csv), n_bright=5, n_medium=5, n_faint=5)
+    sample_df = select_sample_stars(str(tiered_csv), n_bright=10, n_medium=8, n_faint=2)
     print(f"Selected {len(sample_df)} stars across tiers:")
     for tier in ["bright", "medium", "faint"]:
         cnt = len(sample_df[sample_df["tier"].str.lower() == tier])
@@ -189,7 +190,7 @@ def main():
         prot_pct = 100.0 * np.sum(protected_spikes) / flux_sub.size
         comp_masked_px = int(np.sum(comp_only_mask))
         
-        print(f"[{idx+1:02d}/15] {tier.upper():6s} Star {source_id} ({det}, mag={mag:.2f}, {sz}x{sz}): "
+        print(f"[{idx+1:02d}/{len(sample_df)}] {tier.upper():6s} Star {source_id} ({det}, mag={mag:.2f}, {sz}x{sz}): "
               f"Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
               
         processed_stars.append({
@@ -230,6 +231,7 @@ def main():
                 res = star["residual"]
                 mask = star["final_mask"]
                 comp_mask = star["comp_mask"]
+                star_tier = star["tier"].lower()
                 tier_str = star["tier"].capitalize()
                 
                 # Flux normalization
@@ -270,11 +272,17 @@ def main():
                 ax_res.set_facecolor("#161b22")
                 clean_res = np.maximum(res, 1e-4)
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
-                ax_res.set_title(
-                    rf"Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
-                    rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]",
-                    fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6
-                )
+                if star_tier == "faint":
+                    res_title = (
+                        rf"Faint Tier: Moffat Fit Skipped" "\n"
+                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                else:
+                    res_title = (
+                        rf"AstroPhot Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
+                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_res.tick_params(colors="#8b949e", labelsize=8)
                 cb2 = plt.colorbar(im2, ax=ax_res, fraction=0.046, pad=0.03)
                 cb2.ax.tick_params(colors="#8b949e", labelsize=7.5)
@@ -291,11 +299,18 @@ def main():
                     
                 ax_mask.imshow(overlay, origin="lower")
                 
-                comp_info = f" | {star['n_comps']} Gaia Comps" if star['n_comps'] > 0 else ""
-                ax_mask.set_title(
-                    f"Normal + Mask Overlay (Yellow){comp_info}\nMasked: {star['masked_pct']:.1f}% | Spikes Protected: {star['prot_pct']:.1f}%",
-                    fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6
-                )
+                if star_tier == "faint":
+                    mask_title = (
+                        f"Normal + Mask Overlay (Faint Tier: No Masking)\n"
+                        f"Retained: 100% Core & Wings | DQ/NaN: {star['masked_pct']:.1f}%"
+                    )
+                else:
+                    comp_info = f" | {star['n_comps']} Gaia Comps" if star['n_comps'] > 0 else ""
+                    mask_title = (
+                        f"Normal + Mask Overlay (Yellow){comp_info}\n"
+                        f"Masked: {star['masked_pct']:.1f}% | Spikes Protected: {star['prot_pct']:.1f}%"
+                    )
+                ax_mask.set_title(mask_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_mask.tick_params(colors="#8b949e", labelsize=8)
                 
                 # Dummy colorbar for alignment
@@ -305,7 +320,7 @@ def main():
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
             fig.suptitle(
                 f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages} "
-                f"(Unsharp Masking + Gaia Circular Patches + Dual-12 Spike Preservation)",
+                f"(AstroPhot Moffat Residuals + Gaia Circular Patches + Dual-12 Spike Preservation)",
                 fontsize=13, color="#58a6ff", fontweight="bold", y=0.97
             )
             

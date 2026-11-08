@@ -355,7 +355,158 @@ def detect_morphological_spikes(
     return spike_mask
 
 
-def fit_moffat_model(
+class MoffatModelWrapper:
+    """
+    Wrapper around AstroPhot model providing Astropy-compatible parameter properties.
+    Ensures seamless interoperability between AstroPhot and Astropy modeling interfaces.
+    """
+    def __init__(self, ap_model):
+        self._ap_model = ap_model
+        self.I0 = ap_model.I0
+        self.Rd = ap_model.Rd
+        self.n = ap_model.n
+        self.center = ap_model.center
+        self.amplitude = ap_model.I0
+        self.gamma = ap_model.Rd
+        self.alpha = ap_model.n
+
+    def __getattr__(self, name):
+        return getattr(self._ap_model, name)
+
+    def __call__(self, *args, **kwargs):
+        return self._ap_model(*args, **kwargs)
+
+
+def fit_moffat_astrophot(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a 2D circularly symmetric Moffat profile to stellar flux using AstroPhot (https://astrophot.readthedocs.io/).
+
+    Constructs an AstroPhot TargetImage with Poisson variance weighting, masks the central core
+    (r < min_radius) and neighbor Gaia stars (mask), and fits a MoffatGalaxy model with Levenberg-Marquardt.
+    Evaluates the fitted model image analytically across the entire stamp.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit (masks central core).
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude from the fit (e.g. companion Gaia stars).
+    variance : np.ndarray, optional
+        Pre-computed variance image. If None, constructed as Poisson noise variance.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Any]
+        (fitted_image, fitted_model)
+    """
+    import astrophot as ap
+
+    ny, nx = stamp.shape
+    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    grid_y, grid_x = np.ogrid[:ny, :nx]
+    r = np.hypot(grid_x - cx, grid_y - cy)
+
+    # Estimate background from outer perimeter
+    outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
+    if dq_mask is not None:
+        outer_cutout &= (~dq_mask)
+    bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
+
+    if bkg_rms is None:
+        if np.any(outer_cutout):
+            outer_vals = stamp[outer_cutout]
+            bkg_rms = float(1.4826 * np.median(np.abs(outer_vals - bkg)))
+            if bkg_rms <= 0.0:
+                bkg_rms = float(np.std(outer_vals)) or 0.5
+        else:
+            bkg_rms = 0.5
+    bkg_rms = max(float(bkg_rms), 0.1)
+
+    flux_sub = np.where(np.isfinite(stamp), stamp - bkg, 0.0).astype(np.float32)
+    peak_val = max(float(np.nanmax(flux_sub)), 1.0)
+
+    # Combine all exclusions for fit mask
+    combined_mask = (~np.isfinite(stamp))
+    if dq_mask is not None:
+        combined_mask |= dq_mask
+    if mask is not None:
+        combined_mask |= mask
+    if min_radius is not None and min_radius > 0:
+        combined_mask |= (r < min_radius)
+    if max_radius is not None:
+        combined_mask |= (r > max_radius)
+
+    # Create Poisson variance image if not provided:
+    # Var = max(flux_sub, 0) + bkg_rms^2
+    if variance is None:
+        var_img = np.maximum(flux_sub, 0.0) + max(bkg_rms, 1.0)**2
+    else:
+        var_img = np.maximum(variance, 0.01)
+
+    # Sub-window extraction around center to ensure high fitting speed on large stamps
+    fit_r = max_radius if max_radius is not None else min(cx, cy) * 0.8
+    sub_r = int(np.ceil(fit_r)) + 5
+    x0 = max(0, int(round(cx)) - sub_r)
+    x1 = min(nx, int(round(cx)) + sub_r + 1)
+    y0 = max(0, int(round(cy)) - sub_r)
+    y1 = min(ny, int(round(cy)) + sub_r + 1)
+
+    sub_flux = flux_sub[y0:y1, x0:x1]
+    sub_var = var_img[y0:y1, x0:x1]
+    sub_mask = combined_mask[y0:y1, x0:x1]
+    sub_cx = float(cx - x0)
+    sub_cy = float(cy - y0)
+
+    target = ap.TargetImage(
+        data=sub_flux,
+        variance=sub_var,
+        mask=sub_mask,
+        pixelscale=1.0,
+    )
+
+    model = ap.models.MoffatGalaxy(
+        target=target,
+        center=[sub_cx, sub_cy],
+        PA=0.0,
+        q=1.0,
+        I0=peak_val,
+        Rd=3.0,
+        n=1.5,
+    )
+    model.center.to_static()
+    model.PA.to_static()
+    model.q.to_static()
+
+    fitter = ap.fit.LM(model, verbose=False)
+    fitter.fit()
+
+    fitted_I0 = float(model.I0.value)
+    fitted_Rd = max(float(model.Rd.value), 0.5)
+    fitted_n = max(float(model.n.value), 1.05)
+
+    wrapped_model = MoffatModelWrapper(model)
+    # Evaluate full-sized 2D Moffat image analytically across the entire stamp
+    moffat_full = (fitted_I0 / (1.0 + (r / fitted_Rd)**2)**fitted_n + bkg).astype(np.float32)
+    return moffat_full, wrapped_model
+
+
+def fit_moffat_astropy(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
     max_radius: Optional[float] = None,
@@ -365,34 +516,7 @@ def fit_moffat_model(
     bkg_rms: Optional[float] = None,
 ) -> Tuple[np.ndarray, Any]:
     """
-    Fit a 2D Moffat profile to stellar flux, weighting by Poisson noise and masking central/neighbor stars.
-
-    Generates a Poisson noise uncertainty map (sigma = sqrt(max(I - bkg, 0) + bkg_rms^2))
-    to ensure proper weighting across both stellar wings and outskirts. Excludes masked pixels
-    (e.g., companion Gaia stars, DQ flags) and optionally masks the central core region
-    (for bright and medium stars) so non-Moffat core structure does not distort the wing fit.
-
-    Parameters
-    ----------
-    stamp : np.ndarray
-        2D stamp flux array.
-    dq_mask : np.ndarray, optional
-        Boolean mask of invalid/saturated pixels (True = bad).
-    max_radius : float, optional
-        Maximum radius from stamp center included in fit (limits computation on large stamps).
-    min_radius : float, optional
-        Inner radius below which pixels are excluded from the fit (masks the central core).
-    mask : np.ndarray, optional
-        Additional boolean mask of pixels to exclude from the fit (e.g., companion Gaia stars).
-    sigma_image : np.ndarray, optional
-        Pre-computed 2D noise / uncertainty image. If None, constructed as Poisson noise.
-    bkg_rms : float, optional
-        Background RMS noise estimate. If None, robustly estimated from perimeter pixels.
-
-    Returns
-    -------
-    Tuple[np.ndarray, Any]
-        (fitted_image, fitted_model)
+    Fit a 2D Moffat profile to stellar flux using Astropy LevMarLSQFitter.
     """
     ny, nx = stamp.shape
     cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
@@ -412,7 +536,6 @@ def fit_moffat_model(
     if not np.any(valid):
         return np.zeros_like(stamp, dtype=np.float32), None
 
-    # Estimate background from the outer perimeter of the cutout rather than the truncated fitting region
     outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
     if dq_mask is not None:
         outer_cutout &= (~dq_mask)
@@ -432,9 +555,6 @@ def fit_moffat_model(
     peak_val = float(np.nanmax(finite_stamp)) - bkg if len(finite_stamp) > 0 else 1.0
     peak_val = max(peak_val, 1.0)
 
-    # Poisson noise sigma image:
-    # sigma = sqrt(max(stamp - bkg, 0) + bkg_rms^2)
-    # Properly weights the outskirts so the fit captures the wings rather than just the core
     if sigma_image is None:
         flux_excess = np.maximum(stamp - bkg, 0.0)
         sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
@@ -462,6 +582,75 @@ def fit_moffat_model(
     except Exception:
         fallback_img = (init_moffat(grid_x, grid_y) + bkg).astype(np.float32)
         return fallback_img, init_moffat
+
+
+def fit_moffat_model(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    sigma_image: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+    engine: str = "astrophot",
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a 2D Moffat profile to stellar flux using AstroPhot (default) or Astropy.
+
+    Weighting by Poisson noise and masking central/neighbor stars.
+    For medium and bright stars, AstroPhot (https://astrophot.readthedocs.io/)
+    performs fast, robust Levenberg-Marquardt fitting of the Moffat profile.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit (masks central core).
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude from the fit (e.g. companion Gaia stars).
+    sigma_image : np.ndarray, optional
+        Pre-computed 2D noise / uncertainty image.
+    variance : np.ndarray, optional
+        Pre-computed 2D variance image.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+    engine : str, default "astrophot"
+        Fitting engine to use: 'astrophot' or 'astropy'.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Any]
+        (fitted_image, fitted_model)
+    """
+    if engine.lower() == "astrophot":
+        try:
+            return fit_moffat_astrophot(
+                stamp,
+                dq_mask=dq_mask,
+                max_radius=max_radius,
+                min_radius=min_radius,
+                mask=mask,
+                variance=variance,
+                bkg_rms=bkg_rms,
+            )
+        except Exception as exc:
+            logger.warning("AstroPhot Moffat fit encountered exception (%s); falling back to Astropy LevMar.", exc)
+
+    return fit_moffat_astropy(
+        stamp,
+        dq_mask=dq_mask,
+        max_radius=max_radius,
+        min_radius=min_radius,
+        mask=mask,
+        sigma_image=sigma_image,
+        bkg_rms=bkg_rms,
+    )
 
 
 def compute_unsharp_mask_residual(
@@ -963,6 +1152,17 @@ def mask_contaminants_with_spikes_protected(
 
     is_faint = (tier is not None and str(tier).lower().strip() == "faint")
 
+    if is_faint:
+        # Faint stars: omit Moffat fitting, omit diffraction spikes, omit contaminant masking.
+        # Direct pass-through for subsequent centering, resampling, normalization, and stacking.
+        residual = np.where(np.isfinite(stamp), stamp, 0.0).astype(np.float32)
+        protected_stellar_area = (r <= core_protection_radius_px)
+        final_mask = np.zeros(stamp.shape, dtype=bool)
+        if dq_mask is not None:
+            final_mask |= dq_mask
+        final_mask |= (~np.isfinite(stamp))
+        return final_mask, protected_stellar_area, residual
+
     # Pre-compute circular aperture masks for neighbor Gaia stars (used for both Moffat fitting and contaminant masking)
     comp_mask = None
     if companion_stars is not None:
@@ -981,8 +1181,8 @@ def mask_contaminants_with_spikes_protected(
     if method_lower == "unsharp":
         residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
     else:
-        # Default: Moffat analytical model subtraction
-        # For bright and medium stars: mask the central core region during the fit
+        # Default: Moffat analytical model subtraction using AstroPhot
+        # Mask the central core region during the fit for bright and medium stars
         tier_str = str(tier).lower().strip() if tier is not None else ""
         if tier_str in ("bright", "medium"):
             min_fit_r = float(core_protection_radius_px)
@@ -997,6 +1197,7 @@ def mask_contaminants_with_spikes_protected(
             max_radius=max_fit_r,
             min_radius=min_fit_r,
             mask=comp_mask,
+            engine="astrophot",
         )
         residual = (stamp - moffat_img).astype(np.float32)
 
@@ -1122,6 +1323,8 @@ __all__ = [
     "detect_spikes_rht",
     "create_rht_spike_mask",
     "fit_moffat_model",
+    "fit_moffat_astrophot",
+    "fit_moffat_astropy",
     "mask_gaia_companion_stars",
     "mask_contaminants_with_spikes_protected",
 ]

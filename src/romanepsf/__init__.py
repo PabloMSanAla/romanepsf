@@ -56,6 +56,8 @@ from .masking import (
     detect_spikes_rht,
     create_rht_spike_mask,
     fit_moffat_model,
+    fit_moffat_astrophot,
+    fit_moffat_astropy,
     mask_gaia_companion_stars,
     mask_contaminants_with_spikes_protected,
 )
@@ -126,6 +128,8 @@ __all__ = [
     "create_geometric_spike_mask",
     "detect_morphological_spikes",
     "fit_moffat_model",
+    "fit_moffat_astrophot",
+    "fit_moffat_astropy",
     "mask_gaia_companion_stars",
     "mask_contaminants_with_spikes_protected",
     "create_ellipse_meshgrid_torch",

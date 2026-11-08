@@ -36,6 +36,7 @@ Thumbs.db
 *.fits
 *.fits.gz
 *.zarr/
+*.log
 output/**/*.fits
 output/**/*.zarr
 output/run_all/*.fits
