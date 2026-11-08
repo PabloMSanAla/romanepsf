@@ -1,11 +1,13 @@
 """
 Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking,
-AstroPhot 2D Moffat Fitting, and Residual-Threshold Contaminant Filtering Across ~20 Roman Stars.
+SUPERBACK (rosalia) & STPSF Physical Model Residual Fitting, and Contaminant Filtering.
 
 Visualizes 3 panels per star:
   1. Normal: Log stretched stamp flux
-  2. Residual: AstroPhot Moffat analytical model residual map (delta I = I_obs - I_moffat)
-     for bright/medium stars; direct pass-through for faint stars.
+  2. Residual: Physical model residual map (delta I = I_obs - I_model):
+     - Bright stars: SUPERBACK optical model (rosalia.superback_pytorch)
+     - Medium stars: STPSF instrumental model (stpsf.WFI)
+     - Faint stars: direct pass-through (model fit omitted)
   3. Normal + Mask: Stamp flux with semi-transparent uniform yellow overlay highlighting
      masked contaminant pixels & circular Gaia companion apertures, strictly
      preserving Roman diffraction spikes and stellar core.
@@ -80,7 +82,7 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 10, n_medium: 
 
 
 def main():
-    print("=== Starting AstroPhot Moffat & Gaia Masking PDF Generator ===")
+    print("=== Starting SUPERBACK & STPSF Masking PDF Generator ===")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = out_dir / "gaia_masking_gallery.pdf"
@@ -160,8 +162,8 @@ def main():
         in_stamp = (dist > core_rad) & (np.abs(dx) <= half + 10) & (np.abs(dy) <= half + 10)
         n_comps = int(np.sum(in_stamp))
         
-        # Apply spike protection and contaminant + Gaia circular companion masking using Moffat Model fitting
-        final_mask, protected_spikes, moffat_res = mask_contaminants_with_spikes_protected(
+        # Apply spike protection and contaminant + Gaia circular companion masking using SUPERBACK / STPSF fitting
+        final_mask, protected_spikes, res_img = mask_contaminants_with_spikes_protected(
             flux_sub,
             dq_mask=dq_mask,
             pa_aperture=roll_ref,
@@ -171,9 +173,11 @@ def main():
             target_center_xy=(cx, cy),
             pixel_scale=l2.pixel_scale,
             companion_depth=28.0,
-            method="moffat",
+            method="auto",
+            detector=det,
+            bandpass="F146",
         )
-        residual = moffat_res
+        residual = res_img
         
         # Compute companion circular mask separately for visual reporting
         comp_only_mask = mask_gaia_companion_stars(
@@ -267,20 +271,25 @@ def main():
                 cb1.ax.tick_params(colors="#8b949e", labelsize=7.5)
                 cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
                 
-                # ----------------- Panel 2: Moffat Residual Map (Same Stretch) -----------------
+                # ----------------- Panel 2: Physical Model Residual Map (Same Stretch) -----------------
                 ax_res = axes[row_idx, 1]
                 ax_res.set_facecolor("#161b22")
                 clean_res = np.maximum(res, 1e-4)
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
-                if star_tier == "faint":
+                if star_tier == "bright":
                     res_title = (
-                        rf"Faint Tier: Moffat Fit Skipped" "\n"
-                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"SUPERBACK Residual ($\Delta I = I_{{obs}} - I_{{sb}}$)" "\n"
+                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                elif star_tier == "medium":
+                    res_title = (
+                        rf"STPSF Residual ($\Delta I = I_{{obs}} - I_{{stpsf}}$)" "\n"
+                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 else:
                     res_title = (
-                        rf"AstroPhot Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
-                        rf"Same Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"Faint Tier: Model Fit Skipped" "\n"
+                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_res.tick_params(colors="#8b949e", labelsize=8)
@@ -320,7 +329,7 @@ def main():
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
             fig.suptitle(
                 f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages} "
-                f"(AstroPhot Moffat Residuals + Gaia Circular Patches + Dual-12 Spike Preservation)",
+                f"(Bright: SUPERBACK | Medium: STPSF | Faint: Direct | Spikes & Cores Protected)",
                 fontsize=13, color="#58a6ff", fontweight="bold", y=0.97
             )
             

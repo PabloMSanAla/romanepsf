@@ -450,6 +450,8 @@ def process_star_stamps(
 
             # 5. Apply dual-prior spike protection & contaminant masking
             comps_table = companion_stars if companion_stars is not None else catalog_df
+            det_id = getattr(l2_data, "detector", None)
+            bp_id = getattr(l2_data, "filter_name", "F146")
             if mask_contaminants_with_spikes_protected is not None:
                 if spikes_cfg is not None:
                     mask, _, _ = mask_contaminants_with_spikes_protected(
@@ -462,6 +464,8 @@ def process_star_stamps(
                         target_center_xy=(cx, cy),
                         pixel_scale=pixel_scale,
                         companion_depth=companion_depth,
+                        detector=det_id,
+                        bandpass=bp_id,
                     )
                 else:
                     mask, _, _ = mask_contaminants_with_spikes_protected(
@@ -474,6 +478,8 @@ def process_star_stamps(
                         target_center_xy=(cx, cy),
                         pixel_scale=pixel_scale,
                         companion_depth=companion_depth,
+                        detector=det_id,
+                        bandpass=bp_id,
                     )
             else:
                 mask = dq_mask_bool | (~np.isfinite(flux_cutout))

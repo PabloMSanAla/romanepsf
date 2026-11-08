@@ -11,6 +11,9 @@ from romanepsf.masking import (
     create_geometric_spike_mask,
     detect_morphological_spikes,
     fit_moffat_model,
+    fit_superback_model,
+    fit_stpsf_model,
+    fit_stellar_model,
     get_theoretical_spike_angles,
     mask_contaminants_with_spikes_protected,
 )
@@ -502,6 +505,85 @@ class TestRadialHoughTransform:
         # Pixels along the 30 deg line should be masked
         px_30 = (int(round(50 + 25 * np.sin(np.radians(30)))), int(round(50 + 25 * np.cos(np.radians(30)))))
         assert spike_mask[px_30]
+
+
+class TestSuperbackAndStpsfFitting:
+    """Tests for SUPERBACK (rosalia) and STPSF physical PSF fitting."""
+
+    def test_fit_superback_model(self):
+        sz = 81
+        stamp = np.full((sz, sz), 2.0, dtype=np.float32)
+        stamp[40, 40] = 500.0
+        model_img, amp = fit_superback_model(
+            stamp,
+            detector="WFI01",
+            position=(2048.0, 2048.0),
+            bandpass="F146",
+            num_anchors=2,
+        )
+        assert model_img.shape == (sz, sz)
+        assert amp > 0
+        assert np.all(np.isfinite(model_img))
+
+    def test_fit_stpsf_model(self):
+        sz = 81
+        stamp = np.full((sz, sz), 2.0, dtype=np.float32)
+        stamp[40, 40] = 500.0
+        model_img, amp = fit_stpsf_model(
+            stamp,
+            detector="WFI01",
+            position=(2048.0, 2048.0),
+            bandpass="F146",
+            nlambda=1,
+        )
+        assert model_img.shape == (sz, sz)
+        assert amp > 0
+        assert np.all(np.isfinite(model_img))
+
+    def test_fit_stellar_model_dispatch_tiers(self):
+        sz = 81
+        stamp = np.full((sz, sz), 2.0, dtype=np.float32)
+        stamp[40, 40] = 500.0
+
+        # Bright tier -> SUPERBACK
+        bright_img, b_amp = fit_stellar_model(
+            stamp, tier="bright", detector="WFI01", position=(2048.0, 2048.0)
+        )
+        assert bright_img.shape == (sz, sz)
+        assert b_amp > 0
+
+        # Medium tier -> STPSF
+        med_img, m_amp = fit_stellar_model(
+            stamp, tier="medium", detector="WFI01", position=(2048.0, 2048.0)
+        )
+        assert med_img.shape == (sz, sz)
+        assert m_amp > 0
+
+        # Faint tier -> Skipped (zeros)
+        faint_img, f_amp = fit_stellar_model(stamp, tier="faint")
+        assert np.all(faint_img == 0.0)
+        assert f_amp == 0.0
+
+    def test_mask_contaminants_with_physical_models(self):
+        sz = 81
+        stamp = np.full((sz, sz), 1.0, dtype=np.float32)
+        stamp[40, 40] = 1000.0
+        # Add off-axis contaminant
+        stamp[25, 25] = 200.0
+
+        final_mask, prot_area, res = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="bright",
+            detector="WFI01",
+            target_center_xy=(2048.0, 2048.0),
+        )
+        assert final_mask.shape == (sz, sz)
+        assert prot_area.shape == (sz, sz)
+        assert res.shape == (sz, sz)
+        # Contaminant should be flagged
+        assert final_mask[25, 25]
+        # Core is protected
+        assert not final_mask[40, 40]
 
 
 

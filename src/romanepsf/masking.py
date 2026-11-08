@@ -23,7 +23,15 @@ import logging
 import numpy as np
 import pandas as pd
 from astropy.modeling import fitting, models
-from scipy.ndimage import binary_dilation, generate_binary_structure, label, gaussian_filter, map_coordinates
+from scipy.ndimage import (
+    binary_dilation,
+    binary_erosion,
+    generate_binary_structure,
+    label,
+    gaussian_filter,
+    map_coordinates,
+    shift,
+)
 from scipy.signal import find_peaks
 
 from romanepsf.config import SpikesConfig, SpikesSection
@@ -653,6 +661,416 @@ def fit_moffat_model(
     )
 
 
+_STPSF_WFI_CACHE: Dict[str, Any] = {}
+
+
+def fit_superback_model(
+    stamp: np.ndarray,
+    detector: Union[str, int] = "WFI01",
+    position: Optional[Tuple[float, float]] = None,
+    bandpass: str = "F146",
+    dq_mask: Optional[np.ndarray] = None,
+    min_radius: Optional[float] = None,
+    max_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+    subpixel_offset: Optional[Tuple[float, float]] = None,
+    device: str = "cpu",
+    num_anchors: int = 3,
+) -> Tuple[np.ndarray, float]:
+    """
+    Fit a Roman SUPERBACK optical PSF model (from rosalia.superback_pytorch) to the stamp.
+
+    Generates the flux-calibrated SUPERBACK PSF using PyTorch, shifts by sub-pixel
+    centroid offset, and performs weighted least-squares regression to scale amplitude and offset.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    detector : str or int, default "WFI01"
+        Detector identifier, e.g. "WFI01" or 1.
+    position : tuple of float, optional
+        (x, y) detector pixel coordinates.
+    bandpass : str, default "F146"
+        Roman filter bandpass.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit (masks central core).
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude (e.g. companion Gaia stars).
+    variance : np.ndarray, optional
+        Variance image for weighting.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+    subpixel_offset : tuple of float, optional
+        (dx, dy) subpixel offset from stamp center.
+    device : str, default "cpu"
+        PyTorch device ('cpu', 'mps', 'cuda').
+    num_anchors : int, default 3
+        Number of anchor wavelengths across filter response for chromatic integration.
+
+    Returns
+    -------
+    Tuple[np.ndarray, float]
+        (fitted_image, fitted_amplitude)
+    """
+    ny, nx = stamp.shape
+    half_y, half_x = (ny - 1) / 2.0, (nx - 1) / 2.0
+
+    # Parse detector SCA
+    if isinstance(detector, int):
+        sca = detector
+    else:
+        det_digits = "".join(filter(str.isdigit, str(detector)))
+        sca = int(det_digits) if det_digits else 1
+
+    pos = position if position is not None else (2048.0, 2048.0)
+    bp = str(bandpass).upper()
+
+    try:
+        import rosalia.superback_pytorch as sbp
+
+        psf_hdu = sbp.superback_roman_psf_pytorch(
+            position=pos,
+            SCA=sca,
+            bandpass=bp,
+            shape=(ny, nx),
+            device=device,
+            num_anchors=num_anchors,
+        )
+        psf_model = np.asarray(psf_hdu.data, dtype=np.float32)
+    except Exception as exc:
+        logger.warning("SUPERBACK PSF generation failed (%s); returning zeros fallback.", exc)
+        return np.zeros_like(stamp, dtype=np.float32), 0.0
+
+    # Apply subpixel offset if provided or derived
+    if subpixel_offset is not None:
+        dx, dy = subpixel_offset
+    elif position is not None:
+        dx = float(position[0] - round(position[0]))
+        dy = float(position[1] - round(position[1]))
+    else:
+        dx, dy = 0.0, 0.0
+
+    if abs(dx) > 1e-4 or abs(dy) > 1e-4:
+        psf_model = shift(psf_model, shift=(dy, dx), order=3)
+
+    # Build fitting mask
+    grid_y, grid_x = np.ogrid[:ny, :nx]
+    r = np.sqrt((grid_x - half_x)**2 + (grid_y - half_y)**2)
+
+    fit_mask = np.isfinite(stamp)
+    if dq_mask is not None:
+        fit_mask &= (~dq_mask)
+    if mask is not None:
+        fit_mask &= (~mask)
+    if min_radius is not None and min_radius > 0:
+        fit_mask &= (r >= min_radius)
+    if max_radius is not None and max_radius > 0:
+        fit_mask &= (r <= max_radius)
+
+    fit_mask &= (stamp > 0)
+
+    if np.sum(fit_mask) < 10 or np.sum(psf_model[fit_mask]**2) < 1e-12:
+        logger.warning("Insufficient valid pixels for SUPERBACK fit; returning unscaled model.")
+        return psf_model.astype(np.float32), 1.0
+
+    p = psf_model[fit_mask]
+    y = stamp[fit_mask]
+    sig_floor = bkg_rms if bkg_rms is not None and bkg_rms > 0 else 0.1
+    w = 1.0 / np.sqrt(np.maximum(y, 0.1) + sig_floor**2)
+
+    X = np.column_stack([p, np.ones_like(p)])
+    try:
+        params, _, _, _ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
+        A, b = float(params[0]), float(params[1])
+        if A <= 0 or abs(b) > 0.5 * max(float(np.nanpercentile(y, 90)), 1.0):
+            A = float(np.sum(w * y * p) / np.sum(w * p**2))
+            b = 0.0
+    except Exception:
+        A = float(np.sum(w * y * p) / np.sum(w * p**2))
+        b = 0.0
+
+    fitted_image = (A * psf_model + b).astype(np.float32)
+    return fitted_image, A
+
+
+def fit_stpsf_model(
+    stamp: np.ndarray,
+    detector: Union[str, int] = "WFI01",
+    position: Optional[Tuple[float, float]] = None,
+    bandpass: str = "F146",
+    dq_mask: Optional[np.ndarray] = None,
+    min_radius: Optional[float] = None,
+    max_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+    subpixel_offset: Optional[Tuple[float, float]] = None,
+    oversample: int = 1,
+    nlambda: int = 1,
+) -> Tuple[np.ndarray, float]:
+    """
+    Fit Roman STPSF instrumental PSF model (stpsf.WFI) to the stamp.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    detector : str or int, default "WFI01"
+        Detector identifier, e.g. "WFI01" or 1.
+    position : tuple of float, optional
+        (x, y) detector pixel coordinates.
+    bandpass : str, default "F146"
+        Roman filter bandpass.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit.
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude (e.g. companion Gaia stars).
+    variance : np.ndarray, optional
+        Variance image for weighting.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+    subpixel_offset : tuple of float, optional
+        (dx, dy) subpixel offset from stamp center.
+    oversample : int, default 1
+        PSF oversampling factor.
+    nlambda : int, default 1
+        Number of monochromatic wavelengths calculated across filter.
+
+    Returns
+    -------
+    Tuple[np.ndarray, float]
+        (fitted_image, fitted_amplitude)
+    """
+    ny, nx = stamp.shape
+    half_y, half_x = (ny - 1) / 2.0, (nx - 1) / 2.0
+
+    # Format detector name
+    if isinstance(detector, int):
+        det_name = f"WFI{detector:02d}"
+    else:
+        det_str = str(detector).strip().upper()
+        if not det_str.startswith("WFI"):
+            det_digits = "".join(filter(str.isdigit, det_str))
+            det_name = f"WFI{int(det_digits):02d}" if det_digits else "WFI01"
+        else:
+            det_name = det_str
+
+    pos = position if position is not None else (2048.0, 2048.0)
+    bp = str(bandpass).upper()
+
+    try:
+        import stpsf
+
+        if "wfi" not in _STPSF_WFI_CACHE:
+            _STPSF_WFI_CACHE["wfi"] = stpsf.WFI()
+        wfi = _STPSF_WFI_CACHE["wfi"]
+        wfi.filter = bp
+        wfi.detector = det_name
+        wfi.detector_position = (float(pos[0]), float(pos[1]))
+
+        fov = max(ny, nx)
+        if fov % 2 == 0:
+            fov += 1
+
+        psf_hdul = wfi.calc_psf(fov_pixels=fov, oversample=oversample, nlambda=nlambda)
+        psf_det = psf_hdul["DET_SAMP"].data
+
+        # Center-crop to (ny, nx)
+        cy_psf, cx_psf = psf_det.shape[0] // 2, psf_det.shape[1] // 2
+        y0 = cy_psf - ny // 2
+        x0 = cx_psf - nx // 2
+        psf_model = np.asarray(psf_det[y0:y0+ny, x0:x0+nx], dtype=np.float32)
+    except Exception as exc:
+        logger.warning("STPSF PSF generation failed (%s); returning zeros fallback.", exc)
+        return np.zeros_like(stamp, dtype=np.float32), 0.0
+
+    # Apply subpixel offset
+    if subpixel_offset is not None:
+        dx, dy = subpixel_offset
+    elif position is not None:
+        dx = float(position[0] - round(position[0]))
+        dy = float(position[1] - round(position[1]))
+    else:
+        dx, dy = 0.0, 0.0
+
+    if abs(dx) > 1e-4 or abs(dy) > 1e-4:
+        psf_model = shift(psf_model, shift=(dy, dx), order=3)
+
+    # Build fitting mask
+    grid_y, grid_x = np.ogrid[:ny, :nx]
+    r = np.sqrt((grid_x - half_x)**2 + (grid_y - half_y)**2)
+
+    fit_mask = np.isfinite(stamp)
+    if dq_mask is not None:
+        fit_mask &= (~dq_mask)
+    if mask is not None:
+        fit_mask &= (~mask)
+    if min_radius is not None and min_radius > 0:
+        fit_mask &= (r >= min_radius)
+    if max_radius is not None and max_radius > 0:
+        fit_mask &= (r <= max_radius)
+
+    fit_mask &= (stamp > 0)
+
+    if np.sum(fit_mask) < 10 or np.sum(psf_model[fit_mask]**2) < 1e-12:
+        logger.warning("Insufficient valid pixels for STPSF fit; returning unscaled model.")
+        return psf_model.astype(np.float32), 1.0
+
+    p = psf_model[fit_mask]
+    y = stamp[fit_mask]
+    sig_floor = bkg_rms if bkg_rms is not None and bkg_rms > 0 else 0.1
+    w = 1.0 / np.sqrt(np.maximum(y, 0.1) + sig_floor**2)
+
+    X = np.column_stack([p, np.ones_like(p)])
+    try:
+        params, _, _, _ = np.linalg.lstsq(X * w[:, None], y * w, rcond=None)
+        A, b = float(params[0]), float(params[1])
+        if A <= 0 or abs(b) > 0.5 * max(float(np.nanpercentile(y, 90)), 1.0):
+            A = float(np.sum(w * y * p) / np.sum(w * p**2))
+            b = 0.0
+    except Exception:
+        A = float(np.sum(w * y * p) / np.sum(w * p**2))
+        b = 0.0
+
+    fitted_image = (A * psf_model + b).astype(np.float32)
+    return fitted_image, A
+
+
+def fit_stellar_model(
+    stamp: np.ndarray,
+    tier: Optional[str] = None,
+    detector: Optional[Union[str, int]] = None,
+    position: Optional[Tuple[float, float]] = None,
+    bandpass: str = "F146",
+    dq_mask: Optional[np.ndarray] = None,
+    min_radius: Optional[float] = None,
+    max_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+    subpixel_offset: Optional[Tuple[float, float]] = None,
+    method: str = "auto",
+    engine: str = "astrophot",
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit the appropriate stellar PSF model to the star stamp based on tier and method:
+      - Bright tier (or method='superback'): SUPERBACK model from rosalia.superback_pytorch
+      - Medium tier (or method='stpsf'): STPSF model from stpsf.WFI
+      - Faint tier: None (returns zeros)
+      - method='moffat': AstroPhot 2D Moffat model
+
+    Falls back gracefully to AstroPhot Moffat or Astropy Moffat if physical models encounter errors.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    tier : str, optional
+        Stellar brightness tier ('bright', 'medium', 'faint').
+    detector : str or int, optional
+        Detector identifier, e.g. "WFI01".
+    position : tuple of float, optional
+        (x, y) detector pixel coordinates.
+    bandpass : str, default "F146"
+        Roman filter bandpass.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit.
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude.
+    variance : np.ndarray, optional
+        Variance image for weighting.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+    subpixel_offset : tuple of float, optional
+        (dx, dy) subpixel offset from stamp center.
+    method : str, default "auto"
+        Fitting method: 'auto', 'superback', 'stpsf', or 'moffat'.
+    engine : str, default "astrophot"
+        Engine for Moffat fallback: 'astrophot' or 'astropy'.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Any]
+        (fitted_image, fitted_model_or_amp)
+    """
+    tier_lower = str(tier).lower().strip() if tier is not None else ""
+    method_lower = str(method).lower().strip()
+
+    if tier_lower == "faint":
+        return np.zeros_like(stamp, dtype=np.float32), 0.0
+
+    # Auto dispatch: Superback for bright, STPSF for medium
+    use_superback = (method_lower == "superback") or (
+        method_lower in ("auto", "model") and tier_lower == "bright" and detector is not None
+    )
+    use_stpsf = (method_lower == "stpsf") or (
+        method_lower in ("auto", "model") and tier_lower == "medium" and detector is not None
+    )
+
+    if use_superback:
+        try:
+            return fit_superback_model(
+                stamp,
+                detector=detector or "WFI01",
+                position=position,
+                bandpass=bandpass,
+                dq_mask=dq_mask,
+                min_radius=min_radius,
+                max_radius=max_radius,
+                mask=mask,
+                variance=variance,
+                bkg_rms=bkg_rms,
+                subpixel_offset=subpixel_offset,
+            )
+        except Exception as exc:
+            logger.warning("fit_superback_model failed (%s); falling back to Moffat.", exc)
+
+    elif use_stpsf:
+        try:
+            return fit_stpsf_model(
+                stamp,
+                detector=detector or "WFI01",
+                position=position,
+                bandpass=bandpass,
+                dq_mask=dq_mask,
+                min_radius=min_radius,
+                max_radius=max_radius,
+                mask=mask,
+                variance=variance,
+                bkg_rms=bkg_rms,
+                subpixel_offset=subpixel_offset,
+            )
+        except Exception as exc:
+            logger.warning("fit_stpsf_model failed (%s); falling back to Moffat.", exc)
+
+    # Fallback / explicit Moffat fit
+    return fit_moffat_model(
+        stamp,
+        dq_mask=dq_mask,
+        max_radius=max_radius,
+        min_radius=min_radius,
+        mask=mask,
+        variance=variance,
+        bkg_rms=bkg_rms,
+        engine=engine,
+    )
+
+
 def compute_unsharp_mask_residual(
     stamp: np.ndarray,
     sigma: float = 7.0,
@@ -1049,9 +1467,12 @@ def mask_contaminants_with_spikes_protected(
     target_center_xy: Optional[Tuple[float, float]] = None,
     pixel_scale: float = 0.11,
     companion_depth: float = 28.0,
-    method: str = "moffat",
+    method: str = "auto",
     unsharp_sigma: float = 7.0,
     width_growth_rate: Optional[float] = None,
+    detector: Optional[Union[str, int]] = None,
+    bandpass: str = "F146",
+    engine: str = "astrophot",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
@@ -1176,12 +1597,11 @@ def mask_contaminants_with_spikes_protected(
             core_exclusion_radius_px=core_protection_radius_px,
         )
 
-    # 2. Compute residual map (via Moffat model subtraction or unsharp masking)
+    # 2. Compute residual map (via Superback, STPSF, Moffat model subtraction, or unsharp masking)
     method_lower = str(method).lower().strip()
     if method_lower == "unsharp":
         residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
     else:
-        # Default: Moffat analytical model subtraction using AstroPhot
         # Mask the central core region during the fit for bright and medium stars
         tier_str = str(tier).lower().strip() if tier is not None else ""
         if tier_str in ("bright", "medium"):
@@ -1191,15 +1611,28 @@ def mask_contaminants_with_spikes_protected(
 
         max_fit_r = min(max(cx * 0.4, 30.0), 100.0)
 
-        moffat_img, _ = fit_moffat_model(
+        sub_offset = None
+        if target_center_xy is not None:
+            sub_offset = (
+                float(target_center_xy[0] - round(target_center_xy[0])),
+                float(target_center_xy[1] - round(target_center_xy[1])),
+            )
+
+        fitted_img, _ = fit_stellar_model(
             stamp,
+            tier=tier,
+            detector=detector,
+            position=target_center_xy,
+            bandpass=bandpass,
             dq_mask=dq_mask,
             max_radius=max_fit_r,
             min_radius=min_fit_r,
             mask=comp_mask,
-            engine="astrophot",
+            subpixel_offset=sub_offset,
+            method=method,
+            engine=engine,
         )
-        residual = (stamp - moffat_img).astype(np.float32)
+        residual = (stamp - fitted_img).astype(np.float32)
 
     # 3. Spike protection covering theoretical spikes + empirical refinement
     spike_order = getattr(spikes_cfg, "spike_order", None)
@@ -1325,6 +1758,9 @@ __all__ = [
     "fit_moffat_model",
     "fit_moffat_astrophot",
     "fit_moffat_astropy",
+    "fit_superback_model",
+    "fit_stpsf_model",
+    "fit_stellar_model",
     "mask_gaia_companion_stars",
     "mask_contaminants_with_spikes_protected",
 ]

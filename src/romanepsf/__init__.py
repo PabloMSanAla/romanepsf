@@ -58,6 +58,9 @@ from .masking import (
     fit_moffat_model,
     fit_moffat_astrophot,
     fit_moffat_astropy,
+    fit_superback_model,
+    fit_stpsf_model,
+    fit_stellar_model,
     mask_gaia_companion_stars,
     mask_contaminants_with_spikes_protected,
 )
