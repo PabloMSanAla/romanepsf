@@ -85,20 +85,22 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 10, n_medium: 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PDF masking report across sample stars.")
-    parser.add_argument("--method", type=str, default="mto2", choices=["mto2", "moffat", "superback", "stpsf", "unsharp"], help="Masking method")
+    parser.add_argument("--method", type=str, default="moffat", choices=["moffat", "mto2", "superback", "stpsf", "unsharp"], help="Profile residual subtraction method")
+    parser.add_argument("--contaminant-detector", type=str, default="mto2", choices=["mto2", "erosion_dilation"], help="Contaminant detection algorithm")
     parser.add_argument("--n-bright", type=int, default=10, help="Number of bright stars")
     parser.add_argument("--n-medium", type=int, default=8, help="Number of medium stars")
     parser.add_argument("--n-faint", type=int, default=2, help="Number of faint stars")
     parser.add_argument("--output-pdf", type=str, default=None, help="Custom output PDF path")
     args = parser.parse_args()
 
-    print(f"=== Starting Roman ePSF Masking PDF Generator (Method: {args.method.upper()}) ===")
+    print(f"=== Starting Roman ePSF Masking PDF Generator (Subtraction: {args.method.upper()}, Detector: {args.contaminant_detector.upper()}) ===")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = Path(args.output_pdf) if args.output_pdf else out_dir / "gaia_masking_gallery.pdf"
     
     cfg = load_config("configs/default.yaml")
     cfg.spikes.spike_order = "both"
+    cfg.spikes.contaminant_detector = args.contaminant_detector
     
     tiered_csv = Path("output/run_all/all_stars_tiered.csv")
     if not tiered_csv.exists():
@@ -187,6 +189,7 @@ def main():
             pixel_scale=l2.pixel_scale,
             companion_depth=28.0,
             method=args.method,
+            contaminant_detector=args.contaminant_detector,
             detector=det,
             bandpass="F146",
             var_poisson=vp_cutout,
@@ -292,8 +295,13 @@ def main():
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
                 if star_tier == "faint":
                     res_title = (
-                        rf"Faint Tier: Masking Skipped" "\n"
+                        rf"Faint Tier: Moffat Fit Skipped" "\n"
                         rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                elif args.method == "moffat":
+                    res_title = (
+                        rf"AstroPhot 2-Iter Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
+                        rf"Weighted with var_poisson | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 elif args.method == "mto2":
                     res_title = (
@@ -327,9 +335,10 @@ def main():
                         f"Retained: 100% Core & Wings | DQ/NaN: {star['masked_pct']:.1f}%"
                     )
                 else:
+                    det_name = args.contaminant_detector.upper() if args.method == "moffat" else args.method.upper()
                     comp_info = f" | {star['n_comps']} Gaia Comps" if star['n_comps'] > 0 else ""
                     mask_title = (
-                        f"Normal + {args.method.upper()} Mask Overlay (Yellow){comp_info}\n"
+                        f"Normal + {det_name} Mask Overlay (Yellow){comp_info}\n"
                         f"Masked: {star['masked_pct']:.1f}% ({star['n_islands']} sources) | Spikes Protected: {star['prot_pct']:.1f}%"
                     )
                 ax_mask.set_title(mask_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
@@ -340,7 +349,9 @@ def main():
                 cb3.ax.set_visible(False)
                 
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
-            if args.method == "mto2":
+            if args.method == "moffat":
+                method_header = f"2-Iter AstroPhot Moffat Subtraction + {args.contaminant_detector.upper()} Deblending | Spikes & Cores Protected"
+            elif args.method == "mto2":
                 method_header = "MTO2 Max-Tree Object Representation & Deblending | Spikes & Cores Protected"
             else:
                 method_header = f"{args.method.upper()} Fitting & Masking | Spikes & Cores Protected"
@@ -355,8 +366,8 @@ def main():
             page_png = out_dir / f"gaia_masking_gallery_p{page_idx+1}.png"
             fig.savefig(str(page_png), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
             
-            # Also save mto2-named preview if method is mto2
-            if args.method == "mto2":
+            # Also save mto2-named preview if method or detector is mto2
+            if args.method == "mto2" or args.contaminant_detector == "mto2":
                 mto2_png = out_dir / f"mto2_masking_gallery_p{page_idx+1}.png"
                 shutil.copyfile(page_png, mto2_png)
                 
@@ -368,7 +379,7 @@ def main():
     print(f"SUCCESS: Generated {pdf_path} ({os.path.getsize(pdf_path) / 1024:.1f} KB, {num_pages} pages)")
     
     # Save copies to mto2_masking_gallery.pdf and report.pdf
-    if args.method == "mto2":
+    if args.method == "mto2" or args.contaminant_detector == "mto2":
         mto2_pdf = out_dir / "mto2_masking_gallery.pdf"
         report_pdf = out_dir / "report.pdf"
         shutil.copyfile(pdf_path, mto2_pdf)

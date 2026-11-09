@@ -367,31 +367,21 @@ def mask_sources_not_main_star_mto2(
     )
 
     # Identify main star segment IDs:
-    # 1. Any segment that overlaps the central pixel (int(cy), int(cx))
-    # 2. Any segment whose centroid is within core_protection_radius_px
-    # 3. If multiple segments overlap the core, the one with the largest area in the core
+    # RULE: In MTO objects, remove from mask all IDs that overlap with the protected center,
+    # not only that region but the ENTIRE region covered by each such ID.
     main_star_ids: List[int] = []
+
+    # 1. Any segment that has ANY pixel overlapping core_zone (r <= core_protection_radius_px)
+    for sid in catalog.keys():
+        obj_pixels = (seg_map == sid)
+        if np.any(obj_pixels & core_zone):
+            if sid not in main_star_ids:
+                main_star_ids.append(sid)
+
+    # 2. Also check if the central coordinate pixel has a label
     central_id = int(seg_map[int(round(cy)), int(round(cx))])
-    if central_id != 0:
+    if central_id != 0 and central_id not in main_star_ids:
         main_star_ids.append(central_id)
-
-    # Check all objects in catalog
-    core_pixels_per_id: Dict[int, int] = {}
-    for sid, info in catalog.items():
-        obj_mask = (seg_map == sid)
-        core_overlap = int(np.count_nonzero(obj_mask & core_zone))
-        if core_overlap > 0:
-            core_pixels_per_id[sid] = core_overlap
-
-        ox, oy = info["centroid_xy"]
-        dist_c = np.sqrt((ox - cx)**2 + (oy - cy)**2)
-        if dist_c <= core_protection_radius_px and sid not in main_star_ids:
-            main_star_ids.append(sid)
-
-    # If core overlaps exist and no central_id was identified, pick the largest core contributor
-    if len(main_star_ids) == 0 and len(core_pixels_per_id) > 0:
-        best_sid = max(core_pixels_per_id.items(), key=lambda item: item[1])[0]
-        main_star_ids.append(best_sid)
 
     # Non-main-star source IDs are all remaining non-zero segments with area >= min_source_area_px
     other_source_ids = [
@@ -417,7 +407,11 @@ def mask_sources_not_main_star_mto2(
     else:
         contam_dilated = contam_raw.copy()
 
-    # STRICT INVARIANT: Never mask the central stellar core or protected diffraction spikes
+    # STRICT INVARIANT: Remove from mask all IDs that overlap with the protected center:
+    # not only the core_zone circle, but the ENTIRE region covered by each such ID!
+    for sid in main_star_ids:
+        contam_dilated[seg_map == sid] = False
+
     contam_dilated[core_zone] = False
     if protected_spikes is not None:
         contam_dilated[protected_spikes > 0] = False

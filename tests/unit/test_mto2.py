@@ -189,6 +189,44 @@ class TestMTO2MaskingNonStarSources:
         assert protected_area[25, 80], "Companion 2 should intersect a diffraction spike"
         assert not final_mask[25, 80], "Spike corridor intersecting companion 2 must remain protected"
 
+    def test_overlapping_core_id_entire_region_unmasked(self):
+        """Verify that any MTO2 ID overlapping the protected center is entirely unmasked across its whole extent."""
+        stamp = np.zeros((101, 101), dtype=np.float32)
+        cx, cy = 50.0, 50.0
+        y, x = np.ogrid[:101, :101]
+
+        # Central star core
+        r_c = np.sqrt((x - cx)**2 + (y - cy)**2)
+        stamp += 1000.0 / (1.0 + (r_c / 3.0)**2)**2.0
+
+        # An extended asymmetric lobe/wing segment that overlaps the core (r <= 4)
+        # but extends out to r = 18 px (e.g. x between 48 and 68, y between 48 and 52)
+        lobe_mask = (x >= 48) & (x <= 68) & (y >= 48) & (y <= 52)
+        stamp[lobe_mask] += 150.0
+
+        # A distant companion at (20, 20) with no core overlap
+        r_comp = np.sqrt((x - 20)**2 + (y - 20)**2)
+        stamp += 100.0 * np.exp(-r_comp**2 / 8.0)
+
+        core_r = 5.0
+        final_mask, seg_map, main_ids = mask_sources_not_main_star_mto2(
+            stamp,
+            center_xy=(cx, cy),
+            core_protection_radius_px=core_r,
+            s_sigma=1.0,
+            alpha=1e-5,
+            dilation_px=0,
+        )
+
+        # Distant companion must be masked
+        assert final_mask[20, 20], "Distant companion at (20, 20) should be masked"
+
+        # The lobe pixel at (65, 50) is at distance 15 px (well outside core_r=5 px)
+        # But because the lobe segment overlaps the core, its entire region must NOT be masked!
+        lobe_id = seg_map[50, 65]
+        assert lobe_id in main_ids, f"Lobe segment {lobe_id} should be classified as main star ID"
+        assert not final_mask[50, 65], "Lobe pixel outside core radius was wrongly masked!"
+
     def test_direct_method_mto2_on_stamp(self):
         from romanepsf.masking import mask_contaminants_with_spikes_protected
         stamp, (cx, cy) = _generate_synthetic_stamp_with_companions((101, 101))
