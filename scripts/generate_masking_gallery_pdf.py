@@ -1,26 +1,29 @@
 """
 Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking,
-2-Iteration AstroPhot Moffat Fitting Weighted by var_poisson, and Contaminant Filtering.
+MTO2 Max-Tree Object Representation & Deblending, and Diffraction Spike Protection.
 
 Visualizes 3 panels per star:
   1. Normal: Log stretched stamp flux
-  2. Residual: AstroPhot 2-iteration Moffat residual map (delta I = I_obs - I_moffat):
-     - Weighted by Level 2 ASDF var_poisson extension
-     - Second iteration updates fit mask with erosion-dilation detected contaminants
-     - Faint stars: direct pass-through (Moffat fit omitted)
+  2. Residual / Spike Feature Map:
+     - For MTO2 / Unsharp: High-pass residual (delta I = I_obs - I_smooth) isolating diffraction spikes & faint contaminants
+     - For parametric models: Model residual map (delta I = I_obs - I_model)
+     - Faint stars: direct pass-through (masking omitted)
   3. Normal + Mask: Stamp flux with semi-transparent uniform yellow overlay highlighting
-     masked contaminant pixels & circular Gaia companion apertures, strictly
+     MTO2 max-tree segmented contaminant sources & circular Gaia companion apertures, strictly
      preserving Roman diffraction spikes and stellar core.
 """
 
+import argparse
 import os
 from pathlib import Path
+import shutil
 import numpy as np
 import pandas as pd
+from scipy.ndimage import label
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm, Normalize
+from matplotlib.colors import LogNorm
 from matplotlib.backends.backend_pdf import PdfPages
 
 from romanepsf.loader import load_l2_image, RomanL2Data
@@ -36,8 +39,6 @@ from romanepsf.stamps import (
     subtract_stamp_background,
 )
 from romanepsf.masking import (
-    fit_moffat_model,
-    fit_stellar_model,
     mask_contaminants_with_spikes_protected,
     mask_gaia_companion_stars,
 )
@@ -83,10 +84,18 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 10, n_medium: 
 
 
 def main():
-    print("=== Starting SUPERBACK & STPSF Masking PDF Generator ===")
+    parser = argparse.ArgumentParser(description="Generate PDF masking report across sample stars.")
+    parser.add_argument("--method", type=str, default="mto2", choices=["mto2", "moffat", "superback", "stpsf", "unsharp"], help="Masking method")
+    parser.add_argument("--n-bright", type=int, default=10, help="Number of bright stars")
+    parser.add_argument("--n-medium", type=int, default=8, help="Number of medium stars")
+    parser.add_argument("--n-faint", type=int, default=2, help="Number of faint stars")
+    parser.add_argument("--output-pdf", type=str, default=None, help="Custom output PDF path")
+    args = parser.parse_args()
+
+    print(f"=== Starting Roman ePSF Masking PDF Generator (Method: {args.method.upper()}) ===")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
-    pdf_path = out_dir / "gaia_masking_gallery.pdf"
+    pdf_path = Path(args.output_pdf) if args.output_pdf else out_dir / "gaia_masking_gallery.pdf"
     
     cfg = load_config("configs/default.yaml")
     cfg.spikes.spike_order = "both"
@@ -97,7 +106,7 @@ def main():
     if not tiered_csv.exists():
         raise FileNotFoundError("Could not locate all_stars_tiered.csv")
         
-    sample_df = select_sample_stars(str(tiered_csv), n_bright=10, n_medium=8, n_faint=2)
+    sample_df = select_sample_stars(str(tiered_csv), n_bright=args.n_bright, n_medium=args.n_medium, n_faint=args.n_faint)
     print(f"Selected {len(sample_df)} stars across tiers:")
     for tier in ["bright", "medium", "faint"]:
         cnt = len(sample_df[sample_df["tier"].str.lower() == tier])
@@ -166,7 +175,7 @@ def main():
         in_stamp = (dist > core_rad) & (np.abs(dx) <= half + 10) & (np.abs(dy) <= half + 10)
         n_comps = int(np.sum(in_stamp))
         
-        # Apply spike protection and contaminant + Gaia circular companion masking using 2-iteration AstroPhot Moffat fitting
+        # Apply spike protection and contaminant + Gaia circular companion masking using MTO2
         final_mask, protected_spikes, res_img = mask_contaminants_with_spikes_protected(
             flux_sub,
             dq_mask=dq_mask,
@@ -177,7 +186,7 @@ def main():
             target_center_xy=(cx, cy),
             pixel_scale=l2.pixel_scale,
             companion_depth=28.0,
-            method="moffat",
+            method=args.method,
             detector=det,
             bandpass="F146",
             var_poisson=vp_cutout,
@@ -199,9 +208,16 @@ def main():
         masked_pct = 100.0 * np.sum(final_mask) / flux_sub.size
         prot_pct = 100.0 * np.sum(protected_spikes) / flux_sub.size
         comp_masked_px = int(np.sum(comp_only_mask))
+
+        # Count isolated contaminant source islands
+        contam_pixels = final_mask & (~protected_spikes)
+        if dq_mask is not None:
+            contam_pixels &= (~dq_mask)
+        contam_pixels &= np.isfinite(flux_sub)
+        _, n_islands = label(contam_pixels)
         
         print(f"[{idx+1:02d}/{len(sample_df)}] {tier.upper():6s} Star {source_id} ({det}, mag={mag:.2f}, {sz}x{sz}): "
-              f"Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px)")
+              f"Masked={masked_pct:.1f}%, Prot={prot_pct:.1f}%, Comps={n_comps} ({comp_masked_px} px), Islands={n_islands}")
               
         processed_stars.append({
             "idx": idx + 1,
@@ -216,6 +232,7 @@ def main():
             "protected_spikes": protected_spikes,
             "comp_mask": comp_only_mask,
             "n_comps": n_comps,
+            "n_islands": n_islands,
             "masked_pct": masked_pct,
             "prot_pct": prot_pct,
         })
@@ -254,15 +271,6 @@ def main():
                     vmax = vmin * 100.0
                 norm_flux = LogNorm(vmin=max(vmin, 1e-4), vmax=max(vmax, 1e-2))
                 
-                # Residual normalization: robust symmetric range
-                valid_res = res[np.isfinite(res)]
-                if len(valid_res) > 0:
-                    r_med = np.median(valid_res)
-                    r_mad = np.median(np.abs(valid_res - r_med))
-                    r_scale = max(3.0 * 1.4826 * r_mad, 0.01)
-                else:
-                    r_scale = 1.0
-                    
                 # ----------------- Panel 1: Normal Stamp -----------------
                 ax_norm = axes[row_idx, 0]
                 ax_norm.set_facecolor("#161b22")
@@ -277,20 +285,25 @@ def main():
                 cb1.ax.tick_params(colors="#8b949e", labelsize=7.5)
                 cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
                 
-                # ----------------- Panel 2: Forward Model Residual Map (Same Stretch) -----------------
+                # ----------------- Panel 2: Spike Feature Map / Residual Map -----------------
                 ax_res = axes[row_idx, 1]
                 ax_res.set_facecolor("#161b22")
                 clean_res = np.maximum(res, 1e-4)
                 im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
                 if star_tier == "faint":
                     res_title = (
-                        rf"Faint Tier: Moffat Fit Skipped" "\n"
+                        rf"Faint Tier: Masking Skipped" "\n"
                         rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                elif args.method == "mto2":
+                    res_title = (
+                        rf"High-Pass Spike Feature Map ($\Delta I = I_{{obs}} - I_{{smooth}}$)" "\n"
+                        rf"Isolating 24 Spikes | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 else:
                     res_title = (
-                        rf"AstroPhot 2-Iter Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
-                        rf"Weighted with var_poisson | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                        rf"{args.method.upper()} Residual Map ($\Delta I = I_{{obs}} - I_{{model}}$)" "\n"
+                        rf"Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_res.tick_params(colors="#8b949e", labelsize=8)
@@ -303,10 +316,9 @@ def main():
                 ax_mask.set_facecolor("#161b22")
                 ax_mask.imshow(clean_disp, origin="lower", cmap="inferno", norm=norm_flux)
                 
-                # RGBA overlay: entire mask (Gaia companions + contaminants + DQ) in uniform vivid yellow
+                # RGBA overlay: entire mask in uniform vivid yellow
                 overlay = np.zeros((*flux.shape, 4), dtype=float)
                 overlay[mask] = [1.0, 0.92, 0.0, 0.55]
-                    
                 ax_mask.imshow(overlay, origin="lower")
                 
                 if star_tier == "faint":
@@ -317,8 +329,8 @@ def main():
                 else:
                     comp_info = f" | {star['n_comps']} Gaia Comps" if star['n_comps'] > 0 else ""
                     mask_title = (
-                        f"Normal + Mask Overlay (Yellow){comp_info}\n"
-                        f"Masked: {star['masked_pct']:.1f}% | Spikes Protected: {star['prot_pct']:.1f}%"
+                        f"Normal + {args.method.upper()} Mask Overlay (Yellow){comp_info}\n"
+                        f"Masked: {star['masked_pct']:.1f}% ({star['n_islands']} sources) | Spikes Protected: {star['prot_pct']:.1f}%"
                     )
                 ax_mask.set_title(mask_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
                 ax_mask.tick_params(colors="#8b949e", labelsize=8)
@@ -328,21 +340,40 @@ def main():
                 cb3.ax.set_visible(False)
                 
             plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
+            if args.method == "mto2":
+                method_header = "MTO2 Max-Tree Object Representation & Deblending | Spikes & Cores Protected"
+            else:
+                method_header = f"{args.method.upper()} Fitting & Masking | Spikes & Cores Protected"
+                
             fig.suptitle(
-                f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages} "
-                f"(2-Iter AstroPhot Moffat + var_poisson Weighting | Spikes & Cores Protected)",
+                f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages}\n"
+                f"({method_header})",
                 fontsize=13, color="#58a6ff", fontweight="bold", y=0.97
             )
             
             # Save page as high-res PNG preview
             page_png = out_dir / f"gaia_masking_gallery_p{page_idx+1}.png"
             fig.savefig(str(page_png), dpi=150, facecolor=fig.get_facecolor(), edgecolor="none")
+            
+            # Also save mto2-named preview if method is mto2
+            if args.method == "mto2":
+                mto2_png = out_dir / f"mto2_masking_gallery_p{page_idx+1}.png"
+                shutil.copyfile(page_png, mto2_png)
+                
             print(f"Saved page {page_idx+1} preview to {page_png}")
                 
             pdf.savefig(fig, facecolor=fig.get_facecolor(), edgecolor="none")
             plt.close(fig)
             
     print(f"SUCCESS: Generated {pdf_path} ({os.path.getsize(pdf_path) / 1024:.1f} KB, {num_pages} pages)")
+    
+    # Save copies to mto2_masking_gallery.pdf and report.pdf
+    if args.method == "mto2":
+        mto2_pdf = out_dir / "mto2_masking_gallery.pdf"
+        report_pdf = out_dir / "report.pdf"
+        shutil.copyfile(pdf_path, mto2_pdf)
+        shutil.copyfile(pdf_path, report_pdf)
+        print(f"Copied report to {mto2_pdf} and {report_pdf}")
 
 
 if __name__ == "__main__":
