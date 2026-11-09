@@ -118,6 +118,7 @@ Configure the stellar brightness tier and profile fitting method below:
   - `'superback'`: Forward-modeled Roman SUPERBACK optical PSF (via `rosalia.superback_pytorch`) for bright stars.
   - `'stpsf'`: Forward-modeled Roman STPSF instrumental PSF (via `stpsf.WFI`) for medium stars.
   - `'unsharp'`: Gaussian unsharp masking residual ($I_{\\text{obs}} - I_{\\text{smooth}}$).
+  - `'mto2'`: Semantically-informed Max-Tree Object Representation & Deblending ([MTO2](https://github.com/m-faezi/MTO2)) to detect and mask sources that are not the main star stamp.
   - `'auto'`: Dispatches `'moffat'` by default."""))
 
 # ==============================================================================
@@ -125,7 +126,7 @@ Configure the stellar brightness tier and profile fitting method below:
 # ==============================================================================
 cells.append(nbf.v4.new_code_cell("""# >>> SELECT TIER AND METHOD HERE <<<
 SELECTED_TIER = "bright"      # 'bright', 'medium', or 'faint'
-SELECTED_METHOD = "moffat"    # 'moffat', 'superback', 'stpsf', 'unsharp', or 'auto'
+SELECTED_METHOD = "moffat"    # 'moffat', 'superback', 'stpsf', 'unsharp', 'mto2', or 'auto'
 
 tier_candidates = stars_df[stars_df["tier"] == SELECTED_TIER].reset_index(drop=True)
 print(f"Available '{SELECTED_TIER}' stars on {l2.detector}: {len(tier_candidates)}")
@@ -305,15 +306,16 @@ print(f"Contaminant overlap inside protected spikes: {np.sum(final_mask & protec
 # ==============================================================================
 cells.append(nbf.v4.new_markdown_cell("""## Step 7: Method Comparison on the Same Star
 
-Here we execute the three primary methods side-by-side on the exact same star cutout to compare:
+Here we execute the four primary methods side-by-side on the exact same star cutout to compare:
 1. **2-Iteration AstroPhot Moffat** (`method='moffat'` with `var_poisson`)
 2. **Physical Model** (`method='superback'` for bright, `'stpsf'` for medium)
-3. **Gaussian Unsharp Masking** (`method='unsharp'`)"""))
+3. **Gaussian Unsharp Masking** (`method='unsharp'`)
+4. **MTO2 Max-Tree Deblending** (`method='mto2'`)"""))
 
 # ==============================================================================
 # Cell 15: Step 7 Code
 # ==============================================================================
-cells.append(nbf.v4.new_code_cell("""methods_to_compare = ["moffat", "superback" if SELECTED_TIER == "bright" else "stpsf", "unsharp"]
+cells.append(nbf.v4.new_code_cell("""methods_to_compare = ["moffat", "superback" if SELECTED_TIER == "bright" else "stpsf", "unsharp", "mto2"]
 comparison_results = {}
 
 for m in methods_to_compare:
@@ -335,8 +337,8 @@ for m in methods_to_compare:
     comparison_results[m] = {"mask": mask_m, "prot": prot_m, "residual": res_m}
     print(f"Method '{m.upper()}': Masked = {100*np.sum(mask_m)/mask_m.size:.1f}%, Protected = {100*np.sum(prot_m)/prot_m.size:.1f}%")
 
-# Plot 3x3 comparison figure
-fig, axes = plt.subplots(3, 3, figsize=(15, 13))
+# Plot 4x3 comparison figure
+fig, axes = plt.subplots(4, 3, figsize=(15, 17))
 
 pos_flux = aligned_sub[np.isfinite(aligned_sub) & (aligned_sub > 0)]
 vmin = max(np.percentile(pos_flux, 2), 1e-4) if len(pos_flux) > 0 else 1e-4
@@ -369,7 +371,7 @@ for row_idx, m in enumerate(methods_to_compare):
     cb_dummy.ax.set_visible(False)
 
 for c in range(3):
-    axes[2, c].set_xlabel("X (pixels)")
+    axes[3, c].set_xlabel("X (pixels)")
 
 plt.suptitle(f"Comparison of Profile Residual & Masking Methods ({SELECTED_TIER.capitalize()} Star)", fontsize=13, fontweight="bold", y=0.995)
 plt.tight_layout()

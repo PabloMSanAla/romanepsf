@@ -35,6 +35,12 @@ from scipy.ndimage import (
 from scipy.signal import find_peaks
 
 from romanepsf.config import SpikesConfig, SpikesSection
+from romanepsf.mto2 import (
+    MTO2Config,
+    estimate_local_background,
+    segment_sources_mto2,
+    mask_sources_not_main_star_mto2,
+)
 
 logger = logging.getLogger("romanepsf.masking")
 
@@ -1528,6 +1534,41 @@ def _detect_contaminants_erosion_dilation(
     return contaminants
 
 
+def _detect_contaminants_mto2(
+    image_or_residual: np.ndarray,
+    center_xy: Tuple[float, float],
+    core_protection_radius_px: float,
+    protected_area: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    s_sigma: float = 1.6,
+    alpha: float = 1e-6,
+    move_factor: float = 0.1,
+    area_ratio: float = 0.90,
+    dilation_px: int = 2,
+) -> np.ndarray:
+    """
+    Detect non-stellar contaminants using MTO2 Max-Tree source segmentation.
+    """
+    final_mask, _, _ = mask_sources_not_main_star_mto2(
+        image_or_residual,
+        center_xy=center_xy,
+        core_protection_radius_px=core_protection_radius_px,
+        dq_mask=dq_mask,
+        protected_spikes=protected_area,
+        s_sigma=s_sigma,
+        alpha=alpha,
+        move_factor=move_factor,
+        area_ratio=area_ratio,
+        dilation_px=dilation_px,
+    )
+    contaminants = final_mask.copy()
+    contaminants[protected_area] = False
+    if dq_mask is not None:
+        contaminants[dq_mask] = False
+    contaminants[~np.isfinite(image_or_residual)] = False
+    return contaminants
+
+
 def mask_contaminants_with_spikes_protected(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
@@ -1550,6 +1591,7 @@ def mask_contaminants_with_spikes_protected(
     engine: str = "astrophot",
     var_poisson: Optional[np.ndarray] = None,
     n_iterations: int = 2,
+    contaminant_detector: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
@@ -1745,16 +1787,50 @@ def mask_contaminants_with_spikes_protected(
         )
         return geom_mask | morph_mask | (r <= core_protection_radius_px)
 
-    method_lower = str(method).lower().strip()
-    if method_lower == "unsharp":
-        residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
-        protected_stellar_area = _build_spike_and_core_protection(residual)
-        contaminants = _detect_contaminants_erosion_dilation(
-            residual,
-            protected_stellar_area,
+    # Resolve contaminant detector ('erosion_dilation' or 'mto2')
+    if contaminant_detector is None:
+        det_choice = getattr(spikes_cfg, "contaminant_detector", "erosion_dilation")
+        contam_mode = str(det_choice).lower().strip()
+    else:
+        contam_mode = str(contaminant_detector).lower().strip()
+
+    def _detect_contams(res_or_stamp: np.ndarray, prot_area: np.ndarray) -> np.ndarray:
+        if contam_mode == "mto2" or method_lower == "mto2":
+            mto2_cfg = getattr(spikes_cfg, "mto2", None)
+            s_sig = float(getattr(mto2_cfg, "s_sigma", 1.6)) if mto2_cfg else 1.6
+            alp = float(getattr(mto2_cfg, "alpha", 1e-6)) if mto2_cfg else 1e-6
+            mf = float(getattr(mto2_cfg, "move_factor", 0.1)) if mto2_cfg else 0.1
+            ar = float(getattr(mto2_cfg, "area_ratio", 0.90)) if mto2_cfg else 0.90
+            dil = int(getattr(mto2_cfg, "dilation_px", 2)) if mto2_cfg else 2
+            return _detect_contaminants_mto2(
+                res_or_stamp,
+                (cx, cy),
+                core_protection_radius_px,
+                prot_area,
+                dq_mask=dq_mask,
+                s_sigma=s_sig,
+                alpha=alp,
+                move_factor=mf,
+                area_ratio=ar,
+                dilation_px=dil,
+            )
+        return _detect_contaminants_erosion_dilation(
+            res_or_stamp,
+            prot_area,
             dq_mask=dq_mask,
             detection_sigma=detection_sigma,
         )
+
+    method_lower = str(method).lower().strip()
+    if method_lower == "mto2":
+        # MTO2 directly on stamp with unsharp-based spike protection
+        residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
+        protected_stellar_area = _build_spike_and_core_protection(residual)
+        contaminants = _detect_contams(stamp, protected_stellar_area)
+    elif method_lower == "unsharp":
+        residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
+        protected_stellar_area = _build_spike_and_core_protection(residual)
+        contaminants = _detect_contams(residual, protected_stellar_area)
     else:
         # 2-iteration Moffat fitting (or physical model fit) weighted by var_poisson
         min_fit_r = float(core_protection_radius_px)
@@ -1784,12 +1860,7 @@ def mask_contaminants_with_spikes_protected(
         )
         residual = (stamp - fitted_img).astype(np.float32)
         protected_stellar_area = _build_spike_and_core_protection(residual)
-        contam_1 = _detect_contaminants_erosion_dilation(
-            residual,
-            protected_stellar_area,
-            dq_mask=dq_mask,
-            detection_sigma=detection_sigma,
-        )
+        contam_1 = _detect_contams(residual, protected_stellar_area)
 
         # Iteration 2: Re-fit profile with updated mask excluding initial contaminants & companions
         if n_iterations >= 2 and method_lower in ("moffat", "auto"):
@@ -1814,12 +1885,7 @@ def mask_contaminants_with_spikes_protected(
             )
             residual = (stamp - fitted_img).astype(np.float32)
             protected_stellar_area = _build_spike_and_core_protection(residual)
-            contaminants = _detect_contaminants_erosion_dilation(
-                residual,
-                protected_stellar_area,
-                dq_mask=dq_mask,
-                detection_sigma=detection_sigma,
-            )
+            contaminants = _detect_contams(residual, protected_stellar_area)
         else:
             contaminants = contam_1
 
@@ -1831,8 +1897,6 @@ def mask_contaminants_with_spikes_protected(
     final_mask = contaminants.copy()
     if dq_mask is not None:
         final_mask |= dq_mask
-    final_mask |= (~np.isfinite(stamp))
-
     final_mask |= (~np.isfinite(stamp))
 
     return final_mask, protected_stellar_area, residual
@@ -1859,5 +1923,9 @@ __all__ = [
     "fit_stpsf_model",
     "fit_stellar_model",
     "mask_gaia_companion_stars",
+    "mask_sources_not_main_star_mto2",
+    "segment_sources_mto2",
+    "_detect_contaminants_mto2",
+    "_detect_contaminants_erosion_dilation",
     "mask_contaminants_with_spikes_protected",
 ]

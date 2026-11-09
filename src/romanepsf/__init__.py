@@ -63,6 +63,11 @@ from .masking import (
     fit_stellar_model,
     mask_gaia_companion_stars,
     mask_contaminants_with_spikes_protected,
+    mask_sources_not_main_star_mto2,
+    segment_sources_mto2,
+)
+from .mto2 import (
+    MTO2Config,
 )
 from .profile import (
     create_ellipse_meshgrid_torch,
@@ -134,6 +139,9 @@ __all__ = [
     "fit_moffat_astrophot",
     "fit_moffat_astropy",
     "mask_gaia_companion_stars",
+    "mask_sources_not_main_star_mto2",
+    "segment_sources_mto2",
+    "MTO2Config",
     "mask_contaminants_with_spikes_protected",
     "create_ellipse_meshgrid_torch",
     "elliptical_profile",

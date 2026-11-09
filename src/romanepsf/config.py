@@ -162,6 +162,17 @@ class CoreProtectionRadius:
 
 
 @dataclass
+class MTO2ConfigSection:
+    s_sigma: float = 1.6
+    alpha: float = 1e-6
+    move_factor: float = 0.1
+    area_ratio: float = 0.90
+    dilation_px: int = 2
+    min_source_area_px: int = 3
+    background_mode: str = "const"
+
+
+@dataclass
 class SpikesSection:
     spike_order: Optional[str] = None
     base_angles_deg: List[float] = field(default_factory=lambda: [23.55, 55.29, 80.25, 118.65, 142.88, 178.07])
@@ -172,12 +183,16 @@ class SpikesSection:
     core_protection_radius_px: CoreProtectionRadius = field(default_factory=CoreProtectionRadius)
     morphological: MorphologicalConfig = field(default_factory=MorphologicalConfig)
     contaminant_detection_sigma: float = 3.0
+    contaminant_detector: str = "erosion_dilation"
+    mto2: MTO2ConfigSection = field(default_factory=MTO2ConfigSection)
 
     def __post_init__(self):
         if isinstance(self.core_protection_radius_px, dict):
             self.core_protection_radius_px = CoreProtectionRadius(**self.core_protection_radius_px)
         if isinstance(self.morphological, dict):
             self.morphological = MorphologicalConfig(**self.morphological)
+        if isinstance(self.mto2, dict):
+            self.mto2 = MTO2ConfigSection(**self.mto2)
 
 
 @dataclass

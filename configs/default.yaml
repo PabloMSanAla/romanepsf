@@ -64,6 +64,13 @@ spikes:
     min_length_px: 15
     dilation_iterations: 2
   contaminant_detection_sigma: 3.0
+  contaminant_detector: "erosion_dilation" # Options: 'erosion_dilation', 'mto2'
+  mto2:
+    s_sigma: 1.6
+    alpha: 1.0e-6
+    move_factor: 0.1
+    area_ratio: 0.90
+    dilation_px: 2
 
 profile:
   ellipticity: 0.0
