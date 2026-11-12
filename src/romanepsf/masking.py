@@ -391,6 +391,388 @@ class MoffatModelWrapper:
         return self._ap_model(*args, **kwargs)
 
 
+class SersicModelWrapper:
+    """
+    Wrapper around AstroPhot Sersic model providing Astropy-compatible parameter properties.
+    Ensures seamless interoperability between AstroPhot and Astropy modeling interfaces.
+    """
+    def __init__(self, ap_model):
+        self._ap_model = ap_model
+        self.Ie = ap_model.Ie
+        self.Re = ap_model.Re
+        self.n = ap_model.n
+        self.center = ap_model.center
+        self.amplitude = ap_model.Ie
+        self.r_eff = ap_model.Re
+
+    def __getattr__(self, name):
+        return getattr(self._ap_model, name)
+
+    def __call__(self, *args, **kwargs):
+        return self._ap_model(*args, **kwargs)
+
+
+def fit_sersic_astrophot(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a 2D circularly symmetric Sérsic profile to stellar/galaxy flux using AstroPhot (https://astrophot.readthedocs.io/).
+
+    Constructs an AstroPhot TargetImage with Poisson variance weighting, masks the central core
+    (r < min_radius) and companion Gaia stars (mask), and fits a SersicGalaxy model with Levenberg-Marquardt.
+    Evaluates the fitted model image analytically across the entire stamp using Astropy Sersic2D.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D stamp flux array.
+    dq_mask : np.ndarray, optional
+        Boolean mask of invalid/saturated pixels (True = bad).
+    max_radius : float, optional
+        Maximum radius from stamp center included in fit.
+    min_radius : float, optional
+        Inner radius below which pixels are excluded from the fit (masks central core).
+    mask : np.ndarray, optional
+        Additional boolean mask of pixels to exclude from the fit (e.g. companion Gaia stars).
+    variance : np.ndarray, optional
+        Pre-computed variance image. If None, constructed as Poisson noise variance.
+    bkg_rms : float, optional
+        Background RMS noise estimate.
+
+    Returns
+    -------
+    Tuple[np.ndarray, Any]
+        (fitted_image, fitted_model)
+    """
+    import astrophot as ap
+
+    ny, nx = stamp.shape
+    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    grid_y, grid_x = np.ogrid[:ny, :nx]
+    r = np.hypot(grid_x - cx, grid_y - cy)
+
+    outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
+    if dq_mask is not None:
+        outer_cutout &= (~dq_mask)
+    bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
+
+    if bkg_rms is None:
+        if np.any(outer_cutout):
+            outer_vals = stamp[outer_cutout]
+            bkg_rms = float(1.4826 * np.median(np.abs(outer_vals - bkg)))
+            if bkg_rms <= 0.0:
+                bkg_rms = float(np.std(outer_vals)) or 0.5
+        else:
+            bkg_rms = 0.5
+    bkg_rms = max(float(bkg_rms), 0.1)
+
+    flux_sub = np.where(np.isfinite(stamp), stamp - bkg, 0.0).astype(np.float32)
+    peak_val = max(float(np.nanmax(flux_sub)), 1.0)
+
+    combined_mask = (~np.isfinite(stamp))
+    if dq_mask is not None:
+        combined_mask |= dq_mask
+    if mask is not None:
+        combined_mask |= mask
+    if min_radius is not None and min_radius > 0:
+        combined_mask |= (r < min_radius)
+    if max_radius is not None:
+        combined_mask |= (r > max_radius)
+
+    if variance is None:
+        var_img = np.maximum(flux_sub, 0.0) + max(bkg_rms, 1.0)**2
+    else:
+        var_img = np.where(np.isfinite(variance), np.maximum(variance, 0.01), 1e6).astype(np.float32)
+
+    fit_r = max_radius if max_radius is not None else min(cx, cy) * 0.8
+    sub_r = int(np.ceil(fit_r)) + 5
+    x0 = max(0, int(round(cx)) - sub_r)
+    x1 = min(nx, int(round(cx)) + sub_r + 1)
+    y0 = max(0, int(round(cy)) - sub_r)
+    y1 = min(ny, int(round(cy)) + sub_r + 1)
+
+    sub_flux = flux_sub[y0:y1, x0:x1]
+    sub_var = var_img[y0:y1, x0:x1]
+    sub_mask = combined_mask[y0:y1, x0:x1]
+    sub_cx = float(cx - x0)
+    sub_cy = float(cy - y0)
+
+    target = ap.TargetImage(
+        data=sub_flux,
+        variance=sub_var,
+        mask=sub_mask,
+        pixelscale=1.0,
+    )
+
+    model = ap.models.SersicGalaxy(
+        target=target,
+        center=[sub_cx, sub_cy],
+        PA=0.0,
+        q=1.0,
+        Ie=peak_val * 0.5,
+        Re=4.0,
+        n=2.0,
+    )
+    model.center.to_static()
+    model.PA.to_static()
+    model.q.to_static()
+
+    fitter = ap.fit.LM(model, verbose=False)
+    fitter.fit()
+
+    fitted_Ie = max(float(model.Ie.value), 0.0)
+    fitted_Re = max(float(model.Re.value), 0.5)
+    fitted_n = max(min(float(model.n.value), 8.0), 0.5)
+
+    wrapped_model = SersicModelWrapper(model)
+    eval_model = models.Sersic2D(
+        amplitude=fitted_Ie,
+        r_eff=fitted_Re,
+        n=fitted_n,
+        x_0=float(cx),
+        y_0=float(cy),
+        ellip=0.0,
+        theta=0.0,
+    )
+    sersic_full = (eval_model(grid_x, grid_y) + bkg).astype(np.float32)
+    return sersic_full, wrapped_model
+
+
+def fit_sersic_astropy(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    sigma_image: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a 2D Sérsic profile to stellar flux using Astropy LevMarLSQFitter.
+    """
+    ny, nx = stamp.shape
+    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    grid_y, grid_x = np.mgrid[:ny, :nx]
+    r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
+
+    valid = np.isfinite(stamp)
+    if dq_mask is not None:
+        valid &= (~dq_mask)
+    if mask is not None:
+        valid &= (~mask)
+    if min_radius is not None and min_radius > 0:
+        valid &= (r >= min_radius)
+    if max_radius is not None:
+        valid &= (r <= max_radius)
+
+    if not np.any(valid):
+        return np.zeros_like(stamp, dtype=np.float32), None
+
+    outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
+    if dq_mask is not None:
+        outer_cutout &= (~dq_mask)
+    bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
+
+    if bkg_rms is None:
+        if np.any(outer_cutout):
+            outer_vals = stamp[outer_cutout]
+            bkg_rms = float(1.4826 * np.median(np.abs(outer_vals - bkg)))
+            if bkg_rms <= 0.0:
+                bkg_rms = float(np.std(outer_vals)) or 0.5
+        else:
+            bkg_rms = 0.5
+    bkg_rms = max(float(bkg_rms), 0.1)
+
+    finite_stamp = stamp[np.isfinite(stamp)]
+    peak_val = float(np.nanmax(finite_stamp)) - bkg if len(finite_stamp) > 0 else 1.0
+    peak_val = max(peak_val, 1.0)
+
+    if sigma_image is None:
+        if variance is not None:
+            sigma_image = np.sqrt(np.maximum(np.nan_to_num(variance, nan=1.0), 0.01))
+        else:
+            flux_excess = np.maximum(stamp - bkg, 0.0)
+            sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
+
+    weights = 1.0 / np.clip(sigma_image[valid], 0.1, None)
+
+    init_sersic = models.Sersic2D(
+        amplitude=peak_val * 0.5,
+        r_eff=3.0,
+        n=2.0,
+        x_0=float(cx),
+        y_0=float(cy),
+        ellip=0.0,
+        theta=0.0,
+    )
+    init_sersic.ellip.fixed = True
+    init_sersic.theta.fixed = True
+    init_sersic.x_0.bounds = (cx - 5.0, cx + 5.0)
+    init_sersic.y_0.bounds = (cy - 5.0, cy + 5.0)
+    init_sersic.amplitude.bounds = (0.0, None)
+    init_sersic.r_eff.bounds = (0.5, 50.0)
+    init_sersic.n.bounds = (0.5, 6.0)
+
+    fitter = fitting.LevMarLSQFitter()
+    try:
+        fitted = fitter(init_sersic, grid_x[valid], grid_y[valid], stamp[valid] - bkg, weights=weights)
+        fitted_image = (fitted(grid_x, grid_y) + bkg).astype(np.float32)
+        return fitted_image, fitted
+    except Exception:
+        fallback_img = (init_sersic(grid_x, grid_y) + bkg).astype(np.float32)
+        return fallback_img, init_sersic
+
+
+def fit_sersic_model(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    sigma_image: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+    engine: str = "astrophot",
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a 2D Sérsic profile to stellar flux using AstroPhot (default) or Astropy.
+    """
+    if engine.lower() == "astrophot":
+        try:
+            return fit_sersic_astrophot(
+                stamp,
+                dq_mask=dq_mask,
+                max_radius=max_radius,
+                min_radius=min_radius,
+                mask=mask,
+                variance=variance,
+                bkg_rms=bkg_rms,
+            )
+        except Exception as exc:
+            logger.warning("AstroPhot Sérsic fit encountered exception (%s); falling back to Astropy LevMar.", exc)
+
+    return fit_sersic_astropy(
+        stamp,
+        dq_mask=dq_mask,
+        max_radius=max_radius,
+        min_radius=min_radius,
+        mask=mask,
+        sigma_image=sigma_image,
+        variance=variance,
+        bkg_rms=bkg_rms,
+    )
+
+
+def fit_sersic_moffat_model(
+    stamp: np.ndarray,
+    dq_mask: Optional[np.ndarray] = None,
+    max_radius: Optional[float] = None,
+    min_radius: Optional[float] = None,
+    mask: Optional[np.ndarray] = None,
+    sigma_image: Optional[np.ndarray] = None,
+    variance: Optional[np.ndarray] = None,
+    bkg_rms: Optional[float] = None,
+) -> Tuple[np.ndarray, Any]:
+    """
+    Fit a compound Moffat2D + Sersic2D profile simultaneously to stellar flux.
+
+    Represents both the compact core / diffraction wings (Moffat) and the extended
+    broad halo / diffuse galaxy background (Sérsic) with Poisson weighting.
+    """
+    ny, nx = stamp.shape
+    cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+    grid_y, grid_x = np.mgrid[:ny, :nx]
+    r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
+
+    valid = np.isfinite(stamp)
+    if dq_mask is not None:
+        valid &= (~dq_mask)
+    if mask is not None:
+        valid &= (~mask)
+    if min_radius is not None and min_radius > 0:
+        valid &= (r >= min_radius)
+    if max_radius is not None:
+        valid &= (r <= max_radius)
+
+    if not np.any(valid):
+        return np.zeros_like(stamp, dtype=np.float32), None
+
+    outer_cutout = np.isfinite(stamp) & (r > 0.75 * np.nanmax(r))
+    if dq_mask is not None:
+        outer_cutout &= (~dq_mask)
+    bkg = float(np.median(stamp[outer_cutout])) if np.any(outer_cutout) else 0.0
+
+    if bkg_rms is None:
+        if np.any(outer_cutout):
+            outer_vals = stamp[outer_cutout]
+            bkg_rms = float(1.4826 * np.median(np.abs(outer_vals - bkg)))
+            if bkg_rms <= 0.0:
+                bkg_rms = float(np.std(outer_vals)) or 0.5
+        else:
+            bkg_rms = 0.5
+    bkg_rms = max(float(bkg_rms), 0.1)
+
+    finite_stamp = stamp[np.isfinite(stamp)]
+    peak_val = float(np.nanmax(finite_stamp)) - bkg if len(finite_stamp) > 0 else 1.0
+    peak_val = max(peak_val, 1.0)
+
+    if sigma_image is None:
+        if variance is not None:
+            sigma_image = np.sqrt(np.maximum(np.nan_to_num(variance, nan=1.0), 0.01))
+        else:
+            flux_excess = np.maximum(stamp - bkg, 0.0)
+            sigma_image = np.sqrt(flux_excess + max(bkg_rms, 1.0)**2)
+
+    weights = 1.0 / np.clip(sigma_image[valid], 0.1, None)
+
+    init_moffat = models.Moffat2D(
+        amplitude=0.7 * peak_val,
+        x_0=float(cx),
+        y_0=float(cy),
+        gamma=2.5,
+        alpha=1.52,
+    )
+    init_moffat.x_0.bounds = (cx - 5.0, cx + 5.0)
+    init_moffat.y_0.bounds = (cy - 5.0, cy + 5.0)
+    init_moffat.amplitude.bounds = (0.0, None)
+    init_moffat.gamma.bounds = (0.5, 30.0)
+    init_moffat.alpha.bounds = (1.05, 4.0)
+
+    init_sersic = models.Sersic2D(
+        amplitude=0.3 * peak_val,
+        r_eff=8.0,
+        n=1.5,
+        x_0=float(cx),
+        y_0=float(cy),
+        ellip=0.0,
+        theta=0.0,
+    )
+    init_sersic.ellip.fixed = True
+    init_sersic.theta.fixed = True
+    init_sersic.x_0.bounds = (cx - 5.0, cx + 5.0)
+    init_sersic.y_0.bounds = (cy - 5.0, cy + 5.0)
+    init_sersic.amplitude.bounds = (0.0, None)
+    init_sersic.r_eff.bounds = (1.0, 50.0)
+    init_sersic.n.bounds = (0.5, 6.0)
+
+    compound = init_moffat + init_sersic
+    fitter = fitting.LevMarLSQFitter()
+    try:
+        fitted = fitter(compound, grid_x[valid], grid_y[valid], stamp[valid] - bkg, weights=weights)
+        fitted_image = (fitted(grid_x, grid_y) + bkg).astype(np.float32)
+        return fitted_image, fitted
+    except Exception:
+        fallback_img = (compound(grid_x, grid_y) + bkg).astype(np.float32)
+        return fallback_img, compound
+
+
 def fit_moffat_astrophot(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
@@ -1090,6 +1472,31 @@ def fit_stellar_model(
             )
         except Exception as exc:
             logger.warning("fit_stpsf_model failed (%s); falling back to Moffat.", exc)
+
+    # Sersic profile fit
+    if method_lower in ("sersic", "sersic_galaxy"):
+        return fit_sersic_model(
+            stamp,
+            dq_mask=dq_mask,
+            max_radius=max_radius,
+            min_radius=min_radius,
+            mask=mask,
+            variance=variance,
+            bkg_rms=bkg_rms,
+            engine=engine,
+        )
+
+    # Compound Sersic + Moffat fit
+    if method_lower in ("sersic_moffat", "moffat_sersic", "compound", "sersic+moffat"):
+        return fit_sersic_moffat_model(
+            stamp,
+            dq_mask=dq_mask,
+            max_radius=max_radius,
+            min_radius=min_radius,
+            mask=mask,
+            variance=variance,
+            bkg_rms=bkg_rms,
+        )
 
     # Fallback / explicit Moffat fit
     return fit_moffat_model(
@@ -1863,7 +2270,7 @@ def mask_contaminants_with_spikes_protected(
         contam_1 = _detect_contams(residual, protected_stellar_area)
 
         # Iteration 2: Re-fit profile with updated mask excluding initial contaminants & companions
-        if n_iterations >= 2 and method_lower in ("moffat", "auto"):
+        if n_iterations >= 2 and method_lower in ("moffat", "auto", "sersic", "sersic_galaxy", "sersic_moffat", "moffat_sersic", "compound", "sersic+moffat"):
             iter2_mask = contam_1.copy()
             if comp_mask is not None:
                 iter2_mask |= comp_mask
@@ -1919,6 +2326,12 @@ __all__ = [
     "fit_moffat_model",
     "fit_moffat_astrophot",
     "fit_moffat_astropy",
+    "fit_sersic_model",
+    "fit_sersic_astrophot",
+    "fit_sersic_astropy",
+    "fit_sersic_moffat_model",
+    "SersicModelWrapper",
+    "MoffatModelWrapper",
     "fit_superback_model",
     "fit_stpsf_model",
     "fit_stellar_model",

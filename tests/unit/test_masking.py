@@ -11,6 +11,10 @@ from romanepsf.masking import (
     create_geometric_spike_mask,
     detect_morphological_spikes,
     fit_moffat_model,
+    fit_sersic_model,
+    fit_sersic_astrophot,
+    fit_sersic_astropy,
+    fit_sersic_moffat_model,
     fit_superback_model,
     fit_stpsf_model,
     fit_stellar_model,
@@ -639,6 +643,89 @@ class TestTwoIterationMoffatFitting:
         # Faint stars must not have contaminant masking applied
         assert not final_mask[20, 20]
         assert np.array_equal(residual, stamp)
+
+
+class TestSersicAndCompoundFitting:
+    """Tests for Sérsic and compound Sérsic + Moffat profile fitting."""
+
+    def test_fit_sersic_astropy(self):
+        sz = 61
+        cy, cx = 30.0, 30.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        # Synthetic Sersic (n=2, Re=4)
+        bn = 1.9992 * 2.0 - 0.3271
+        synthetic = (400.0 * np.exp(-bn * ((r / 4.0)**(1/2.0) - 1.0)) + 3.0).astype(np.float32)
+
+        fitted_img, model = fit_sersic_astropy(synthetic)
+        assert fitted_img.shape == (sz, sz)
+        assert model is not None
+        assert np.all(np.isfinite(fitted_img))
+        assert abs(model.amplitude.value - 400.0) < 100.0
+
+    def test_fit_sersic_astrophot(self):
+        sz = 61
+        cy, cx = 30.0, 30.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        bn = 1.9992 * 2.0 - 0.3271
+        synthetic = (400.0 * np.exp(-bn * ((r / 4.0)**(1/2.0) - 1.0)) + 3.0).astype(np.float32)
+
+        fitted_img, model = fit_sersic_astrophot(synthetic)
+        assert fitted_img.shape == (sz, sz)
+        assert model is not None
+        assert np.all(np.isfinite(fitted_img))
+
+    def test_fit_sersic_moffat_compound(self):
+        sz = 61
+        cy, cx = 30.0, 30.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        # Combined Moffat + Sersic
+        moffat = 300.0 / (1.0 + (r / 2.5)**2)**1.5
+        bn = 1.9992 * 2.0 - 0.3271
+        sersic = 50.0 * np.exp(-bn * ((r / 10.0)**(1/2.0) - 1.0))
+        synthetic = (moffat + sersic + 2.0).astype(np.float32)
+
+        fitted_img, model = fit_sersic_moffat_model(synthetic)
+        assert fitted_img.shape == (sz, sz)
+        assert model is not None
+        assert np.all(np.isfinite(fitted_img))
+
+    def test_fit_stellar_model_sersic_dispatch(self):
+        sz = 61
+        stamp = np.full((sz, sz), 2.0, dtype=np.float32)
+        stamp[30, 30] = 500.0
+
+        sersic_img, s_model = fit_stellar_model(stamp, method="sersic")
+        assert sersic_img.shape == (sz, sz)
+        assert np.all(np.isfinite(sersic_img))
+
+        comp_img, c_model = fit_stellar_model(stamp, method="sersic_moffat")
+        assert comp_img.shape == (sz, sz)
+        assert np.all(np.isfinite(comp_img))
+
+    def test_mask_contaminants_with_sersic(self):
+        sz = 81
+        cy, cx = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        bn = 1.9992 * 2.0 - 0.3271
+        synthetic = (400.0 * np.exp(-bn * ((r / 4.0)**(1/2.0) - 1.0)) + 3.0).astype(np.float32)
+        # Contaminant off-axis
+        synthetic[20, 20] = 200.0
+
+        final_mask, prot_area, residual = mask_contaminants_with_spikes_protected(
+            synthetic,
+            tier="bright",
+            method="sersic",
+            n_iterations=2,
+        )
+        assert final_mask.shape == (sz, sz)
+        assert final_mask[20, 20]
+        assert not final_mask[40, 40]
+        assert prot_area[40, 40]
+
 
 
 

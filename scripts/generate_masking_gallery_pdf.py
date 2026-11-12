@@ -1,14 +1,13 @@
 """
 Generate Publication-Quality PDF Report Demonstrating Gaia Companion Masking,
-MTO2 Max-Tree Object Representation & Deblending, and Diffraction Spike Protection.
+Moffat & Sérsic Profile Residual Fitting, MTO2 Max-Tree Object Representation & Deblending,
+and Roman Diffraction Spike Protection.
 
-Visualizes 3 panels per star:
+Visualizes 4 panels per star:
   1. Normal: Log stretched stamp flux
-  2. Residual / Spike Feature Map:
-     - For MTO2 / Unsharp: High-pass residual (delta I = I_obs - I_smooth) isolating diffraction spikes & faint contaminants
-     - For parametric models: Model residual map (delta I = I_obs - I_model)
-     - Faint stars: direct pass-through (masking omitted)
-  3. Normal + Mask: Stamp flux with semi-transparent uniform yellow overlay highlighting
+  2. Moffat Residual Map: 2-iteration AstroPhot Moffat profile residual (delta I = I_obs - I_moffat)
+  3. Sérsic Residual Map: 2D Sérsic profile residual (delta I = I_obs - I_sersic)
+  4. Normal + Mask Overlay: Stamp flux with semi-transparent uniform yellow overlay highlighting
      MTO2 max-tree segmented contaminant sources & circular Gaia companion apertures, strictly
      preserving Roman diffraction spikes and stellar core.
 """
@@ -41,6 +40,8 @@ from romanepsf.stamps import (
 from romanepsf.masking import (
     mask_contaminants_with_spikes_protected,
     mask_gaia_companion_stars,
+    fit_moffat_model,
+    fit_sersic_model,
 )
 from romanepsf.config import load_config
 
@@ -85,7 +86,7 @@ def select_sample_stars(tiered_catalog_path: str, n_bright: int = 10, n_medium: 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate PDF masking report across sample stars.")
-    parser.add_argument("--method", type=str, default="moffat", choices=["moffat", "mto2", "superback", "stpsf", "unsharp"], help="Profile residual subtraction method")
+    parser.add_argument("--method", type=str, default="moffat", choices=["moffat", "sersic", "compound", "mto2", "superback", "stpsf", "unsharp"], help="Primary residual subtraction method")
     parser.add_argument("--contaminant-detector", type=str, default="mto2", choices=["mto2", "erosion_dilation"], help="Contaminant detection algorithm")
     parser.add_argument("--n-bright", type=int, default=10, help="Number of bright stars")
     parser.add_argument("--n-medium", type=int, default=8, help="Number of medium stars")
@@ -93,7 +94,7 @@ def main():
     parser.add_argument("--output-pdf", type=str, default=None, help="Custom output PDF path")
     args = parser.parse_args()
 
-    print(f"=== Starting Roman ePSF Masking PDF Generator (Subtraction: {args.method.upper()}, Detector: {args.contaminant_detector.upper()}) ===")
+    print(f"=== Starting Roman ePSF Masking PDF Generator (Fitting: Moffat & Sérsic, Detector: {args.contaminant_detector.upper()}) ===")
     out_dir = Path("output")
     out_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = Path(args.output_pdf) if args.output_pdf else out_dir / "gaia_masking_gallery.pdf"
@@ -169,35 +170,15 @@ def main():
         
         roll_ref = float(getattr(l2, "pa_aperture", l2.meta.get("roll_ref", -110.02)))
         
-        # Find companion stars inside stamp for stats
+        # Find companion stars inside stamp for stats and exclusion
         half = (sz - 1) // 2
         dx = gaia_pix["x"] - cx
         dy = gaia_pix["y"] - cy
         dist = np.hypot(dx, dy)
         in_stamp = (dist > core_rad) & (np.abs(dx) <= half + 10) & (np.abs(dy) <= half + 10)
         n_comps = int(np.sum(in_stamp))
-        
-        # Apply spike protection and contaminant + Gaia circular companion masking using MTO2
-        final_mask, protected_spikes, res_img = mask_contaminants_with_spikes_protected(
-            flux_sub,
-            dq_mask=dq_mask,
-            pa_aperture=roll_ref,
-            cfg=cfg.spikes,
-            tier=tier,
-            companion_stars=gaia_pix,
-            target_center_xy=(cx, cy),
-            pixel_scale=l2.pixel_scale,
-            companion_depth=28.0,
-            method=args.method,
-            contaminant_detector=args.contaminant_detector,
-            detector=det,
-            bandpass="F146",
-            var_poisson=vp_cutout,
-            n_iterations=2,
-        )
-        residual = res_img
-        
-        # Compute companion circular mask separately for visual reporting
+
+        # Compute companion circular mask separately for fitting exclusion and reporting
         comp_only_mask = mask_gaia_companion_stars(
             flux_sub.shape,
             ((sz - 1) / 2.0, (sz - 1) / 2.0),
@@ -207,6 +188,41 @@ def main():
             depth=28.0,
             core_exclusion_radius_px=core_rad,
         )
+
+        # 1. Fit Moffat profile & detect contaminants with MTO2
+        final_mask, protected_spikes, res_moffat = mask_contaminants_with_spikes_protected(
+            flux_sub,
+            dq_mask=dq_mask,
+            pa_aperture=roll_ref,
+            cfg=cfg.spikes,
+            tier=tier,
+            companion_stars=gaia_pix,
+            target_center_xy=(cx, cy),
+            pixel_scale=l2.pixel_scale,
+            companion_depth=28.0,
+            method="moffat",
+            contaminant_detector=args.contaminant_detector,
+            detector=det,
+            bandpass="F146",
+            var_poisson=vp_cutout,
+            n_iterations=2,
+        )
+
+        # 2. Fit Sérsic profile
+        if tier == "faint":
+            res_sersic = flux_sub.copy()
+        else:
+            sersic_img, _ = fit_sersic_model(
+                flux_sub,
+                dq_mask=dq_mask,
+                max_radius=min(max(half * 0.4, 30.0), 100.0),
+                min_radius=core_rad,
+                mask=comp_only_mask,
+                variance=vp_cutout,
+                bkg_rms=bkg_rms,
+                engine="astrophot",
+            )
+            res_sersic = (flux_sub - sersic_img).astype(np.float32)
 
         masked_pct = 100.0 * np.sum(final_mask) / flux_sub.size
         prot_pct = 100.0 * np.sum(protected_spikes) / flux_sub.size
@@ -230,7 +246,8 @@ def main():
             "mag": mag,
             "size": sz,
             "flux": flux_sub,
-            "residual": residual,
+            "res_moffat": res_moffat,
+            "res_sersic": res_sersic,
             "final_mask": final_mask,
             "protected_spikes": protected_spikes,
             "comp_mask": comp_only_mask,
@@ -250,7 +267,7 @@ def main():
             page_stars = processed_stars[page_idx * stars_per_page : (page_idx + 1) * stars_per_page]
             n_rows = len(page_stars)
             
-            fig, axes = plt.subplots(n_rows, 3, figsize=(14, 4.4 * n_rows), dpi=150)
+            fig, axes = plt.subplots(n_rows, 4, figsize=(18.5, 4.4 * n_rows), dpi=150)
             if n_rows == 1:
                 axes = np.expand_dims(axes, 0)
                 
@@ -258,7 +275,8 @@ def main():
             
             for row_idx, star in enumerate(page_stars):
                 flux = star["flux"]
-                res = star["residual"]
+                res_m = star["res_moffat"]
+                res_s = star["res_sersic"]
                 mask = star["final_mask"]
                 comp_mask = star["comp_mask"]
                 star_tier = star["tier"].lower()
@@ -281,46 +299,57 @@ def main():
                 im1 = ax_norm.imshow(clean_disp, origin="lower", cmap="inferno", norm=norm_flux)
                 ax_norm.set_title(
                     f"#{star['idx']} {tier_str} Star ({star['detector']}, mag={star['mag']:.2f})\nNormal Stamp ({star['size']}x{star['size']} px)",
-                    fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6
+                    fontsize=10.0, color="#e6edf3", fontweight="bold", pad=6
                 )
-                ax_norm.tick_params(colors="#8b949e", labelsize=8)
+                ax_norm.tick_params(colors="#8b949e", labelsize=7.5)
                 cb1 = plt.colorbar(im1, ax=ax_norm, fraction=0.046, pad=0.03)
-                cb1.ax.tick_params(colors="#8b949e", labelsize=7.5)
-                cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
+                cb1.ax.tick_params(colors="#8b949e", labelsize=7.0)
+                cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=7.5)
                 
-                # ----------------- Panel 2: Spike Feature Map / Residual Map -----------------
-                ax_res = axes[row_idx, 1]
-                ax_res.set_facecolor("#161b22")
-                clean_res = np.maximum(res, 1e-4)
-                im2 = ax_res.imshow(clean_res, origin="lower", cmap="inferno", norm=norm_flux)
+                # ----------------- Panel 2: Moffat Residual Map -----------------
+                ax_res_m = axes[row_idx, 1]
+                ax_res_m.set_facecolor("#161b22")
+                clean_res_m = np.maximum(res_m, 1e-4)
+                im2 = ax_res_m.imshow(clean_res_m, origin="lower", cmap="inferno", norm=norm_flux)
                 if star_tier == "faint":
-                    res_title = (
-                        rf"Faint Tier: Moffat Fit Skipped" "\n"
-                        rf"Direct Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
-                    )
-                elif args.method == "moffat":
-                    res_title = (
-                        rf"AstroPhot 2-Iter Moffat Residual ($\Delta I = I_{{obs}} - I_{{moffat}}$)" "\n"
-                        rf"Weighted with var_poisson | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
-                    )
-                elif args.method == "mto2":
-                    res_title = (
-                        rf"High-Pass Spike Feature Map ($\Delta I = I_{{obs}} - I_{{smooth}}$)" "\n"
-                        rf"Isolating 24 Spikes | Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    res_m_title = (
+                        rf"Faint Tier: Moffat Skipped" "\n"
+                        rf"Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
                     )
                 else:
-                    res_title = (
-                        rf"{args.method.upper()} Residual Map ($\Delta I = I_{{obs}} - I_{{model}}$)" "\n"
-                        rf"Stretch [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    res_m_title = (
+                        rf"2-Iter AstroPhot Moffat Residual" "\n"
+                        rf"$\Delta I = I_{{obs}} - I_{{moffat}}$"
                     )
-                ax_res.set_title(res_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
-                ax_res.tick_params(colors="#8b949e", labelsize=8)
-                cb2 = plt.colorbar(im2, ax=ax_res, fraction=0.046, pad=0.03)
-                cb2.ax.tick_params(colors="#8b949e", labelsize=7.5)
-                cb2.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
+                ax_res_m.set_title(res_m_title, fontsize=10.0, color="#e6edf3", fontweight="bold", pad=6)
+                ax_res_m.tick_params(colors="#8b949e", labelsize=7.5)
+                cb2 = plt.colorbar(im2, ax=ax_res_m, fraction=0.046, pad=0.03)
+                cb2.ax.tick_params(colors="#8b949e", labelsize=7.0)
+                cb2.set_label("Residual (MJy/sr)", color="#8b949e", fontsize=7.5)
+
+                # ----------------- Panel 3: Sérsic Residual Map -----------------
+                ax_res_s = axes[row_idx, 2]
+                ax_res_s.set_facecolor("#161b22")
+                clean_res_s = np.maximum(res_s, 1e-4)
+                im3 = ax_res_s.imshow(clean_res_s, origin="lower", cmap="inferno", norm=norm_flux)
+                if star_tier == "faint":
+                    res_s_title = (
+                        rf"Faint Tier: Sérsic Skipped" "\n"
+                        rf"Pass-Through [{norm_flux.vmin:.1e}, {norm_flux.vmax:.1e}]"
+                    )
+                else:
+                    res_s_title = (
+                        rf"AstroPhot 2D Sérsic Residual" "\n"
+                        rf"$\Delta I = I_{{obs}} - I_{{sersic}}$"
+                    )
+                ax_res_s.set_title(res_s_title, fontsize=10.0, color="#e6edf3", fontweight="bold", pad=6)
+                ax_res_s.tick_params(colors="#8b949e", labelsize=7.5)
+                cb3 = plt.colorbar(im3, ax=ax_res_s, fraction=0.046, pad=0.03)
+                cb3.ax.tick_params(colors="#8b949e", labelsize=7.0)
+                cb3.set_label("Residual (MJy/sr)", color="#8b949e", fontsize=7.5)
                 
-                # ----------------- Panel 3: Normal + Mask Overlay (Uniform Yellow) -----------------
-                ax_mask = axes[row_idx, 2]
+                # ----------------- Panel 4: Normal + Mask Overlay (Uniform Yellow) -----------------
+                ax_mask = axes[row_idx, 3]
                 ax_mask.set_facecolor("#161b22")
                 ax_mask.imshow(clean_disp, origin="lower", cmap="inferno", norm=norm_flux)
                 
@@ -331,30 +360,25 @@ def main():
                 
                 if star_tier == "faint":
                     mask_title = (
-                        f"Normal + Mask Overlay (Faint Tier: No Masking)\n"
-                        f"Retained: 100% Core & Wings | DQ/NaN: {star['masked_pct']:.1f}%"
+                        f"Normal + Mask (Faint: No Masking)\n"
+                        f"Retained: 100% | DQ/NaN: {star['masked_pct']:.1f}%"
                     )
                 else:
-                    det_name = args.contaminant_detector.upper() if args.method == "moffat" else args.method.upper()
+                    det_name = args.contaminant_detector.upper()
                     comp_info = f" | {star['n_comps']} Gaia Comps" if star['n_comps'] > 0 else ""
                     mask_title = (
-                        f"Normal + {det_name} Mask Overlay (Yellow){comp_info}\n"
-                        f"Masked: {star['masked_pct']:.1f}% ({star['n_islands']} sources) | Spikes Protected: {star['prot_pct']:.1f}%"
+                        f"Normal + {det_name} Mask Overlay{comp_info}\n"
+                        f"Masked: {star['masked_pct']:.1f}% ({star['n_islands']} objs) | Spikes: {star['prot_pct']:.1f}%"
                     )
-                ax_mask.set_title(mask_title, fontsize=10.5, color="#e6edf3", fontweight="bold", pad=6)
-                ax_mask.tick_params(colors="#8b949e", labelsize=8)
+                ax_mask.set_title(mask_title, fontsize=10.0, color="#e6edf3", fontweight="bold", pad=6)
+                ax_mask.tick_params(colors="#8b949e", labelsize=7.5)
                 
                 # Dummy colorbar for alignment
-                cb3 = plt.colorbar(im1, ax=ax_mask, fraction=0.046, pad=0.03)
-                cb3.ax.set_visible(False)
+                cb4 = plt.colorbar(im1, ax=ax_mask, fraction=0.046, pad=0.03)
+                cb4.ax.set_visible(False)
                 
-            plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.06, right=0.94)
-            if args.method == "moffat":
-                method_header = f"2-Iter AstroPhot Moffat Subtraction + {args.contaminant_detector.upper()} Deblending | Spikes & Cores Protected"
-            elif args.method == "mto2":
-                method_header = "MTO2 Max-Tree Object Representation & Deblending | Spikes & Cores Protected"
-            else:
-                method_header = f"{args.method.upper()} Fitting & Masking | Spikes & Cores Protected"
+            plt.subplots_adjust(top=0.92, bottom=0.05, hspace=0.35, wspace=0.25, left=0.04, right=0.96)
+            method_header = f"Moffat & Sérsic Profile Fits + {args.contaminant_detector.upper()} Deblending | Spikes & Cores Protected"
                 
             fig.suptitle(
                 f"Roman ePSF Masking Gallery — Page {page_idx+1} of {num_pages}\n"

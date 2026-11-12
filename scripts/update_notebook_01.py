@@ -15,7 +15,7 @@ cells = []
 # ==============================================================================
 # Cell 0: Header & Introduction
 # ==============================================================================
-cells.append(nbf.v4.new_markdown_cell("""# Tutorial 1: Postage Stamp Extraction, Sub-pixel Alignment, Profile Residual Methods, and Spike-Preserving Masking
+cells.append(nbf.v4.new_markdown_cell(r"""# Tutorial 1: Postage Stamp Extraction, Sub-pixel Alignment, Profile Residual Methods, and Spike-Preserving Masking
 
 In this tutorial, you will learn the complete preprocessing and masking pipeline for measuring the extended Point Spread Function (ePSF) of the Roman Space Telescope:
 
@@ -24,20 +24,22 @@ In this tutorial, you will learn the complete preprocessing and masking pipeline
 3. **Background Subtraction**: Robust estimation of local background flux in peripheral annuli.
 4. **Multiple Profile Residual Methods**:
    - **Method 1: 2-Iteration AstroPhot Moffat Fitting (`method='moffat'`)**: Fast Levenberg-Marquardt fitting of a 2D Moffat profile weighted by Level 2 Poisson variance (`var_poisson`). In iteration 2, the fit mask is updated to exclude initially detected contaminants and neighbor Gaia companions.
-   - **Method 2: Physical Model Fitting (`method='superback'` / `method='stpsf'`)**: Forward-modeling Roman SUPERBACK optical PSF (via `rosalia.superback_pytorch`) for bright stars and instrumental PSF (via `stpsf.WFI`) for medium stars.
-   - **Method 3: Gaussian Unsharp Masking (`method='unsharp'`)**: Non-parametric high-pass filtering isolating compact contaminants and diffraction spikes without parametric profile assumptions.
+   - **Method 2: 2D Sérsic Profile Fitting (`method='sersic'`)**: Levenberg-Marquardt fitting of a 2D circularly symmetric Sérsic profile $I(r) = I_e \exp(-b_n((r/R_e)^{1/n} - 1))$, modeling extended wings and broad diffuse backgrounds.
+   - **Method 3: Compound Sérsic + Moffat Fitting (`method='compound'`)**: Simultaneous fitting of both core Moffat and extended Sérsic components.
+   - **Method 4: Physical Model Fitting (`method='superback'` / `method='stpsf'`)**: Forward-modeling Roman SUPERBACK optical PSF (via `rosalia.superback_pytorch`) for bright stars and instrumental PSF (via `stpsf.WFI`) for medium stars.
+   - **Method 5: Gaussian Unsharp Masking (`method='unsharp'`)**: Non-parametric high-pass filtering isolating compact contaminants and diffraction spikes without parametric profile assumptions.
    - **Faint Star Strategy**: Bypassing profile fitting and contaminant masking to preserve faint stellar wings and core flux for direct stacking.
 5. **Neighbor Gaia Companion Masking**: Analytically calculating circular aperture exclusion radii using `get_psf_extension_moffat(mag, depth=28.0)` and masking nearby stars.
 6. **Dual-Prior Diffraction Spike Protection**:
    - **Theoretical dual-set priors**: 24 spike rays derived from Roman's secondary mirror spider assembly and pupil facets rotated by aperture position angle (`roll_ref`) and detector clocking.
    - **Empirical angle refinement & morphological filtering**: Fine-tuning candidate rays along observed ridge peaks on residual maps.
-7. **Erosion-Dilation Contaminant Masking**:
+7. **Erosion-Dilation & MTO2 Contaminant Masking**:
    - Sigma-clipped detection: $\\text{threshold} = \\text{median} + 1.5 \\times \\text{std}$
-   - Morphological opening ($1 \\times 1$ erosion) and dilation ($3 \\times 3$)
+   - Morphological opening ($1 \\times 1$ erosion) and dilation ($3 \\times 3$) or MTO2 Max-Tree deblending.
    - Strict invariant: excluded pixels never overlap protected diffraction spikes or central core.
 8. **Method Comparison & Publication Visualizations**:
    - Side-by-side comparison of residual maps and masks across methods on the same star.
-   - Standard 3-panel visualization: Normal Stamp, Residual Map, and Normal + Uniform Yellow Mask Overlay."""))
+   - Standard 4-panel visualization: Normal Stamp, Moffat Residual, Sérsic Residual, and Normal + Uniform Yellow Mask Overlay."""))
 
 # ==============================================================================
 # Cell 1: Environment & Imports
@@ -253,7 +255,32 @@ moffat_img, moffat_model = rep.fit_moffat_model(
     engine="astrophot",
 )
 moffat_residual = aligned_sub - moffat_img
-print(f"Moffat fit completed. Residual range: [{np.nanmin(moffat_residual):.2e}, {np.nanmax(moffat_residual):.2e}] MJy/sr")"""))
+print(f"Moffat fit completed. Residual range: [{np.nanmin(moffat_residual):.2e}, {np.nanmax(moffat_residual):.2e}] MJy/sr")
+
+# Demonstrate 2D Sérsic profile fit
+sersic_img, sersic_model = rep.fit_sersic_model(
+    aligned_sub,
+    dq_mask=aligned_mask,
+    mask=comp_mask,
+    min_radius=core_rad,
+    max_radius=min(max((stamp_sz - 1) * 0.2, 30.0), 100.0),
+    variance=raw_vp,
+    engine="astrophot",
+)
+sersic_residual = aligned_sub - sersic_img
+print(f"Sérsic fit completed. Residual range: [{np.nanmin(sersic_residual):.2e}, {np.nanmax(sersic_residual):.2e}] MJy/sr")
+
+# Demonstrate Compound Sérsic + Moffat fit
+compound_img, compound_model = rep.fit_sersic_moffat_model(
+    aligned_sub,
+    dq_mask=aligned_mask,
+    mask=comp_mask,
+    min_radius=core_rad,
+    max_radius=min(max((stamp_sz - 1) * 0.2, 30.0), 100.0),
+    variance=raw_vp,
+)
+compound_residual = aligned_sub - compound_img
+print(f"Compound fit completed. Residual range: [{np.nanmin(compound_residual):.2e}, {np.nanmax(compound_residual):.2e}] MJy/sr")"""))
 
 # ==============================================================================
 # Cell 12: Step 6 Markdown
@@ -308,14 +335,23 @@ cells.append(nbf.v4.new_markdown_cell("""## Step 7: Method Comparison on the Sam
 
 Here we execute the four primary methods side-by-side on the exact same star cutout to compare:
 1. **2-Iteration AstroPhot Moffat** (`method='moffat'` with `var_poisson`)
-2. **Physical Model** (`method='superback'` for bright, `'stpsf'` for medium)
-3. **Gaussian Unsharp Masking** (`method='unsharp'`)
-4. **MTO2 Max-Tree Deblending** (`method='mto2'`)"""))
+2. **2D Sérsic Profile** (`method='sersic'`)
+3. **Compound Sérsic + Moffat** (`method='compound'`)
+4. **Physical Model** (`method='superback'` for bright, `'stpsf'` for medium)
+5. **Gaussian Unsharp Masking** (`method='unsharp'`)
+6. **MTO2 Max-Tree Deblending** (`method='mto2'`)"""))
 
 # ==============================================================================
 # Cell 15: Step 7 Code
 # ==============================================================================
-cells.append(nbf.v4.new_code_cell("""methods_to_compare = ["moffat", "superback" if SELECTED_TIER == "bright" else "stpsf", "unsharp", "mto2"]
+cells.append(nbf.v4.new_code_cell("""methods_to_compare = [
+    "moffat",
+    "sersic",
+    "compound",
+    "superback" if SELECTED_TIER == "bright" else "stpsf",
+    "unsharp",
+    "mto2",
+]
 comparison_results = {}
 
 for m in methods_to_compare:
@@ -337,8 +373,9 @@ for m in methods_to_compare:
     comparison_results[m] = {"mask": mask_m, "prot": prot_m, "residual": res_m}
     print(f"Method '{m.upper()}': Masked = {100*np.sum(mask_m)/mask_m.size:.1f}%, Protected = {100*np.sum(prot_m)/prot_m.size:.1f}%")
 
-# Plot 4x3 comparison figure
-fig, axes = plt.subplots(4, 3, figsize=(15, 17))
+# Plot 6x3 comparison figure
+n_methods = len(methods_to_compare)
+fig, axes = plt.subplots(n_methods, 3, figsize=(15, 4.0 * n_methods))
 
 pos_flux = aligned_sub[np.isfinite(aligned_sub) & (aligned_sub > 0)]
 vmin = max(np.percentile(pos_flux, 2), 1e-4) if len(pos_flux) > 0 else 1e-4
@@ -371,7 +408,7 @@ for row_idx, m in enumerate(methods_to_compare):
     cb_dummy.ax.set_visible(False)
 
 for c in range(3):
-    axes[3, c].set_xlabel("X (pixels)")
+    axes[n_methods - 1, c].set_xlabel("X (pixels)")
 
 plt.suptitle(f"Comparison of Profile Residual & Masking Methods ({SELECTED_TIER.capitalize()} Star)", fontsize=13, fontweight="bold", y=0.995)
 plt.tight_layout()
@@ -380,17 +417,18 @@ fig"""))
 # ==============================================================================
 # Cell 16: Step 8 Markdown
 # ==============================================================================
-cells.append(nbf.v4.new_markdown_cell("""## Step 8: Publication-Quality 3-Panel Diagnostic
+cells.append(nbf.v4.new_markdown_cell("""## Step 8: Publication-Quality 4-Panel Diagnostic
 
-We display the 3-panel layout matching the Roman ePSF validation report and masking gallery:
+We display the 4-panel diagnostic layout matching the Roman ePSF validation report and masking gallery:
 1. **Normal Stamp**: LogNorm stretched flux showing primary core and extended diffraction spikes.
-2. **Model Residual Map**: Residual flux $\\Delta I = I_{\\text{obs}} - I_{\\text{model}}$ using the **exact same stretch** as the science image.
-3. **Normal + Mask Overlay**: Stamp flux with a semi-transparent uniform yellow overlay highlighting masked contaminants and Gaia companion stars, with spikes and core strictly preserved."""))
+2. **Moffat Residual Map**: 2-iteration AstroPhot Moffat profile residual $\\Delta I = I_{\\text{obs}} - I_{\\text{moffat}}$.
+3. **Sérsic Residual Map**: 2D Sérsic profile residual $\\Delta I = I_{\\text{obs}} - I_{\\text{sersic}}$.
+4. **Normal + Mask Overlay**: Stamp flux with a semi-transparent uniform yellow overlay highlighting masked contaminants and Gaia companion stars, with spikes and core strictly preserved."""))
 
 # ==============================================================================
 # Cell 17: Step 8 Code
 # ==============================================================================
-cells.append(nbf.v4.new_code_cell("""fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), dpi=130)
+cells.append(nbf.v4.new_code_cell("""fig, axes = plt.subplots(1, 4, figsize=(19, 5.0), dpi=140)
 fig.patch.set_facecolor("#0e1117")
 
 pos_flux = aligned_sub[np.isfinite(aligned_sub) & (aligned_sub > 0)]
@@ -402,41 +440,44 @@ norm = LogNorm(vmin=vmin, vmax=vmax)
 ax1 = axes[0]
 ax1.set_facecolor("#161b22")
 im1 = ax1.imshow(np.maximum(aligned_sub, 1e-4), origin="lower", cmap="inferno", norm=norm)
-ax1.set_title(f"1. Normal Stamp ({SELECTED_TIER.capitalize()} Star, mag={target_star['mag_lambda']:.2f})\\nSize: {stamp_sz}x{stamp_sz} px", fontsize=11, color="#e6edf3", fontweight="bold", pad=6)
-ax1.tick_params(colors="#8b949e", labelsize=8.5)
+ax1.set_title(f"1. Normal Stamp\\n{SELECTED_TIER.capitalize()} Star ({l2.detector})", color="#e6edf3", fontsize=10.5, fontweight="bold")
+ax1.tick_params(colors="#8b949e", labelsize=8)
 cb1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.03)
-cb1.ax.tick_params(colors="#8b949e", labelsize=8)
-cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8.5)
+cb1.ax.tick_params(colors="#8b949e", labelsize=7.5)
+cb1.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
 
-# Panel 2: Model Residual Map (Same Stretch)
+# Panel 2: Moffat Residual Map
 ax2 = axes[1]
 ax2.set_facecolor("#161b22")
-im2 = ax2.imshow(np.maximum(residual_map, 1e-4), origin="lower", cmap="inferno", norm=norm)
-ax2.set_title(f"2. {SELECTED_METHOD.upper()} Residual Map (Same Stretch)\\nStretch [{norm.vmin:.1e}, {norm.vmax:.1e}]", fontsize=11, color="#e6edf3", fontweight="bold", pad=6)
-ax2.tick_params(colors="#8b949e", labelsize=8.5)
+im2 = ax2.imshow(np.maximum(moffat_residual, 1e-4), origin="lower", cmap="inferno", norm=norm)
+ax2.set_title("2. AstroPhot Moffat Residual\\n$\\Delta I = I_{obs} - I_{moffat}$", color="#e6edf3", fontsize=10.5, fontweight="bold")
+ax2.tick_params(colors="#8b949e", labelsize=8)
 cb2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03)
-cb2.ax.tick_params(colors="#8b949e", labelsize=8)
-cb2.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8.5)
+cb2.ax.tick_params(colors="#8b949e", labelsize=7.5)
+cb2.set_label("Residual (MJy/sr)", color="#8b949e", fontsize=8)
 
-# Panel 3: Normal + Mask Overlay (Uniform Yellow)
+# Panel 3: Sérsic Residual Map
 ax3 = axes[2]
 ax3.set_facecolor("#161b22")
-ax3.imshow(np.maximum(aligned_sub, 1e-4), origin="lower", cmap="inferno", norm=norm)
+im3 = ax3.imshow(np.maximum(sersic_residual, 1e-4), origin="lower", cmap="inferno", norm=norm)
+ax3.set_title("3. 2D Sérsic Residual\\n$\\Delta I = I_{obs} - I_{sersic}$", color="#e6edf3", fontsize=10.5, fontweight="bold")
+ax3.tick_params(colors="#8b949e", labelsize=8)
+cb3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.03)
+cb3.ax.tick_params(colors="#8b949e", labelsize=7.5)
+cb3.set_label("Residual (MJy/sr)", color="#8b949e", fontsize=8)
 
+# Panel 4: Normal + Mask Overlay
+ax4 = axes[3]
+ax4.set_facecolor("#161b22")
+ax4.imshow(np.maximum(aligned_sub, 1e-4), origin="lower", cmap="inferno", norm=norm)
 overlay = np.zeros((*aligned_sub.shape, 4), dtype=float)
-overlay[final_mask] = [1.0, 0.92, 0.0, 0.55]  # Uniform yellow
-ax3.imshow(overlay, origin="lower")
+overlay[final_mask] = [1.0, 0.92, 0.0, 0.55]
+ax4.imshow(overlay, origin="lower")
+ax4.set_title(f"4. Normal + Mask Overlay\\nMasked: {100*np.sum(final_mask)/final_mask.size:.1f}% | Spikes: {100*np.sum(protected_spikes)/final_mask.size:.1f}%", color="#e6edf3", fontsize=10.5, fontweight="bold")
+ax4.tick_params(colors="#8b949e", labelsize=8)
+cb4 = plt.colorbar(im1, ax=ax4, fraction=0.046, pad=0.03)
+cb4.ax.set_visible(False)
 
-ax3.set_title(f"3. Normal + Mask Overlay (Yellow)\\nMasked: {100*np.sum(final_mask)/final_mask.size:.1f}% | Spikes Protected: {100*np.sum(protected_spikes)/final_mask.size:.1f}%", fontsize=11, color="#e6edf3", fontweight="bold", pad=6)
-ax3.tick_params(colors="#8b949e", labelsize=8.5)
-cb3 = plt.colorbar(im1, ax=ax3, fraction=0.046, pad=0.03)
-cb3.ax.set_visible(False)
-
-for ax in axes:
-    ax.set_xlabel("X (pixels)", color="#8b949e", fontsize=9)
-    ax.set_ylabel("Y (pixels)", color="#8b949e", fontsize=9)
-
-plt.suptitle(f"Roman ePSF Masking Diagnostic — {SELECTED_TIER.capitalize()} Star ({SELECTED_METHOD.upper()} Method)", fontsize=13, color="#58a6ff", fontweight="bold", y=0.99)
 plt.tight_layout()
 fig"""))
 
