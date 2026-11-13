@@ -1,8 +1,10 @@
 """
 Publication-Quality Visualization Script for Roman Space Telescope ePSF Pipeline:
-Plot 1: 1D Radial Profile of Resulting Composite ePSF with all contributing individual star profiles in background (lower alpha, 4x oversampled for faint/medium)
-Plot 2: Full 2D Composite Extended PSF Model Canvas (1025x1025, 113"x113" FOV) with 4x Oversampled Core Inset
-Plot 3: Forward Modeling Subtraction for 1 Bright, 1 Medium, and 1 Faint Star (4x oversampled subpixel modeling, identical scale across all 4 panels)
+Plot 1: 1D Radial Profile of Resulting Composite ePSF Constructed via Ensemble Median,
+        with all contributing individual star profiles in background (quality-filtered & normalized)
+Plot 2: Full 2D Composite Extended PSF Model Canvas (1025x1025, 113"x113" FOV) with Core Zoom Inset
+Plot 3: Forward Modeling Subtraction for 1 Bright, 1 Medium, and 1 Faint Star
+        (Native resolution forward modeling, identical scale across all 4 panels)
 """
 
 import os
@@ -15,8 +17,6 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from astropy.io import fits
-from scipy.ndimage import shift
-from scipy.optimize import minimize
 
 from romanepsf.loader import load_l2_image
 from romanepsf.stamps import (
@@ -24,7 +24,6 @@ from romanepsf.stamps import (
     estimate_stamp_background,
     subtract_stamp_background,
     recenter_and_align_stamp,
-    downsample_oversampled_stamp,
     get_adaptive_stamp_size,
     StellarStamp,
 )
@@ -38,46 +37,42 @@ def compute_fast_radial_profile(
     stamp_data: np.ndarray,
     mask: np.ndarray = None,
     r_max_native: float = 500.0,
-    oversample: float = 1.0,
-    bin_width_native: float = 1.0,
+    bin_width: float = 0.5,
 ) -> tuple:
-    """Compute fast 1D azimuthal radial profile in native pixel units with optional subpixel binning."""
+    """Compute 1D azimuthal radial profile from 2D stamp array on valid unmasked pixels."""
     ny, nx = stamp_data.shape
     cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r_px = np.hypot(grid_x - cx, grid_y - cy)
-    r_native = r_px / oversample
 
     valid = np.isfinite(stamp_data) & (stamp_data > 0)
     if mask is not None:
         valid &= (~mask)
 
     if not np.any(valid):
-        return np.array([1.0]), np.array([np.nan])
+        return np.array([]), np.array([])
 
-    r_valid = r_native[valid]
+    r_valid = r_px[valid]
     f_valid = stamp_data[valid]
 
-    # Subpixel binning in native pixel units
-    bin_edges = np.arange(bin_width_native / 2.0, r_max_native + bin_width_native, bin_width_native)
+    # Radial binning starting at 0.0 with 0.5 px width
+    bin_edges = np.arange(0.0, r_max_native + bin_width, bin_width)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     bin_idx = np.digitize(r_valid, bin_edges) - 1
 
-    unique_bins = np.unique(bin_idx)
-    unique_bins = unique_bins[(unique_bins >= 0) & (unique_bins < len(bin_edges))]
-
-    flux_prof = []
     r_prof = []
-    for b in unique_bins:
+    f_prof = []
+    for b in range(len(bin_centers)):
         in_bin = bin_idx == b
-        if np.sum(in_bin) >= 3:
-            flux_prof.append(float(np.median(f_valid[in_bin])))
-            r_prof.append(float(bin_edges[b]))
+        if np.sum(in_bin) >= 1:
+            r_prof.append(float(bin_centers[b]))
+            f_prof.append(float(np.median(f_valid[in_bin])))
 
-    return np.array(r_prof), np.array(flux_prof)
+    return np.array(r_prof), np.array(f_prof)
 
 
 def main():
-    print("=== Generating Roman ePSF Pipeline Visualizations (4x Oversampled Faint & Medium) ===")
+    print("=== Generating Roman ePSF Pipeline Visualizations (Ensemble Median Profile & Native Subtraction) ===")
     out_dir = Path("output/plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -94,6 +89,28 @@ def main():
     with fits.open(fits_path) as hdul:
         epsf_model = hdul[0].data.astype(np.float32)
         header = hdul[0].header
+        if "RADIAL_PROFILES" in hdul:
+            prof_tab = hdul["RADIAL_PROFILES"].data
+            r_ref = np.array(prof_tab["RADIUS_PX"], dtype=float)
+            f_ref = np.array(prof_tab["FLUX_COMPOSITE"], dtype=float)
+            valid_ref = np.isfinite(f_ref) & (f_ref > 0)
+            r_ref = r_ref[valid_ref]
+            f_ref = f_ref[valid_ref]
+        else:
+            ny_e, nx_e = epsf_model.shape
+            cy_e, cx_e = (ny_e - 1) / 2.0, (nx_e - 1) / 2.0
+            gy_e, gx_e = np.ogrid[:ny_e, :nx_e]
+            r_epsf = np.hypot(gx_e - cx_e, gy_e - cy_e)
+            r_ref_grid = np.arange(0.8, 500.0, 0.5)
+            f_ref_list = []
+            for rad in r_ref_grid:
+                in_b = (r_epsf >= rad - 0.4) & (r_epsf < rad + 0.4)
+                f_ref_list.append(float(np.median(epsf_model[in_b])) if np.any(in_b) else np.nan)
+            r_ref = r_ref_grid
+            f_ref = np.array(f_ref_list)
+            valid_ref = np.isfinite(f_ref) & (f_ref > 0)
+            r_ref = r_ref[valid_ref]
+            f_ref = f_ref[valid_ref]
 
     pixel_scale = float(header.get("PIXSCALE", 0.11))
     canvas_size = epsf_model.shape[0]
@@ -102,12 +119,36 @@ def main():
     k_mb = float(header.get("K_MB", 0.0255))
     print(f"ePSF Canvas: {canvas_size}x{canvas_size} pixels ({canvas_size * pixel_scale:.1f}\" x {canvas_size * pixel_scale:.1f}\"), Total Flux: {total_flux:.6f}")
 
-    # 2. Load Star Catalog
+    # 2. Load Star Catalog and Apply Quality Filtering
     tiered_csv = Path("output/run_all/all_stars_tiered.csv")
     if not tiered_csv.exists():
         tiered_csv = Path("output/all_stars_tiered.csv")
-    stars_df = pd.read_csv(tiered_csv)
-    print(f"Loaded {len(stars_df)} stars from {tiered_csv} across detectors:")
+    stars_raw_df = pd.read_csv(tiered_csv)
+    print(f"Loaded {len(stars_raw_df)} stars from catalog.")
+
+    # Quality filter: reject edge stars, dead pixels, non-detections, and bad centroids
+    edge = (
+        (stars_raw_df["x"] >= 64.0) & (stars_raw_df["x"] <= 4024.0) &
+        (stars_raw_df["y"] >= 64.0) & (stars_raw_df["y"] <= 4024.0) &
+        pd.notna(stars_raw_df["mag_lambda"])
+    )
+    q_faint = (
+        (stars_raw_df["tier"].str.lower() == "faint") &
+        (stars_raw_df["peak_flux"] > 80.0) &
+        (stars_raw_df["centroid_shift_px"] < 1.5) & edge
+    )
+    q_med = (
+        (stars_raw_df["tier"].str.lower() == "medium") &
+        (stars_raw_df["peak_flux"] > 80.0) &
+        (stars_raw_df["centroid_shift_px"] < 2.0) & edge
+    )
+    q_bright = (
+        (stars_raw_df["tier"].str.lower() == "bright") &
+        (stars_raw_df["peak_flux"] > 80.0) &
+        (stars_raw_df["centroid_shift_px"] < 2.5) & edge
+    )
+    stars_df = stars_raw_df[q_faint | q_med | q_bright].copy()
+    print(f"Retained {len(stars_df)} quality-verified stars across detectors:")
     for tier in ["bright", "medium", "faint"]:
         cnt = len(stars_df[stars_df["tier"].str.lower() == tier])
         print(f"  - {tier.capitalize()}: {cnt} stars")
@@ -134,19 +175,11 @@ def main():
                 loaded_gaia[det_lower] = None
         return loaded_l2[det_lower], loaded_gaia[det_lower]
 
-    # Compute Wide Composite ePSF 1D Radial Profile
-    print("Measuring radial profile of the final 2D composite ePSF...")
-    r_comp_wide, f_comp_wide = compute_fast_radial_profile(epsf_model, r_max_native=canvas_size // 2, oversample=1.0, bin_width_native=1.0)
-
-    # Extract cutouts, oversample faint & medium by 4x, and measure 1D radial profiles
-    print("\nExtracting star cutouts and measuring individual 1D radial profiles (4x oversampled for faint & medium)...")
+    # Extract cutouts, mask invalid/saturated pixels, and measure 1D radial profiles
+    print("\nExtracting cutouts, applying DQ masking, and measuring individual 1D profiles...")
     star_profiles = {"bright": [], "medium": [], "faint": []}
+    all_normalized_curves = []
     sample_stars_for_plot3 = {}
-    faint_stamps_4x = []
-    medium_stamps_4x = []
-
-    faint_crop_sz_4x = 177   # (45 - 1) * 4 + 1
-    medium_crop_sz_4x = 361  # (91 - 1) * 4 + 1
 
     for idx, row in stars_df.iterrows():
         tier = str(row["tier"]).lower()
@@ -159,192 +192,118 @@ def main():
 
         raw_cutout, (ix, iy) = extract_cutout(l2.data, (cx, cy), sz, fill_value=np.nan)
         raw_dq, _ = extract_cutout(l2.dq, (cx, cy), sz, fill_value=1)
-        dq_bad = (raw_dq & 1) > 0
 
-        core_rad = 6.0 if tier == "bright" else 4.0
-        if tier == "faint":
-            half = (sz - 1) // 2
-            gy, gx = np.indices((sz, sz))
-            r_c = np.hypot(gx - half, gy - half)
-            valid_core = (r_c <= core_rad) & np.isfinite(raw_cutout) & (raw_cutout > 0)
-            dq_bad[valid_core] = False
+        # STRICT QUALITY & SATURATION MASKING:
+        # Mask NaNs, non-finite values, and DQ bit 0 (DO_NOT_USE) or bit 1 (SATURATED)
+        bad_mask = (~np.isfinite(raw_cutout)) | ((raw_dq & 1) > 0) | ((raw_dq & 2) > 0)
 
-        bkg_val, bkg_rms = estimate_stamp_background(raw_cutout, mask=dq_bad, method="annulus")
+        bkg_val, bkg_rms = estimate_stamp_background(raw_cutout, mask=bad_mask, method="annulus")
         flux_sub = subtract_stamp_background(raw_cutout, bkg_val)
 
         sub_dx = cx - ix
         sub_dy = cy - iy
 
-        osamp = 4 if tier in ["faint", "medium"] else 1
-        bin_w = 0.25 if osamp > 1 else 1.0
+        # Subpixel alignment preserving true bad pixel masks
+        aligned_flux, aligned_mask = recenter_and_align_stamp(flux_sub, bad_mask, (sub_dx, sub_dy), oversample=1)
 
-        # Subpixel alignment (oversampled 4x for faint and medium)
-        aligned_flux, aligned_mask = recenter_and_align_stamp(flux_sub, dq_bad, (sub_dx, sub_dy), oversample=osamp)
-
-        # Collect normalized oversampled stamps for 4x core model stacking
-        if tier == "faint" and aligned_flux.shape[0] >= faint_crop_sz_4x:
-            c_f = aligned_flux.shape[0] // 2
-            h_f = faint_crop_sz_4x // 2
-            f_crop = aligned_flux[c_f - h_f : c_f + h_f + 1, c_f - h_f : c_f + h_f + 1]
-            f_sum = np.sum(f_crop[f_crop > 0])
-            if f_sum > 0:
-                faint_stamps_4x.append(f_crop / f_sum)
-        elif tier == "medium" and aligned_flux.shape[0] >= medium_crop_sz_4x:
-            c_m = aligned_flux.shape[0] // 2
-            h_m = medium_crop_sz_4x // 2
-            m_crop = aligned_flux[c_m - h_m : c_m + h_m + 1, c_m - h_m : c_m + h_m + 1]
-            m_sum = np.sum(m_crop[m_crop > 0])
-            if m_sum > 0:
-                medium_stamps_4x.append(m_crop / m_sum)
-
-        # Measure 1D radial profile of this individual star
+        # Measure 1D radial profile strictly on valid, unmasked pixels
         r_star, f_star = compute_fast_radial_profile(
-            aligned_flux, mask=aligned_mask, r_max_native=min(sz // 2, 500), oversample=osamp, bin_width_native=bin_w
+            aligned_flux, mask=aligned_mask, r_max_native=min(sz // 2, 500), bin_width=0.5
         )
 
-        if len(r_star) > 0 and np.any(f_star > 0):
-            # Optimal normalization scale factor Ai matching star profile to composite ePSF:
-            comp_vals = np.interp(r_star, r_comp_wide, f_comp_wide)
-            fit_range = {"faint": (1.0, 10.0), "medium": (8.0, 25.0), "bright": (20.0, 60.0)}[tier]
+        if len(r_star) >= 4 and np.any(f_star > 0):
+            # Normalization scale factor Ai matching star profile to reference ePSF curve
+            comp_vals = np.interp(r_star, r_ref, f_ref)
+            fit_range = {"faint": (3.0, 12.0), "medium": (8.0, 25.0), "bright": (25.0, 60.0)}[tier]
             valid_fit = (r_star >= fit_range[0]) & (r_star <= fit_range[1]) & (f_star > 0) & (comp_vals > 0)
 
             if np.sum(valid_fit) >= 3:
                 scale_factor = float(np.median(f_star[valid_fit] / comp_vals[valid_fit]))
             else:
-                pos_f = aligned_flux[aligned_flux > 0]
-                scale_factor = float(np.sum(pos_f)) if len(pos_f) > 0 else 1.0
+                scale_factor = float(np.median(f_star / comp_vals)) if np.any(comp_vals > 0) else 1.0
 
             if scale_factor > 0 and np.isfinite(scale_factor):
                 f_norm = f_star / scale_factor
 
-                # Filter valid radial range per tier
+                # Filter valid radial range per tier (bright starts at 10 px outside saturation)
                 if tier == "faint":
-                    valid_plot = (r_star >= 0.25) & (r_star <= 24.0) & (f_norm > 0)
+                    valid_plot = (r_star >= np.min(r_star)) & (r_star <= 24.0) & (f_norm > 0)
                 elif tier == "medium":
-                    valid_plot = (r_star >= 0.75) & (r_star <= 80.0) & (f_norm > 0)
+                    valid_plot = (r_star >= np.min(r_star)) & (r_star <= 80.0) & (f_norm > 0)
                 else:  # bright
-                    valid_plot = (r_star >= 6.0) & (r_star <= 450.0) & (f_norm > 0)
+                    valid_plot = (r_star >= 10.0) & (r_star <= 450.0) & (f_norm > 0)
 
                 if np.any(valid_plot):
-                    star_profiles[tier].append((r_star[valid_plot], f_norm[valid_plot]))
+                    r_p = r_star[valid_plot]
+                    f_p = f_norm[valid_plot]
+                    star_profiles[tier].append((r_p, f_p))
+                    all_normalized_curves.append((r_p, f_p))
 
         # Pick one representative star per tier for Plot 3
         if tier not in sample_stars_for_plot3:
-            # Also get native 1x aligned flux for Plot 3
-            if osamp > 1:
-                aligned_flux_native, aligned_mask_native = recenter_and_align_stamp(flux_sub, dq_bad, (sub_dx, sub_dy), oversample=1)
-            else:
-                aligned_flux_native, aligned_mask_native = aligned_flux, aligned_mask
-
             if tier == "bright" and (sz >= 201 or "WFI05" in det or idx == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux_native, "mask": aligned_mask_native,
+                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
-                    "sub_offset": (sub_dx, sub_dy)
                 }
             elif tier == "medium" and ("WFI02" in det or len(sample_stars_for_plot3.get("medium", {})) == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux_native, "mask": aligned_mask_native,
+                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
-                    "sub_offset": (sub_dx, sub_dy)
                 }
             elif tier == "faint" and ("WFI10" in det or len(sample_stars_for_plot3.get("faint", {})) == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux_native, "mask": aligned_mask_native,
+                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
-                    "sub_offset": (sub_dx, sub_dy)
                 }
 
-    print(f"Normalized profile counts: Bright={len(star_profiles['bright'])}, Medium={len(star_profiles['medium'])}, Faint={len(star_profiles['faint'])}")
+    print(f"Profile counts: Bright={len(star_profiles['bright'])}, Medium={len(star_profiles['medium'])}, Faint={len(star_profiles['faint'])}")
 
     # ==============================================================================
-    # 4X OVERSAMPLED CORE MODEL SYNTHESIS
+    # COMPOSITE PROFILE FROM SYNTHESIZED MODEL & MULTI-TIER ENSEMBLE
     # ==============================================================================
-    print("Synthesizing 4x oversampled core ePSF model from faint and medium star ensembles...")
-    psf_faint_4x = np.nanmedian(faint_stamps_4x, axis=0) if faint_stamps_4x else None
-    psf_medium_4x = np.nanmedian(medium_stamps_4x, axis=0) if medium_stamps_4x else None
-
-    # Embed faint 4x into medium 4x shape (361x361) and blend with smooth raised-cosine
-    ny_c, nx_c = medium_crop_sz_4x, medium_crop_sz_4x
-    cx_c, cy_c = (nx_c - 1) / 2.0, (ny_c - 1) / 2.0
-    grid_y, grid_x = np.ogrid[:ny_c, :nx_c]
-    r_nat_c = np.hypot(grid_x - cx_c, grid_y - cy_c) / 4.0
-
-    if psf_faint_4x is not None and psf_medium_4x is not None:
-        f_emb = np.zeros((ny_c, nx_c), dtype=np.float32)
-        h_f = faint_crop_sz_4x // 2
-        f_emb[int(cy_c - h_f) : int(cy_c + h_f + 1), int(cx_c - h_f) : int(cx_c + h_f + 1)] = psf_faint_4x
-
-        w_blend = 0.5 * (1.0 + np.cos(np.pi * (r_nat_c - 10.0) / (18.0 - 10.0)))
-        w_blend[r_nat_c <= 10.0] = 1.0
-        w_blend[r_nat_c >= 18.0] = 0.0
-
-        psf_core_4x = w_blend * f_emb + (1.0 - w_blend) * psf_medium_4x * k_fm
-    elif psf_faint_4x is not None:
-        psf_core_4x = psf_faint_4x
-    else:
-        # Fallback to crop from 2D composite ePSF oversampled by 4x
-        c_mid = canvas_size // 2
-        crop_nat = epsf_model[c_mid - 45 : c_mid + 46, c_mid - 45 : c_mid + 46]
-        psf_core_4x, _ = recenter_and_align_stamp(crop_nat, np.zeros_like(crop_nat, dtype=bool), (0, 0), oversample=4)
-
-    # Measure 4x radial profile of the synthesized core
-    r_comp_4x, f_comp_4x = compute_fast_radial_profile(psf_core_4x, oversample=4.0, bin_width_native=0.25)
-
-    # Scale 4x core profile to match composite profile in blend range [10, 18] px
-    match_zone = (r_comp_4x >= 10.0) & (r_comp_4x <= 18.0)
-    if np.any(match_zone):
-        ref_vals = np.interp(r_comp_4x[match_zone], r_comp_wide, f_comp_wide)
-        core_scale = float(np.median(ref_vals / f_comp_4x[match_zone]))
-        f_comp_4x *= core_scale
-        psf_core_4x *= core_scale
-
-    # Splice 4x oversampled core profile with wide outer profile for master composite curve
-    r_master_core = r_comp_4x[r_comp_4x <= 18.0]
-    f_master_core = f_comp_4x[r_comp_4x <= 18.0]
-    r_master_wide = r_comp_wide[r_comp_wide > 18.0]
-    f_master_wide = f_comp_wide[r_comp_wide > 18.0]
-    r_composite_master = np.concatenate([r_master_core, r_master_wide])
-    f_composite_master = np.concatenate([f_master_core, f_master_wide])
+    print("Preparing master composite profile from pipeline synthesis...")
+    r_composite_master = r_ref
+    f_composite_master = f_ref
 
     # ==============================================================================
-    # PLOT 1: Resulting 1D Radial Profile with 4x Oversampled Stars in Background
+    # PLOT 1: Resulting 1D Radial Profile with Individual Profiles in Background
     # ==============================================================================
-    print("\nRendering Plot 1: 1D Radial Profile Comparison (4x Oversampled Faint & Medium)...")
+    print("\nRendering Plot 1: 1D Radial Profile Comparison (Composite ePSF vs Individual Stars)...")
     fig1, ax1 = plt.subplots(figsize=(11, 7.5), dpi=300)
     fig1.patch.set_facecolor("#0e1117")
     ax1.set_facecolor("#161b22")
 
     # Background: Individual profiles from all stars with low alpha (already normalized to composite)
-    # Faint tier (4x oversampled, 0.25 px bins)
+    # Faint tier
     for r_s, f_s in star_profiles["faint"]:
-        ax1.plot(r_s, f_s, color="#4caf50", alpha=0.14, linewidth=0.8)
-    # Medium tier (4x oversampled, 0.25 px bins)
+        ax1.plot(r_s, f_s, color="#4caf50", alpha=0.18, linewidth=0.85)
+    # Medium tier
     for r_s, f_s in star_profiles["medium"]:
-        ax1.plot(r_s, f_s, color="#2196f3", alpha=0.18, linewidth=0.8)
-    # Bright tier (1x native, 1.0 px bins)
+        ax1.plot(r_s, f_s, color="#2196f3", alpha=0.22, linewidth=0.85)
+    # Bright tier
     for r_s, f_s in star_profiles["bright"]:
-        ax1.plot(r_s, f_s, color="#ff9800", alpha=0.30, linewidth=1.0)
+        ax1.plot(r_s, f_s, color="#ff9800", alpha=0.35, linewidth=1.0)
 
     # Dummy lines for legend for background individual stars
-    ax1.plot([], [], color="#4caf50", alpha=0.7, linewidth=1.4, label=f"Faint Stars ({len(star_profiles['faint'])} stars, 4x Oversampled [0.25 px], r < 24 px)")
-    ax1.plot([], [], color="#2196f3", alpha=0.7, linewidth=1.4, label=f"Medium Stars ({len(star_profiles['medium'])} stars, 4x Oversampled [0.25 px], 0.75 < r < 80 px)")
-    ax1.plot([], [], color="#ff9800", alpha=0.8, linewidth=1.4, label=f"Bright Stars ({len(star_profiles['bright'])} stars, Native [1.0 px], r ≥ 6 px)")
+    ax1.plot([], [], color="#4caf50", alpha=0.7, linewidth=1.4, label=f"Faint Stars ({len(star_profiles['faint'])} stars, r < 24 px)")
+    ax1.plot([], [], color="#2196f3", alpha=0.7, linewidth=1.4, label=f"Medium Stars ({len(star_profiles['medium'])} stars, r < 80 px)")
+    ax1.plot([], [], color="#ff9800", alpha=0.8, linewidth=1.4, label=f"Bright Stars ({len(star_profiles['bright'])} stars, r ≥ 10 px)")
 
     # Transition blending zones (shaded bands)
     ax1.axvspan(10.0, 18.0, color="#00e5ff", alpha=0.12, label="Faint-Medium Blend ($10-18$ px / $1.1-2.0''$)")
     ax1.axvspan(30.0, 48.0, color="#ffd600", alpha=0.12, label="Medium-Bright Blend ($30-48$ px / $3.3-5.3''$)")
 
-    # Foreground: Final Composite ePSF profile with 4x oversampled core
-    ax1.plot(r_composite_master, f_composite_master, color="#ffffff", linewidth=3.0, label="Final Composite ePSF (4x Oversampled Core + Wide Halo)")
+    # Foreground: Final Composite ePSF profile
+    ax1.plot(r_composite_master, f_composite_master, color="#ffffff", linewidth=3.0, label="Final Composite ePSF (Multi-Tier Blend)")
     ax1.plot(r_composite_master, f_composite_master, color="#00e5ff", linewidth=1.6, linestyle="--")
 
     ax1.set_xscale("log")
     ax1.set_yscale("log")
-    ax1.set_xlim(0.2, 520.0)
+    ax1.set_xlim(0.8, 520.0)
     ax1.set_ylim(1e-9, 1e-1)
 
-    ax1.set_xlabel("Radius from Centroid (native pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
+    ax1.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1.tick_params(colors="#8b949e", labelsize=10.5, which="both")
     ax1.grid(True, which="both", color="#30363d", alpha=0.4, linestyle=":")
@@ -352,13 +311,13 @@ def main():
     # Top twin axis for radius in arcseconds
     ax1_top = ax1.twiny()
     ax1_top.set_xscale("log")
-    ax1_top.set_xlim(0.2 * pixel_scale, 520.0 * pixel_scale)
+    ax1_top.set_xlim(0.8 * pixel_scale, 520.0 * pixel_scale)
     ax1_top.set_xlabel("Radius from Centroid (arcseconds)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1_top.tick_params(colors="#8b949e", labelsize=10.5, which="both")
 
     ax1.set_title(
         "Roman Space Telescope Extended PSF: Multi-Tier Radial Profile Synthesis\n"
-        f"(Master ePSF with 4x Subpixel Oversampling vs. {len(stars_df)} Contributing Stars Across 18 SCAs)",
+        f"(Master Ensemble Median Profile vs. {len(stars_df)} Quality-Verified Stars Across 18 SCAs)",
         color="#58a6ff", fontsize=13, fontweight="bold", pad=16
     )
 
@@ -372,9 +331,9 @@ def main():
     print(f"Saved Plot 1 to {p1_path}")
 
     # ==============================================================================
-    # PLOT 2: The Entire 2D Composite Extended PSF Canvas with 4x Oversampled Inset
+    # PLOT 2: The Entire 2D Composite Extended PSF Canvas
     # ==============================================================================
-    print("\nRendering Plot 2: Entire 2D Extended PSF Model (with 4x Oversampled Core Inset)...")
+    print("\nRendering Plot 2: Entire 2D Extended PSF Model...")
     fig2, ax2 = plt.subplots(figsize=(10, 10), dpi=300)
     fig2.patch.set_facecolor("#0e1117")
     ax2.set_facecolor("#161b22")
@@ -404,7 +363,7 @@ def main():
     ax2.tick_params(colors="#8b949e", labelsize=9.5)
     ax2.set_title(
         f"Roman Space Telescope Synthesized 2D Extended PSF ({canvas_size}x{canvas_size} px, {canvas_size*pixel_scale:.1f}\"x{canvas_size*pixel_scale:.1f}\")\n"
-        "Full Multi-Tier Composite Model Across All 18 SCAs | Filter F146 (4x Oversampled Core)",
+        "Full Multi-Tier Composite Model Across All 18 SCAs | Filter F146",
         color="#58a6ff", fontsize=12, fontweight="bold", pad=10
     )
 
@@ -413,16 +372,15 @@ def main():
     cb2.ax.tick_params(colors="#8b949e", labelsize=8.5)
     cb2.set_label("Normalized Surface Brightness / pixel (Sum = 1.0)", color="#e6edf3", fontsize=10)
 
-    # Inset zoom: 4x Oversampled Core (181x181 subpixels = 45x45 native pixels = 5.0"x5.0")
-    ax_inset = inset_axes(ax2, width="30%", height="30%", loc="upper right", borderpad=1.2)
+    # Inset zoom of central core (45x45 native pixels = 5.0"x5.0")
+    ax_inset = inset_axes(ax2, width="28%", height="28%", loc="upper right", borderpad=1.2)
     ax_inset.set_facecolor("#161b22")
-    core_rad_nat = 22  # native pixels
-    core_rad_sub = core_rad_nat * 4  # 88 subpixels
-    c_sub = psf_core_4x.shape[0] // 2
-    core_cutout_4x = psf_core_4x[c_sub - core_rad_sub : c_sub + core_rad_sub + 1, c_sub - core_rad_sub : c_sub + core_rad_sub + 1]
-    extent_inset = [-core_rad_nat * pixel_scale, core_rad_nat * pixel_scale, -core_rad_nat * pixel_scale, core_rad_nat * pixel_scale]
-    ax_inset.imshow(np.maximum(core_cutout_4x, 1e-4), origin="lower", cmap="inferno", norm=LogNorm(vmin=1e-4, vmax=vmax_2d), extent=extent_inset)
-    ax_inset.set_title("Core Zoom (4x Oversampled: 0.0275\"/px)", color="#e6edf3", fontsize=8.5, fontweight="bold", pad=3)
+    core_rad_inset = 22  # pixels
+    c_mid = canvas_size // 2
+    core_cutout = epsf_model[c_mid - core_rad_inset : c_mid + core_rad_inset + 1, c_mid - core_rad_inset : c_mid + core_rad_inset + 1]
+    extent_inset = [-core_rad_inset * pixel_scale, core_rad_inset * pixel_scale, -core_rad_inset * pixel_scale, core_rad_inset * pixel_scale]
+    ax_inset.imshow(np.maximum(core_cutout, 1e-4), origin="lower", cmap="inferno", norm=LogNorm(vmin=1e-4, vmax=vmax_2d), extent=extent_inset)
+    ax_inset.set_title("Core Zoom ($45\\times 45$ px)", color="#e6edf3", fontsize=8.5, fontweight="bold", pad=3)
     ax_inset.tick_params(colors="#8b949e", labelsize=7)
     for spine in ax_inset.spines.values():
         spine.set_edgecolor("#58a6ff")
@@ -434,7 +392,6 @@ def main():
         f"Field of View: {canvas_size*pixel_scale:.1f}\" x {canvas_size*pixel_scale:.1f}\"\n"
         f"Detectors: All 18 SCAs\n"
         f"Filter: F146 (0.11\"/px)\n"
-        f"Core Sampling: 4x Oversampled (0.0275\"/px)\n"
         f"Total Stars: {len(stars_df)}\n"
         f"Dynamic Range: > 10$^6$\n"
         f"Annular Blends: [10, 18] & [30, 48] px"
@@ -450,7 +407,8 @@ def main():
     # ==============================================================================
     # PLOT 3: Forward Modeling Subtraction for 1 Bright, 1 Medium, and 1 Faint Star
     # ==============================================================================
-    print("\nRendering Plot 3: Forward Modeling & Subtraction on 1 Bright, 1 Medium, 1 Faint Star (4x Oversampled Subpixel Modeling)...")
+    # Note: "dont oversample when doing the substraction for now. preserve the same scale for all 4 plots"
+    print("\nRendering Plot 3: Forward Modeling & Subtraction on 1 Bright, 1 Medium, 1 Faint Star (Native Resolution)...")
     fig3, axes3 = plt.subplots(3, 4, figsize=(18, 13.5), dpi=300)
     fig3.patch.set_facecolor("#0e1117")
 
@@ -465,76 +423,36 @@ def main():
         s_sz = star_info["sz"]
         s_bkg_rms = star_info["bkg_rms"]
 
-        # Forward model the star
-        if t in ["faint", "medium"]:
-            # Forward model using the 4x oversampled model shifted at subpixel scale and block-integrated to native pixels
-            h_s = s_sz // 2
-            c_sub = psf_core_4x.shape[0] // 2
-            h_sub = h_s * 4
+        # Forward model the star directly using fit_star_to_model (native resolution)
+        stamp_obj = StellarStamp(
+            source_id=f"sample_{t}",
+            tier=t,
+            mag=s_mag,
+            data=s_flux,
+            mask=s_mask,
+            center_original=((s_sz - 1) / 2.0, (s_sz - 1) / 2.0),
+            size=s_sz,
+            bkg_rms=s_bkg_rms,
+        )
 
-            # Crop or embed 4x core model to match star stamp FOV
-            if c_sub >= h_sub:
-                crop_4x = psf_core_4x[c_sub - h_sub : c_sub + h_sub + 1, c_sub - h_sub : c_sub + h_sub + 1].copy()
-            else:
-                crop_4x = np.zeros((2 * h_sub + 1, 2 * h_sub + 1), dtype=np.float32)
-                crop_4x[h_sub - c_sub : h_sub + c_sub + 1, h_sub - c_sub : h_sub + c_sub + 1] = psf_core_4x
+        res_result = fit_star_to_model(stamp_obj, epsf_model, fit_subpixel_offset=True)
 
-            # Fit optimal subpixel shift (dy, dx in native pixels, shifted by 4x in oversampled grid)
-            def _sub_loss(coords):
-                sy, sx = coords
-                s_shifted = shift(crop_4x, [sy * 4.0, sx * 4.0], order=3, mode="constant", cval=0.0)
-                s_native = downsample_oversampled_stamp(s_shifted, oversample=4)
-                v = np.isfinite(s_flux) & (~s_mask) & (s_flux > 0)
-                denom = float(np.sum(s_native[v]**2))
-                if denom <= 1e-12:
-                    return 1e12
-                a = max(float(np.sum(s_flux[v] * s_native[v])) / denom, 0.0)
-                return float(np.sum((s_flux[v] - a * s_native[v])**2))
+        obs = res_result.observed_stamp
+        mod = res_result.model_stamp
+        res = res_result.residual_map
+        alpha = res_result.flux_scale
+        dx, dy = res_result.subpixel_offset
 
-            opt = minimize(_sub_loss, [0.0, 0.0], method="Powell", bounds=[(-1.5, 1.5), (-1.5, 1.5)], options={"maxiter": 20})
-            best_dy, best_dx = float(opt.x[0]), float(opt.x[1])
-
-            best_shifted_4x = shift(crop_4x, [best_dy * 4.0, best_dx * 4.0], order=3, mode="constant", cval=0.0)
-            best_model_native = downsample_oversampled_stamp(best_shifted_4x, oversample=4)
-
-            v_fit = np.isfinite(s_flux) & (~s_mask)
-            denom = float(np.sum(best_model_native[v_fit]**2))
-            alpha = float(np.sum(s_flux[v_fit] * best_model_native[v_fit])) / denom if denom > 1e-12 else 1.0
-
-            obs = s_flux
-            mod = alpha * best_model_native
-            res = obs - mod
-            dx, dy = best_dx, best_dy
-            display_sz = s_sz
+        # For bright star with huge 1001x1001 stamp, zoom to central 251x251 for clear visual comparison
+        if s_sz > 301:
+            h_sub = 125
+            c_s = s_sz // 2
+            obs = obs[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
+            mod = mod[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
+            res = res[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
+            display_sz = 2 * h_sub + 1
         else:
-            # Bright star forward modeling using wide composite ePSF
-            stamp_obj = StellarStamp(
-                source_id=f"sample_{t}",
-                tier=t,
-                mag=s_mag,
-                data=s_flux,
-                mask=s_mask,
-                center_original=((s_sz - 1) / 2.0, (s_sz - 1) / 2.0),
-                size=s_sz,
-                bkg_rms=s_bkg_rms,
-            )
-            res_result = fit_star_to_model(stamp_obj, epsf_model, fit_subpixel_offset=True)
-            obs = res_result.observed_stamp
-            mod = res_result.model_stamp
-            res = res_result.residual_map
-            alpha = res_result.flux_scale
-            dx, dy = res_result.subpixel_offset
-
-            # Zoom central 251x251 for bright star
-            if s_sz > 301:
-                h_sub = 125
-                c_s = s_sz // 2
-                obs = obs[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
-                mod = mod[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
-                res = res[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
-                display_sz = 2 * h_sub + 1
-            else:
-                display_sz = s_sz
+            display_sz = s_sz
 
         pos_flux = obs[np.isfinite(obs) & (obs > 0)]
         vmin = max(float(np.percentile(pos_flux, 2)), 1e-3) if len(pos_flux) > 0 else 1e-3
@@ -556,8 +474,7 @@ def main():
         ax2 = axes3[row_idx, 1]
         ax2.set_facecolor("#161b22")
         im2 = ax2.imshow(np.maximum(mod, vmin), origin="lower", cmap="inferno", norm=norm_flux)
-        model_title_prefix = "4x Oversampled Model" if t in ["faint", "medium"] else "Forward-Modeled ePSF"
-        ax2.set_title(f"{model_title_prefix} ($I_{{model}}$)\nScale $\\alpha={alpha:.2e}$, Shift=({dx:+.2f}, {dy:+.2f}) px",
+        ax2.set_title(f"Forward-Modeled ePSF ($I_{{model}}$)\nScale $\\alpha={alpha:.2e}$, Shift=({dx:+.2f}, {dy:+.2f}) px",
                       color="#e6edf3", fontsize=10.5, fontweight="bold", pad=6)
         ax2.tick_params(colors="#8b949e", labelsize=8)
         cb2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.03)
@@ -601,7 +518,7 @@ def main():
     plt.subplots_adjust(top=0.93, bottom=0.05, hspace=0.35, wspace=0.25, left=0.05, right=0.95)
     fig3.suptitle(
         "Roman Space Telescope Extended PSF Forward-Modeling & Subtraction Validation\n"
-        "(Representative Stars Across WFI Detectors | 4x Oversampled Subpixel Modeling on Faint & Medium)",
+        "(Representative Stars Across WFI Detectors | Native Resolution Forward Modeling)",
         color="#58a6ff", fontsize=14, fontweight="bold", y=0.98
     )
 
@@ -610,7 +527,7 @@ def main():
     plt.close(fig3)
     print(f"Saved Plot 3 to {p3_path}")
 
-    print("\nSUCCESS: All 3 plots successfully regenerated with 4x oversampling in output/plots/:")
+    print("\nSUCCESS: All 3 plots successfully regenerated in output/plots/:")
     print(f"  1. {p1_path}")
     print(f"  2. {p2_path}")
     print(f"  3. {p3_path}")
