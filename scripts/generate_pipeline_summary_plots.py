@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 from astropy.io import fits
+from scipy.ndimage import map_coordinates
 
 from romanepsf.loader import load_l2_image
 from romanepsf.stamps import (
@@ -37,13 +38,15 @@ def compute_fast_radial_profile(
     stamp_data: np.ndarray,
     mask: np.ndarray = None,
     r_max_native: float = 500.0,
-    bin_width: float = 0.5,
+    oversample: float = 1.0,
+    bin_width_native: float = 0.1,
 ) -> tuple:
-    """Compute 1D azimuthal radial profile from 2D stamp array on valid unmasked pixels."""
+    """Compute 1D azimuthal radial profile from 2D stamp array on valid unmasked pixels with optional oversampling."""
     ny, nx = stamp_data.shape
     cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r_px = np.hypot(grid_x - cx, grid_y - cy)
+    r_native = r_px / oversample
 
     valid = np.isfinite(stamp_data) & (stamp_data > 0)
     if mask is not None:
@@ -52,11 +55,12 @@ def compute_fast_radial_profile(
     if not np.any(valid):
         return np.array([]), np.array([])
 
-    r_valid = r_px[valid]
+    r_valid = r_native[valid]
     f_valid = stamp_data[valid]
 
-    # Radial binning starting at 0.0 with 0.5 px width
-    bin_edges = np.arange(0.0, r_max_native + bin_width, bin_width)
+    # Subpixel radial binning starting at 0.1 px
+    max_r = min(r_max_native, float(np.max(r_valid)))
+    bin_edges = np.arange(0.1, max_r + bin_width_native, bin_width_native)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     bin_idx = np.digitize(r_valid, bin_edges) - 1
 
@@ -72,7 +76,7 @@ def compute_fast_radial_profile(
 
 
 def main():
-    print("=== Generating Roman ePSF Pipeline Visualizations (Ensemble Median Profile & Native Subtraction) ===")
+    print("=== Generating Roman ePSF Pipeline Visualizations (Subpixel Oversampling down to 0.1 px) ===")
     out_dir = Path("output/plots")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -89,28 +93,6 @@ def main():
     with fits.open(fits_path) as hdul:
         epsf_model = hdul[0].data.astype(np.float32)
         header = hdul[0].header
-        if "RADIAL_PROFILES" in hdul:
-            prof_tab = hdul["RADIAL_PROFILES"].data
-            r_ref = np.array(prof_tab["RADIUS_PX"], dtype=float)
-            f_ref = np.array(prof_tab["FLUX_COMPOSITE"], dtype=float)
-            valid_ref = np.isfinite(f_ref) & (f_ref > 0)
-            r_ref = r_ref[valid_ref]
-            f_ref = f_ref[valid_ref]
-        else:
-            ny_e, nx_e = epsf_model.shape
-            cy_e, cx_e = (ny_e - 1) / 2.0, (nx_e - 1) / 2.0
-            gy_e, gx_e = np.ogrid[:ny_e, :nx_e]
-            r_epsf = np.hypot(gx_e - cx_e, gy_e - cy_e)
-            r_ref_grid = np.arange(0.8, 500.0, 0.5)
-            f_ref_list = []
-            for rad in r_ref_grid:
-                in_b = (r_epsf >= rad - 0.4) & (r_epsf < rad + 0.4)
-                f_ref_list.append(float(np.median(epsf_model[in_b])) if np.any(in_b) else np.nan)
-            r_ref = r_ref_grid
-            f_ref = np.array(f_ref_list)
-            valid_ref = np.isfinite(f_ref) & (f_ref > 0)
-            r_ref = r_ref[valid_ref]
-            f_ref = f_ref[valid_ref]
 
     pixel_scale = float(header.get("PIXSCALE", 0.11))
     canvas_size = epsf_model.shape[0]
@@ -118,6 +100,54 @@ def main():
     k_fm = float(header.get("K_FM", 0.1936))
     k_mb = float(header.get("K_MB", 0.0255))
     print(f"ePSF Canvas: {canvas_size}x{canvas_size} pixels ({canvas_size * pixel_scale:.1f}\" x {canvas_size * pixel_scale:.1f}\"), Total Flux: {total_flux:.6f}")
+
+    # Subpixel radial profile of composite ePSF model from 0.1 px to 500 px
+    ny_e, nx_e = epsf_model.shape
+    cy_e, cx_e = (ny_e - 1) / 2.0, (nx_e - 1) / 2.0
+
+    # 1. Subpixel core evaluation (r from 0.10 to 6.0 px with 10x oversampling)
+    sub_r_max = 6.0
+    O_ref = 10
+    sub_sz = int(2 * sub_r_max * O_ref + 1)
+    u_ref = np.linspace(-sub_r_max, sub_r_max, sub_sz)
+    uu_ref, vv_ref = np.meshgrid(u_ref, u_ref)
+    r_sub_ref = np.hypot(uu_ref, vv_ref)
+
+    x_samp = cx_e + uu_ref
+    y_samp = cy_e + vv_ref
+    epsf_sub = map_coordinates(epsf_model, [y_samp, x_samp], order=3, mode="constant", cval=0.0)
+
+    r_core_bins = np.logspace(np.log10(0.10), np.log10(sub_r_max), 60)
+    r_core_centers = 0.5 * (r_core_bins[:-1] + r_core_bins[1:])
+    f_core_prof = []
+    for i in range(len(r_core_centers)):
+        in_b = (r_sub_ref >= r_core_bins[i]) & (r_sub_ref < r_core_bins[i + 1])
+        f_core_prof.append(float(np.median(epsf_sub[in_b])) if np.any(in_b) else np.nan)
+
+    r_core = np.array(r_core_centers)
+    f_core = np.array(f_core_prof)
+    valid_c = np.isfinite(f_core) & (f_core > 0)
+    r_core = r_core[valid_c]
+    f_core = f_core[valid_c]
+
+    # 2. Outer profile from 6.0 px to 500 px
+    gy_e, gx_e = np.ogrid[:ny_e, :nx_e]
+    r_epsf = np.hypot(gx_e - cx_e, gy_e - cy_e)
+    r_outer_bins = np.logspace(np.log10(sub_r_max), np.log10(500.0), 160)
+    r_outer_centers = 0.5 * (r_outer_bins[:-1] + r_outer_bins[1:])
+    f_outer_prof = []
+    for i in range(len(r_outer_centers)):
+        in_b = (r_epsf >= r_outer_bins[i]) & (r_epsf < r_outer_bins[i + 1])
+        f_outer_prof.append(float(np.median(epsf_model[in_b])) if np.any(in_b) else np.nan)
+
+    r_outer = np.array(r_outer_centers)
+    f_outer = np.array(f_outer_prof)
+    valid_o = np.isfinite(f_outer) & (f_outer > 0)
+    r_outer = r_outer[valid_o]
+    f_outer = f_outer[valid_o]
+
+    r_ref = np.concatenate([r_core, r_outer])
+    f_ref = np.concatenate([f_core, f_outer])
 
     # 2. Load Star Catalog and Apply Quality Filtering
     tiered_csv = Path("output/run_all/all_stars_tiered.csv")
@@ -203,12 +233,15 @@ def main():
         sub_dx = cx - ix
         sub_dy = cy - iy
 
-        # Subpixel alignment preserving true bad pixel masks
-        aligned_flux, aligned_mask = recenter_and_align_stamp(flux_sub, bad_mask, (sub_dx, sub_dy), oversample=1)
+        O_tier = 10 if tier == "faint" else (4 if tier == "medium" else 1)
+        bin_w = 0.1 if tier in ["faint", "medium"] else 0.5
 
-        # Measure 1D radial profile strictly on valid, unmasked pixels
+        # Subpixel alignment with oversampling preserving true bad pixel masks
+        aligned_flux, aligned_mask = recenter_and_align_stamp(flux_sub, bad_mask, (sub_dx, sub_dy), oversample=O_tier)
+
+        # Measure 1D radial profile strictly on valid, unmasked pixels down to 0.1 px
         r_star, f_star = compute_fast_radial_profile(
-            aligned_flux, mask=aligned_mask, r_max_native=min(sz // 2, 500), bin_width=0.5
+            aligned_flux, mask=aligned_mask, r_max_native=min(sz // 2, 500), oversample=O_tier, bin_width_native=bin_w
         )
 
         if len(r_star) >= 4 and np.any(f_star > 0):
@@ -239,21 +272,25 @@ def main():
                     star_profiles[tier].append((r_p, f_p))
                     all_normalized_curves.append((r_p, f_p))
 
-        # Pick one representative star per tier for Plot 3
+        # Pick one representative star per tier for Plot 3 (evaluated at native resolution)
         if tier not in sample_stars_for_plot3:
+            if O_tier == 1:
+                nat_flux, nat_mask = aligned_flux, aligned_mask
+            else:
+                nat_flux, nat_mask = recenter_and_align_stamp(flux_sub, bad_mask, (sub_dx, sub_dy), oversample=1)
             if tier == "bright" and (sz >= 201 or "WFI05" in det or idx == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
+                    "row": row, "flux": nat_flux, "mask": nat_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
                 }
             elif tier == "medium" and ("WFI02" in det or len(sample_stars_for_plot3.get("medium", {})) == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
+                    "row": row, "flux": nat_flux, "mask": nat_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
                 }
             elif tier == "faint" and ("WFI10" in det or len(sample_stars_for_plot3.get("faint", {})) == 0):
                 sample_stars_for_plot3[tier] = {
-                    "row": row, "flux": aligned_flux, "mask": aligned_mask,
+                    "row": row, "flux": nat_flux, "mask": nat_mask,
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms,
                 }
 
@@ -300,7 +337,7 @@ def main():
 
     ax1.set_xscale("log")
     ax1.set_yscale("log")
-    ax1.set_xlim(0.8, 520.0)
+    ax1.set_xlim(0.1, 520.0)
     ax1.set_ylim(1e-9, 1e-1)
 
     ax1.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
@@ -311,13 +348,13 @@ def main():
     # Top twin axis for radius in arcseconds
     ax1_top = ax1.twiny()
     ax1_top.set_xscale("log")
-    ax1_top.set_xlim(0.8 * pixel_scale, 520.0 * pixel_scale)
+    ax1_top.set_xlim(0.1 * pixel_scale, 520.0 * pixel_scale)
     ax1_top.set_xlabel("Radius from Centroid (arcseconds)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1_top.tick_params(colors="#8b949e", labelsize=10.5, which="both")
 
     ax1.set_title(
         "Roman Space Telescope Extended PSF: Multi-Tier Radial Profile Synthesis\n"
-        f"(Master Ensemble Median Profile vs. {len(stars_df)} Quality-Verified Stars Across 18 SCAs)",
+        f"(Subpixel Oversampled Composite Model down to 0.1 px vs. {len(stars_df)} Quality-Verified Stars)",
         color="#58a6ff", fontsize=13, fontweight="bold", pad=16
     )
 
