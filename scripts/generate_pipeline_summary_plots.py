@@ -127,15 +127,15 @@ def main():
                 loaded_gaia[det_lower] = None
         return loaded_l2[det_lower], loaded_gaia[det_lower]
 
+    # Compute Composite ePSF 1D Radial Profile
+    print("Measuring radial profile of the final 2D composite ePSF...")
+    r_comp, f_comp = compute_fast_radial_profile(epsf_model, r_max=canvas_size // 2)
+    comp_prof = {int(round(r)): float(f) for r, f in zip(r_comp, f_comp) if f > 0}
+
     # Extract cutouts and measure 1D radial profiles for stars across all tiers
     print("\nExtracting star cutouts and measuring individual 1D radial profiles...")
     star_profiles = {"bright": [], "medium": [], "faint": []}
     sample_stars_for_plot3 = {}
-
-    # Representative star indices for Plot 3
-    # Bright: Star on WFI05 (mag ~7.37)
-    # Medium: Star on WFI02 (mag ~11.11)
-    # Faint: Star on WFI10 (mag ~13.03)
 
     for idx, row in stars_df.iterrows():
         tier = str(row["tier"]).lower()
@@ -165,31 +165,37 @@ def main():
         sub_dy = cy - iy
         aligned_flux, aligned_mask = recenter_and_align_stamp(flux_sub, dq_bad, (sub_dx, sub_dy))
 
-        # Measure 1D radial profile
+        # Measure 1D radial profile of this individual star
         r_star, f_star = compute_fast_radial_profile(aligned_flux, mask=aligned_mask, r_max=min(sz // 2, 500))
 
         if len(r_star) > 0 and np.any(f_star > 0):
-            # Scale factor to align individual profile with final composite ePSF:
-            # The composite extended PSF is unit-flux normalized.
-            # To plot all stars in the background on the same physical scale:
-            if tier == "faint":
-                # Faint stars define the core: scale to match core flux
-                f_norm_factor = float(np.sum(aligned_flux[aligned_flux > 0])) if np.sum(aligned_flux > 0) > 0 else 1.0
-                f_scaled = f_star / f_norm_factor
-            elif tier == "medium":
-                # Medium stars scaled by k_fm
-                m_norm_factor = (float(np.sum(aligned_flux[aligned_flux > 0])) / k_fm) if np.sum(aligned_flux > 0) > 0 else 1.0
-                f_scaled = f_star / m_norm_factor
+            # Optimal normalization scale factor Ai matching star profile to composite ePSF:
+            # f_star(r) = Ai * f_comp(r) => Ai = median(f_star / f_comp) in valid SNR tier zone
+            fit_range = {"faint": (1, 10), "medium": (8, 25), "bright": (20, 60)}[tier]
+            r_fit = [r for r, f in zip(r_star, f_star) if fit_range[0] <= r <= fit_range[1] and int(round(r)) in comp_prof and f > 0]
+            if len(r_fit) >= 3:
+                ratios = [f_star[r_star == r][0] / comp_prof[int(round(r))] for r in r_fit if comp_prof[int(round(r))] > 0]
+                scale_factor = float(np.median(ratios))
             else:
-                # Bright stars scaled by k_mb
-                b_norm_factor = (float(np.sum(aligned_flux[aligned_flux > 0])) / (k_fm * k_mb)) if np.sum(aligned_flux > 0) > 0 else 1.0
-                f_scaled = f_star / b_norm_factor
+                pos_f = aligned_flux[aligned_flux > 0]
+                scale_factor = float(np.sum(pos_f)) if len(pos_f) > 0 else 1.0
 
-            star_profiles[tier].append((r_star, f_scaled))
+            if scale_factor > 0 and np.isfinite(scale_factor):
+                f_norm = f_star / scale_factor
+
+                # Exclude saturated core (r < 6) for bright stars and background noise floor for faint stars
+                if tier == "faint":
+                    valid_plot = (r_star >= 1.0) & (r_star <= 24.0) & (f_norm > 0)
+                elif tier == "medium":
+                    valid_plot = (r_star >= 3.0) & (r_star <= 80.0) & (f_norm > 0)
+                else:  # bright
+                    valid_plot = (r_star >= 6.0) & (r_star <= 450.0) & (f_norm > 0)
+
+                if np.any(valid_plot):
+                    star_profiles[tier].append((r_star[valid_plot], f_norm[valid_plot]))
 
         # Pick one representative star per tier for Plot 3
         if tier not in sample_stars_for_plot3:
-            # Check for high quality representative star
             if tier == "bright" and (sz >= 201 or "WFI05" in det or idx == 0):
                 sample_stars_for_plot3[tier] = {
                     "row": row, "flux": aligned_flux, "mask": aligned_mask,
@@ -206,11 +212,7 @@ def main():
                     "cx": cx, "cy": cy, "det": det, "mag": mag, "sz": sz, "bkg_rms": bkg_rms
                 }
 
-    print(f"Profile counts: Bright={len(star_profiles['bright'])}, Medium={len(star_profiles['medium'])}, Faint={len(star_profiles['faint'])}")
-
-    # Compute Composite ePSF 1D Radial Profile
-    print("Measuring radial profile of the final 2D composite ePSF...")
-    r_comp, f_comp = compute_fast_radial_profile(epsf_model, r_max=canvas_size // 2)
+    print(f"Normalized profile counts: Bright={len(star_profiles['bright'])}, Medium={len(star_profiles['medium'])}, Faint={len(star_profiles['faint'])}")
 
     # ==============================================================================
     # PLOT 1: Resulting 1D Radial Profile with Individual Profiles in Background
@@ -220,28 +222,28 @@ def main():
     fig1.patch.set_facecolor("#0e1117")
     ax1.set_facecolor("#161b22")
 
-    # Background: Individual profiles from all stars with low alpha
+    # Background: Individual profiles from all stars with low alpha (already normalized to composite)
     # Faint tier
     for r_s, f_s in star_profiles["faint"]:
-        ax1.plot(r_s, f_s, color="#4caf50", alpha=0.15, linewidth=0.8)
+        ax1.plot(r_s, f_s, color="#4caf50", alpha=0.14, linewidth=0.8)
     # Medium tier
     for r_s, f_s in star_profiles["medium"]:
-        ax1.plot(r_s, f_s, color="#2196f3", alpha=0.15, linewidth=0.8)
+        ax1.plot(r_s, f_s, color="#2196f3", alpha=0.18, linewidth=0.8)
     # Bright tier
     for r_s, f_s in star_profiles["bright"]:
-        ax1.plot(r_s, f_s, color="#ff9800", alpha=0.20, linewidth=1.0)
+        ax1.plot(r_s, f_s, color="#ff9800", alpha=0.30, linewidth=1.0)
 
     # Dummy lines for legend for background individual stars
-    ax1.plot([], [], color="#4caf50", alpha=0.5, linewidth=1.2, label=f"Faint Stars ({len(star_profiles['faint'])} cutouts, low α)")
-    ax1.plot([], [], color="#2196f3", alpha=0.5, linewidth=1.2, label=f"Medium Stars ({len(star_profiles['medium'])} cutouts, low α)")
-    ax1.plot([], [], color="#ff9800", alpha=0.6, linewidth=1.2, label=f"Bright Stars ({len(star_profiles['bright'])} cutouts, low α)")
+    ax1.plot([], [], color="#4caf50", alpha=0.7, linewidth=1.4, label=f"Faint Stars ({len(star_profiles['faint'])} normalized profiles, r < 24 px)")
+    ax1.plot([], [], color="#2196f3", alpha=0.7, linewidth=1.4, label=f"Medium Stars ({len(star_profiles['medium'])} normalized profiles, 3 < r < 80 px)")
+    ax1.plot([], [], color="#ff9800", alpha=0.8, linewidth=1.4, label=f"Bright Stars ({len(star_profiles['bright'])} normalized profiles, r ≥ 6 px)")
 
     # Transition blending zones (shaded bands)
     ax1.axvspan(10.0, 18.0, color="#00e5ff", alpha=0.12, label="Faint-Medium Blend ($10-18$ px / $1.1-2.0''$)")
     ax1.axvspan(30.0, 48.0, color="#ffd600", alpha=0.12, label="Medium-Bright Blend ($30-48$ px / $3.3-5.3''$)")
 
     # Foreground: Final Composite ePSF profile
-    ax1.plot(r_comp, f_comp, color="#ffffff", linewidth=2.8, label="Final Composite Extended PSF (Resulting Profile)")
+    ax1.plot(r_comp, f_comp, color="#ffffff", linewidth=3.0, label="Final Composite Extended PSF (Master Profile)")
     ax1.plot(r_comp, f_comp, color="#00e5ff", linewidth=1.6, linestyle="--")
 
     ax1.set_xscale("log")
@@ -263,7 +265,7 @@ def main():
 
     ax1.set_title(
         "Roman Space Telescope Extended PSF: Multi-Tier Radial Profile Synthesis\n"
-        f"(Final ePSF Profile vs. {len(stars_df)} Contributing Stars Across All 18 SCAs)",
+        f"(Master ePSF vs. {len(stars_df)} Individually Normalized Stars Across All 18 SCAs)",
         color="#58a6ff", fontsize=13, fontweight="bold", pad=16
     )
 
@@ -402,14 +404,14 @@ def main():
             display_sz = s_sz
 
         pos_flux = obs[np.isfinite(obs) & (obs > 0)]
-        vmin = max(np.percentile(pos_flux, 2), 1e-4) if len(pos_flux) > 0 else 1e-4
-        vmax = max(np.percentile(pos_flux, 99.8), 1e-2) if len(pos_flux) > 0 else 1.0
+        vmin = max(float(np.percentile(pos_flux, 2)), 1e-3) if len(pos_flux) > 0 else 1e-3
+        vmax = float(max(np.nanmax(obs), np.nanmax(mod))) if len(pos_flux) > 0 else 1.0
         norm_flux = LogNorm(vmin=vmin, vmax=vmax)
 
         # ----------------- Col 1: Observed Star -----------------
         ax1 = axes3[row_idx, 0]
         ax1.set_facecolor("#161b22")
-        im1 = ax1.imshow(np.maximum(obs, 1e-4), origin="lower", cmap="inferno", norm=norm_flux)
+        im1 = ax1.imshow(np.maximum(obs, vmin), origin="lower", cmap="inferno", norm=norm_flux)
         ax1.set_title(f"{t.capitalize()} Star: Observed ($I_{{obs}}$)\n{s_det}, mag={s_mag:.2f} ({display_sz}x{display_sz} px)",
                       color="#e6edf3", fontsize=10.5, fontweight="bold", pad=6)
         ax1.tick_params(colors="#8b949e", labelsize=8)
@@ -420,7 +422,7 @@ def main():
         # ----------------- Col 2: Forward-Modeled ePSF -----------------
         ax2 = axes3[row_idx, 1]
         ax2.set_facecolor("#161b22")
-        im2 = ax2.imshow(np.maximum(mod, 1e-4), origin="lower", cmap="inferno", norm=norm_flux)
+        im2 = ax2.imshow(np.maximum(mod, vmin), origin="lower", cmap="inferno", norm=norm_flux)
         ax2.set_title(f"Forward-Modeled ePSF ($I_{{model}}$)\nScale $\\alpha={alpha:.2e}$, Shift=({dx:+.2f}, {dy:+.2f}) px",
                       color="#e6edf3", fontsize=10.5, fontweight="bold", pad=6)
         ax2.tick_params(colors="#8b949e", labelsize=8)
@@ -428,31 +430,39 @@ def main():
         cb2.ax.tick_params(colors="#8b949e", labelsize=7.5)
         cb2.set_label("Flux (MJy/sr)", color="#8b949e", fontsize=8)
 
-        # ----------------- Col 3: Residual Map -----------------
+        # ----------------- Col 3: Residual Map (Same Scale) -----------------
         ax3 = axes3[row_idx, 2]
         ax3.set_facecolor("#161b22")
-        # Diverging or log stretch for residual
-        max_abs_res = float(np.nanpercentile(np.abs(res), 99)) if np.any(np.isfinite(res)) else 1.0
-        max_abs_res = max(max_abs_res, 0.1)
-        im3 = ax3.imshow(res, origin="lower", cmap="coolwarm", vmin=-max_abs_res, vmax=max_abs_res)
-        ax3.set_title(f"Subtraction Residual Map\n$\\Delta I = I_{{obs}} - I_{{model}}$ [$-{max_abs_res:.1f}, +{max_abs_res:.1f}$]",
+        im3 = ax3.imshow(np.maximum(res, vmin), origin="lower", cmap="inferno", norm=norm_flux)
+        ax3.set_title(f"Subtraction Residual ($I_{{obs}} - I_{{model}}$)\nSame Scale [Floor $\\geq$ {vmin:.1e}]",
                       color="#e6edf3", fontsize=10.5, fontweight="bold", pad=6)
         ax3.tick_params(colors="#8b949e", labelsize=8)
         cb3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.03)
         cb3.ax.tick_params(colors="#8b949e", labelsize=7.5)
         cb3.set_label("Residual (MJy/sr)", color="#8b949e", fontsize=8)
 
-        # ----------------- Col 4: Normalized Residual (Sigma) -----------------
+        # ----------------- Col 4: Absolute Residual + Mask Overlay (Same Scale) -----------------
         ax4 = axes3[row_idx, 3]
         ax4.set_facecolor("#161b22")
-        clean_norm_res = np.clip(np.nan_to_num(norm_res, nan=0.0), -5.0, 5.0)
-        im4 = ax4.imshow(clean_norm_res, origin="lower", cmap="coolwarm", vmin=-3.0, vmax=3.0)
-        ax4.set_title(f"Normalized Residual Map\n$(I_{{obs}} - I_{{model}}) / \\sigma$ [$-3\\sigma, +3\\sigma$]",
+        im4 = ax4.imshow(np.maximum(np.abs(res), vmin), origin="lower", cmap="inferno", norm=norm_flux)
+
+        # Overlay contaminant mask
+        if s_mask is not None:
+            if s_sz > 301:
+                crop_mask = s_mask[c_s - h_sub : c_s + h_sub + 1, c_s - h_sub : c_s + h_sub + 1]
+            else:
+                crop_mask = s_mask
+            if np.any(crop_mask):
+                overlay = np.zeros((*crop_mask.shape, 4), dtype=np.float32)
+                overlay[crop_mask] = [0.0, 0.95, 1.0, 0.45]  # Semi-transparent cyan highlight
+                ax4.imshow(overlay, origin="lower")
+
+        ax4.set_title(f"Absolute Residual $|I_{{obs}} - I_{{model}}|$ + Mask\nSame Scale | Cyan: Contaminants",
                       color="#e6edf3", fontsize=10.5, fontweight="bold", pad=6)
         ax4.tick_params(colors="#8b949e", labelsize=8)
         cb4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.03)
         cb4.ax.tick_params(colors="#8b949e", labelsize=7.5)
-        cb4.set_label("Normalized Error ($\\sigma$)", color="#8b949e", fontsize=8)
+        cb4.set_label("Abs Residual (MJy/sr)", color="#8b949e", fontsize=8)
 
     plt.subplots_adjust(top=0.93, bottom=0.05, hspace=0.35, wspace=0.25, left=0.05, right=0.95)
     fig3.suptitle(
