@@ -83,6 +83,8 @@ profile:
 assembly:
   canvas_size: 1025           # Canvas dimension: 1025x1025 or 2049x2049 (odd integer)
   stack_sigma_clip: 3.0
+  oversampling_faint: 4       # Subpixel oversampling around 4x for faint tier core
+  oversampling_medium: 4      # Subpixel oversampling around 4x for medium tier transition
   overlap_fm:
     r_min: 8.0
     r_max: 16.0

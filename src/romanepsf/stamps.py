@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import logging
 import numpy as np
 import pandas as pd
-from scipy.ndimage import shift
+from scipy.ndimage import shift, map_coordinates, uniform_filter
 
 from romanepsf.loader import RomanL2Data, DQ_FLAGS, get_dq_mask
 from romanepsf.catalog import get_psf_extension_moffat
@@ -43,6 +43,7 @@ class StellarStamp:
     norm_factor: float = 1.0    # Photometric scale factor relative to reference tier
     bkg_value: float = 0.0      # Estimated local background subtracted from stamp
     bkg_rms: float = 0.0        # Background RMS uncertainty
+    oversample: int = 1         # Subpixel oversampling factor (e.g. 4 for faint/medium)
 
 
 # Alias for PROJECT.md contract compatibility
@@ -250,9 +251,11 @@ def recenter_and_align_stamp(
     subpixel_offset: Tuple[float, float],
     fill_bkg: Optional[float] = None,
     order: int = 3,
+    oversample: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Shift stamp and mask so the star's continuous centroid aligns exactly with the grid center.
+    Optionally evaluates on an oversampled subpixel grid (e.g. oversample=4).
 
     Parameters
     ----------
@@ -268,17 +271,17 @@ def recenter_and_align_stamp(
     order : int, default 3
         Spline interpolation order for science flux (order=3 bicubic).
         Mask is always shifted with order=0 (nearest neighbor).
+    oversample : int, default 1
+        Subpixel oversampling factor (e.g. 4 for 4x oversampling).
 
     Returns
     -------
     aligned_data : np.ndarray (float32)
-        Subpixel centered flux array.
+        Subpixel centered flux array (at native or oversampled resolution).
     aligned_mask : np.ndarray (bool)
         Shifted boolean mask with newly exposed boundary pixels marked True.
     """
     dx, dy = subpixel_offset
-    shift_y = -dy
-    shift_x = -dx
 
     # Fill NaNs with median background prior to spline shift to avoid NaN propagation
     valid = np.isfinite(stamp) & (~mask)
@@ -289,14 +292,50 @@ def recenter_and_align_stamp(
 
     clean_stamp = np.where(np.isfinite(stamp), stamp, bkg)
 
-    # Shift flux with cubic spline interpolation (order=3)
-    aligned_data = shift(clean_stamp, [shift_y, shift_x], order=order, mode="constant", cval=bkg)
+    if oversample <= 1:
+        shift_y = -dy
+        shift_x = -dx
+        aligned_data = shift(clean_stamp, [shift_y, shift_x], order=order, mode="constant", cval=bkg)
+        aligned_mask = shift(mask.astype(float), [shift_y, shift_x], order=0, mode="constant", cval=1.0) > 0.5
+        aligned_mask |= (~np.isfinite(aligned_data))
+        return aligned_data.astype(np.float32), aligned_mask
 
-    # Shift boolean mask with nearest neighbor interpolation (order=0)
-    aligned_mask = shift(mask.astype(float), [shift_y, shift_x], order=0, mode="constant", cval=1.0) > 0.5
+    # Continuous subpixel oversampled alignment
+    ny, nx = stamp.shape
+    O = int(oversample)
+    ny_over = (ny - 1) * O + 1
+    nx_over = (nx - 1) * O + 1
+    cy_over = (ny_over - 1) / 2.0
+    cx_over = (nx_over - 1) / 2.0
+    cy_in = (ny - 1) / 2.0
+    cx_in = (nx - 1) / 2.0
+
+    u = np.arange(nx_over, dtype=np.float64)
+    v = np.arange(ny_over, dtype=np.float64)
+    uu, vv = np.meshgrid(u, v)
+
+    x_sample = cx_in + dx + (uu - cx_over) / O
+    y_sample = cy_in + dy + (vv - cy_over) / O
+
+    aligned_data = map_coordinates(clean_stamp, [y_sample, x_sample], order=order, mode="constant", cval=bkg)
+    aligned_mask = map_coordinates(mask.astype(float), [y_sample, x_sample], order=0, mode="constant", cval=1.0) > 0.5
     aligned_mask |= (~np.isfinite(aligned_data))
 
     return aligned_data.astype(np.float32), aligned_mask
+
+
+def downsample_oversampled_stamp(image: np.ndarray, oversample: int = 4) -> np.ndarray:
+    """
+    Downsample an oversampled array by physical detector pixel area integration (boxcar block average).
+    """
+    O = int(oversample)
+    if O <= 1:
+        return image
+    ny_over, nx_over = image.shape
+    filtered = uniform_filter(image.astype(np.float32), size=O, mode="constant", cval=0.0)
+    idx_y = np.arange(0, ny_over, O)
+    idx_x = np.arange(0, nx_over, O)
+    return filtered[np.ix_(idx_y, idx_x)].astype(np.float32)
 
 
 def _get_row_magnitude(row: pd.Series, preferred_col: str = "mag_lambda") -> float:

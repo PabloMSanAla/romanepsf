@@ -220,6 +220,8 @@ class AssemblySection:
     overlap_fm: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(8.0, 16.0, 10.0, 18.0))
     overlap_mb: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(22.0, 45.0, 30.0, 48.0))
     normalize_flux: bool = True
+    oversampling_faint: int = 4
+    oversampling_medium: int = 4
 
     def __post_init__(self):
         if isinstance(self.overlap_fm, dict):
