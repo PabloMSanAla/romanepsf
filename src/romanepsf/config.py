@@ -212,6 +212,9 @@ class ProfileSection:
     max_clip_iters: int = 5
     radial_step_px: float = 1.0
     num_workers: int = 8
+    growth_rate: float = 1.03
+    bin_spacing: str = "geometric"
+    r_min_px: float = 0.5
 
 
 @dataclass
@@ -312,6 +315,11 @@ class PipelineConfig:
         if self.tiers.bright_limit >= self.tiers.faint_limit:
             raise ValueError(
                 f"bright_limit must be strictly less than faint_limit: {self.tiers.bright_limit} >= {self.tiers.faint_limit}"
+            )
+
+        if self.profile.growth_rate <= 1.0:
+            raise ValueError(
+                f"profile.growth_rate must be strictly greater than 1.0, got {self.profile.growth_rate}"
             )
 
         if isinstance(self.assembly.canvas_size, str) or not isinstance(self.assembly.canvas_size, (int, float)):

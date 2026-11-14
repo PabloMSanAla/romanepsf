@@ -23,7 +23,7 @@ from astropy.table import Table
 from romanepsf import __version__
 from romanepsf.masking import ROMAN_BASE_SPIKE_ANGLES_DEG, NOMINAL_DETECTOR_OFFSET_DEG
 from romanepsf.stamps import StellarStamp
-from romanepsf.profile import elliptical_profile
+from romanepsf.profile import elliptical_profile, get_geometric_radial_bins
 from romanepsf.config import resolve_device, AssemblySection, OverlapAnnulusConfig
 
 
@@ -135,9 +135,13 @@ def measure_radial_profile_1d(
     mask: Optional[np.ndarray] = None,
     rmax: Optional[int] = None,
     device: Union[str, torch.device] = "cpu",
+    growth_rate: float = 1.03,
+    r_min: float = 0.5,
+    bin_spacing: str = "geometric",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Measure robust 1D radial surface brightness profile using profile.py.
+    Supports logarithmic/geometric radial binning (growth_rate, default 1.03x).
 
     STRICT SCIENTIFIC CONSTRAINT:
     Outputs purely 1D radial vectors strictly for saturation boundary detection
@@ -153,8 +157,13 @@ def measure_radial_profile_1d(
     if rmax is None:
         rmax = int(min(cx, cy))
 
-    rad_bins = np.arange(0.5, rmax + 1.0, 1.0)
-    rad_centers = 0.5 * (rad_bins[:-1] + rad_bins[1:])
+    if bin_spacing == "linear":
+        rad_bins = np.arange(0.5, rmax + 1.0, 1.0)
+        rad_centers = 0.5 * (rad_bins[:-1] + rad_bins[1:])
+    else:
+        effective_growth = float(growth_rate) if growth_rate and growth_rate > 1.0 else 1.03
+        rad_bins = get_geometric_radial_bins(r_min=float(r_min), r_max=float(rmax), growth_rate=effective_growth)
+        rad_centers = np.sqrt(rad_bins[:-1] * rad_bins[1:])
 
     data_input = np.ma.masked_array(image, mask=mask) if mask is not None else image
     flux, flux_err = elliptical_profile(
@@ -471,19 +480,23 @@ def assemble_composite_extended_psf(
         else (None, None)
     )
 
+    profile_growth_rate = 1.03
+    if cfg is not None:
+        profile_growth_rate = getattr(cfg, "growth_rate", getattr(cfg, "profile_growth_rate", 1.03))
+
     # 3. Extract 1D radial profiles strictly with coverage masks (Defect 1 fix)
     r_f, prof_f = (
-        measure_radial_profile_1d(psf_faint, mask=(cov_faint == 0), device=device)[:2]
+        measure_radial_profile_1d(psf_faint, mask=(cov_faint == 0), device=device, growth_rate=profile_growth_rate)[:2]
         if has_f
         else (None, None)
     )
     r_m, prof_m = (
-        measure_radial_profile_1d(psf_medium, mask=(cov_medium == 0), device=device)[:2]
+        measure_radial_profile_1d(psf_medium, mask=(cov_medium == 0), device=device, growth_rate=profile_growth_rate)[:2]
         if has_m
         else (None, None)
     )
     r_b, prof_b = (
-        measure_radial_profile_1d(psf_bright, mask=(cov_bright == 0), device=device)[:2]
+        measure_radial_profile_1d(psf_bright, mask=(cov_bright == 0), device=device, growth_rate=profile_growth_rate)[:2]
         if has_b
         else (None, None)
     )
@@ -733,7 +746,7 @@ def serialize_composite_epsf_fits(
     r_max = int((S - 1) // 2)
     max_profile_r = min(r_max, 500)
     radii = np.arange(1.0, max(max_profile_r, 1) + 1.0, 1.0)
-    r_c, prof_c = measure_radial_profile_1d(composite_epsf, rmax=int(radii[-1]))[:2]
+    r_c, prof_c = measure_radial_profile_1d(composite_epsf, rmax=int(radii[-1]), growth_rate=1.03)[:2]
 
     if len(r_c) > 0:
         interp_c = np.interp(radii, r_c, prof_c, right=0.0)

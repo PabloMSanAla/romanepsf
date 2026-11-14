@@ -116,18 +116,28 @@ class TestMeasureRadialProfile1D:
     """Unit tests for measure_radial_profile_1d."""
 
     def test_profile_dimensions_match(self):
-        """Verify matching length for radii, flux, and flux_err."""
+        """Verify matching length for radii, flux, and flux_err with geometric spacing."""
         img = np.ones((101, 101), dtype=np.float32)
         r, f, ferr = assembly.measure_radial_profile_1d(img, rmax=40)
-        assert len(r) == len(f) == len(ferr) == 40
-        assert np.isclose(r[0], 1.0)
-        assert np.isclose(r[-1], 40.0)
+        assert len(r) == len(f) == len(ferr) > 0
+        assert r[0] < r[-1]
+        assert np.isclose(r[-1], 40.0, atol=1.0)
+        # Check geometric growth:
+        ratios = r[1:] / r[:-1]
+        assert np.allclose(ratios, 1.03, atol=2e-3)
+
+        # Also verify linear fallback when requested
+        r_lin, f_lin, ferr_lin = assembly.measure_radial_profile_1d(img, rmax=40, bin_spacing="linear")
+        assert len(r_lin) == len(f_lin) == len(ferr_lin) == 40
+        assert np.isclose(r_lin[0], 1.0)
+        assert np.isclose(r_lin[-1], 40.0)
 
     def test_custom_rmax(self):
         """Verify rmax argument controls profile extent."""
         img = np.ones((51, 51), dtype=np.float32)
         r, f, _ = assembly.measure_radial_profile_1d(img, rmax=20)
-        assert len(r) == 20
+        assert len(r) == len(f) > 0
+        assert np.isclose(r[-1], 20.0, atol=1.0)
 
 
 class TestDetermineOverlapScaleFactorDual:

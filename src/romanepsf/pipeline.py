@@ -850,6 +850,7 @@ def run_pipeline(
             pooled_stamps=pooled_stamps,
             diagnostics=diagnostics,
             pixel_scale=0.11,
+            growth_rate=getattr(cfg.profile, "growth_rate", 1.03),
         )
         plots_dir = cfg.data.output_dir / "plots"
         generate_diagnostic_plots(
@@ -1332,6 +1333,7 @@ def run_sca_batch_pipeline(
             pooled_stamps=pooled_stamps,
             diagnostics=diagnostics,
             pixel_scale=0.11,
+            growth_rate=getattr(cfg.profile, "growth_rate", 1.03),
         )
         plots_dir = resolved_cfg.data.output_dir / "plots"
         generate_diagnostic_plots(

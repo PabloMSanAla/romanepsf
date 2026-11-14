@@ -27,6 +27,7 @@ from matplotlib.patches import Circle
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 from scipy.ndimage import map_coordinates
+from romanepsf.profile import get_geometric_radial_bins
 
 logger = logging.getLogger("romanepsf.plot_utils")
 
@@ -36,10 +37,11 @@ def compute_subpixel_composite_radial_profile(
     sub_r_max: float = 6.0,
     oversample: int = 10,
     r_max_native: float = 500.0,
+    growth_rate: float = 1.03,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute subpixel radial profile of composite ePSF model from 0.1 px to r_max_native px.
-    Uses 10x subpixel interpolation for r in [0.10, sub_r_max] px and native median rings beyond.
+    Uses 10x subpixel interpolation for r in [0.10, sub_r_max] px and geometric radial bins beyond.
     """
     ny, nx = epsf_model.shape
     cy, cx = (ny - 1.0) / 2.0, (nx - 1.0) / 2.0
@@ -54,8 +56,8 @@ def compute_subpixel_composite_radial_profile(
     y_samp = cy + vv_ref
     epsf_sub = map_coordinates(epsf_model, [y_samp, x_samp], order=3, mode="constant", cval=0.0)
 
-    r_core_bins = np.logspace(np.log10(0.10), np.log10(sub_r_max), 60)
-    r_core_centers = 0.5 * (r_core_bins[:-1] + r_core_bins[1:])
+    r_core_bins = get_geometric_radial_bins(r_min=0.10, r_max=sub_r_max, growth_rate=growth_rate)
+    r_core_centers = np.sqrt(r_core_bins[:-1] * r_core_bins[1:])
     f_core_prof = []
     for i in range(len(r_core_centers)):
         in_b = (r_sub_ref >= r_core_bins[i]) & (r_sub_ref < r_core_bins[i + 1])
@@ -74,8 +76,8 @@ def compute_subpixel_composite_radial_profile(
     # 2. Outer profile from sub_r_max px to r_max_native px
     gy, gx = np.ogrid[:ny, :nx]
     r_epsf = np.hypot(gx - cx, gy - cy)
-    r_outer_bins = np.logspace(np.log10(sub_r_max), np.log10(r_max_native), 160)
-    r_outer_centers = 0.5 * (r_outer_bins[:-1] + r_outer_bins[1:])
+    r_outer_bins = get_geometric_radial_bins(r_min=sub_r_max, r_max=r_max_native, growth_rate=growth_rate)
+    r_outer_centers = np.sqrt(r_outer_bins[:-1] * r_outer_bins[1:])
     f_outer_prof = []
     for i in range(len(r_outer_centers)):
         in_b = (r_epsf >= r_outer_bins[i]) & (r_epsf < r_outer_bins[i + 1])
@@ -101,9 +103,11 @@ def extract_stamp_1d_radial_profile(
     stamp_mask: Optional[np.ndarray] = None,
     oversample: int = 1,
     r_bins: Optional[np.ndarray] = None,
+    growth_rate: float = 1.03,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Extract 1D radial profile from a 2D postage stamp array on valid unmasked pixels.
+    Supports logarithmic/geometric binning growing at growth_rate (default 1.03x).
     """
     ny, nx = stamp_data.shape
     cy, cx = (ny - 1.0) / 2.0, (nx - 1.0) / 2.0
@@ -123,9 +127,9 @@ def extract_stamp_1d_radial_profile(
 
     if r_bins is None:
         max_r = min(float(nx) / (2.0 * oversample), 500.0)
-        r_bins = np.logspace(np.log10(0.1), np.log10(max(max_r, 1.0)), 120)
+        r_bins = get_geometric_radial_bins(r_min=0.10, r_max=max(max_r, 1.0), growth_rate=growth_rate)
 
-    r_centers = 0.5 * (r_bins[:-1] + r_bins[1:])
+    r_centers = np.sqrt(r_bins[:-1] * r_bins[1:])
     f_prof = []
     r_out = []
 
@@ -148,20 +152,21 @@ def save_radial_profiles_data(
     pooled_stamps: Dict[str, List[Any]],
     diagnostics: Optional[Dict[str, Any]] = None,
     pixel_scale: float = 0.11,
+    growth_rate: float = 1.03,
 ) -> Path:
     """
     Extract, normalize, and save all individual star profiles and the master composite
-    curve into a compressed NPZ file (~1-6 MB).
+    curve into a compressed NPZ file (~1-6 MB) using geometric radial bins.
     """
     output_npz = Path(output_npz_path)
     output_npz.parent.mkdir(parents=True, exist_ok=True)
     diag = diagnostics or {}
 
     # 1. Master composite curve (down to 0.1 px)
-    r_comp, f_comp = compute_subpixel_composite_radial_profile(composite_epsf)
+    r_comp, f_comp = compute_subpixel_composite_radial_profile(composite_epsf, growth_rate=growth_rate)
 
-    # 2. Standard evaluation grid
-    r_grid = np.logspace(np.log10(0.1), np.log10(500.0), 200).astype(np.float32)
+    # 2. Standard evaluation grid with geometric spacing
+    r_grid = get_geometric_radial_bins(r_min=0.10, r_max=500.0, growth_rate=growth_rate).astype(np.float32)
 
     # Normalization overlap ranges
     norm_ranges = {
@@ -188,7 +193,7 @@ def save_radial_profiles_data(
             if s_data is None:
                 continue
 
-            r_s, f_s = extract_stamp_1d_radial_profile(s_data, s_mask, oversample=s_ovs)
+            r_s, f_s = extract_stamp_1d_radial_profile(s_data, s_mask, oversample=s_ovs, growth_rate=growth_rate)
             if len(r_s) < 3 or not np.any(f_s > 0):
                 continue
 

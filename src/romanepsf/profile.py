@@ -21,6 +21,61 @@ import torch
 from romanepsf.config import resolve_device
 
 
+def get_geometric_radial_bins(
+    r_min: float = 0.5,
+    r_max: float = 500.0,
+    growth_rate: float = 1.03,
+    as_tensor: bool = False,
+    device: Union[str, torch.device] = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Union[np.ndarray, torch.Tensor]:
+    """
+    Generate logarithmically/geometrically spaced radial bin edges via np.geomspace
+    (or torch.logspace for PyTorch tensors) where each consecutive bin grows by growth_rate:
+        r_{k+1} = r_k * growth_rate (default 1.03x)
+
+    Parameters
+    ----------
+    r_min : float, default 0.5
+        Inner radius of the first bin boundary in pixels (> 0).
+    r_max : float, default 500.0
+        Outer radius of the final bin boundary in pixels.
+    growth_rate : float, default 1.03
+        Multiplicative geometric growth rate per bin (> 1.0).
+    as_tensor : bool, default False
+        If True, returns a PyTorch 1D Tensor on the target device.
+    device : str or torch.device, default 'cpu'
+        Target PyTorch device if as_tensor=True.
+    dtype : torch.dtype, default torch.float32
+        Data type if as_tensor=True.
+
+    Returns
+    -------
+    bins : np.ndarray or torch.Tensor
+        Strictly monotonically increasing geometric bin boundaries from r_min to r_max.
+    """
+    if r_min <= 0:
+        raise ValueError(f"r_min must be strictly positive, got {r_min}")
+    if r_max <= r_min:
+        raise ValueError(f"r_max ({r_max}) must be greater than r_min ({r_min})")
+    if growth_rate <= 1.0:
+        raise ValueError(f"growth_rate must be strictly greater than 1.0, got {growth_rate}")
+
+    n_bins = int(np.ceil(np.log(float(r_max) / float(r_min)) / np.log(float(growth_rate)))) + 1
+    n_bins = max(n_bins, 2)
+
+    if as_tensor:
+        if isinstance(device, str):
+            dev = resolve_device(device)
+        else:
+            dev = device
+        log_min = float(np.log10(r_min))
+        log_max = float(np.log10(r_max))
+        return torch.logspace(log_min, log_max, n_bins, device=dev, dtype=dtype)
+    else:
+        return np.geomspace(float(r_min), float(r_max), n_bins, dtype=np.float64)
+
+
 def create_ellipse_meshgrid_torch(
     eps: float,
     pa: float,
@@ -315,6 +370,7 @@ def get_psf_extension_moffat(
 
 
 __all__ = [
+    "get_geometric_radial_bins",
     "create_ellipse_meshgrid_torch",
     "elliptical_profile",
     "get_psf_extension_moffat",

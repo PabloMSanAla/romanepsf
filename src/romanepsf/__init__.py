@@ -81,6 +81,7 @@ from .mto2 import (
     MTO2Config,
 )
 from .profile import (
+    get_geometric_radial_bins,
     create_ellipse_meshgrid_torch,
     elliptical_profile,
 )
@@ -154,6 +155,7 @@ __all__ = [
     "segment_sources_mto2",
     "MTO2Config",
     "mask_contaminants_with_spikes_protected",
+    "get_geometric_radial_bins",
     "create_ellipse_meshgrid_torch",
     "elliptical_profile",
     "stack_tier_stamps_torch",

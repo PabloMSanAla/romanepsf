@@ -25,6 +25,7 @@ from astropy.stats import sigma_clip, mad_std
 from scipy.ndimage import binary_erosion, binary_dilation
 from scipy.interpolate import interp1d
 
+from romanepsf.profile import get_geometric_radial_bins
 from romanepsf.loader import load_l2_image
 from romanepsf.stamps import (
     extract_cutout,
@@ -46,12 +47,14 @@ OUTPUT_DIR = Path("plots")
 def compute_radial_profile_sigma_clipped(
     stamp: np.ndarray,
     center: tuple[float, float],
-    dr: float = 1.0,
+    growth_rate: float = 1.03,
+    r_min: float = 0.5,
     sigma_clip_val: float = 3.0,
     max_iters: int = 3,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute azimuthal radial profile using sigma clipping in radial annuli.
+    Compute azimuthal radial profile using geometric log binning (growth_rate, default 1.03x)
+    and iterative sigma clipping in radial annuli.
 
     Returns:
     --------
@@ -68,9 +71,10 @@ def compute_radial_profile_sigma_clipped(
 
     valid_mask = np.isfinite(stamp)
     r_max = np.nanmax(r_map[valid_mask]) if np.any(valid_mask) else float(max(nx, ny) // 2)
+    r_max = max(r_max, r_min + 1.0)
 
-    bins = np.arange(0.0, r_max + dr, dr)
-    r_mids = 0.5 * (bins[:-1] + bins[1:])
+    bins = get_geometric_radial_bins(r_min=r_min, r_max=r_max, growth_rate=growth_rate)
+    r_mids = np.sqrt(bins[:-1] * bins[1:])
     f_prof = []
     s_prof = []
     n_prof = []
@@ -159,7 +163,7 @@ def run_test_for_star(
     # 3. Benchmark Radial Profile 2D Model
     t_r0 = time.perf_counter()
     r_map, r_mids, f_prof, s_prof, n_prof = compute_radial_profile_sigma_clipped(
-        stamp, (scx, scy), dr=1.0, sigma_clip_val=3.0
+        stamp, (scx, scy), growth_rate=1.03, sigma_clip_val=3.0
     )
     model_2d, std_2d = build_2d_model_from_radial(r_map, r_mids, f_prof, s_prof)
     t_radial = time.perf_counter() - t_r0

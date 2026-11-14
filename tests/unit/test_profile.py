@@ -154,6 +154,40 @@ class TestMoffatExtension:
             profile.get_psf_extension_moffat(10.0, beta=1.0)
 
 
+class TestGeometricRadialBins:
+    """Unit tests for get_geometric_radial_bins and logarithmic spacing."""
+
+    def test_default_growth_rate_1_03(self):
+        """Verify consecutive bins grow by ~1.03x."""
+        bins = profile.get_geometric_radial_bins(r_min=0.5, r_max=500.0, growth_rate=1.03)
+        assert isinstance(bins, np.ndarray)
+        assert len(bins) > 10
+        assert np.isclose(bins[0], 0.5)
+        assert np.isclose(bins[-1], 500.0)
+        assert np.all(np.diff(bins) > 0), "Bins must be strictly monotonically increasing"
+        ratios = bins[1:] / bins[:-1]
+        assert np.allclose(ratios, 1.03, atol=2e-3), f"Ratios mean={np.mean(ratios):.4f} should be ~1.03"
+
+    def test_torch_tensor_output(self):
+        """Verify PyTorch tensor generation on target device."""
+        bins_t = profile.get_geometric_radial_bins(r_min=0.1, r_max=100.0, growth_rate=1.05, as_tensor=True, device="cpu")
+        assert isinstance(bins_t, torch.Tensor)
+        assert bins_t.device.type == "cpu"
+        assert np.isclose(bins_t[0].item(), 0.1)
+        assert np.isclose(bins_t[-1].item(), 100.0)
+        ratios = (bins_t[1:] / bins_t[:-1]).numpy()
+        assert np.allclose(ratios, 1.05, atol=2e-3)
+
+    def test_invalid_parameters_raise_error(self):
+        """Verify invalid bounds and growth rates raise ValueError."""
+        with pytest.raises(ValueError, match="r_min must be strictly positive"):
+            profile.get_geometric_radial_bins(r_min=0.0, r_max=100.0)
+        with pytest.raises(ValueError, match="r_max .* must be greater than r_min"):
+            profile.get_geometric_radial_bins(r_min=10.0, r_max=5.0)
+        with pytest.raises(ValueError, match="growth_rate must be strictly greater than 1.0"):
+            profile.get_geometric_radial_bins(r_min=0.5, r_max=500.0, growth_rate=1.0)
+
+
 class TestScientificConstraintProfile:
     """Strict scientific constraint verification: 1D profiles must never circularize 2D data."""
 

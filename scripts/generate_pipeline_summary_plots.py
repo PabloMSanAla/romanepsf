@@ -40,8 +40,9 @@ def compute_fast_radial_profile(
     r_max_native: float = 500.0,
     oversample: float = 1.0,
     bin_width_native: float = 0.1,
+    growth_rate: float = 1.03,
 ) -> tuple:
-    """Compute 1D azimuthal radial profile from 2D stamp array on valid unmasked pixels with optional oversampling."""
+    """Compute 1D azimuthal radial profile from 2D stamp array on valid unmasked pixels with geometric log spacing."""
     ny, nx = stamp_data.shape
     cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
     grid_y, grid_x = np.ogrid[:ny, :nx]
@@ -58,10 +59,14 @@ def compute_fast_radial_profile(
     r_valid = r_native[valid]
     f_valid = stamp_data[valid]
 
-    # Subpixel radial binning starting at 0.1 px
+    # Subpixel geometric radial binning starting at 0.1 px
     max_r = min(r_max_native, float(np.max(r_valid)))
-    bin_edges = np.arange(0.1, max_r + bin_width_native, bin_width_native)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    if max_r <= 0.15:
+        return np.array([]), np.array([])
+
+    from romanepsf.profile import get_geometric_radial_bins
+    bin_edges = get_geometric_radial_bins(r_min=0.10, r_max=max_r, growth_rate=growth_rate)
+    bin_centers = np.sqrt(bin_edges[:-1] * bin_edges[1:])
     bin_idx = np.digitize(r_valid, bin_edges) - 1
 
     r_prof = []
