@@ -210,12 +210,15 @@ def generate_debug_figure2_apertures_and_profile(
     is_calibrated: bool = True,
     center_xy: Optional[Tuple[float, float]] = None,
     dq_mask: Optional[np.ndarray] = None,
+    gaia_center_xy: Optional[Tuple[float, float]] = None,
 ) -> Path:
     """
-    Figure 2: 2 panels:
-    - Left: Calibrated image with overlaid concentric profile apertures,
+    Figure 2: 3 panels:
+    - Panel 1: Calibrated image with overlaid concentric profile apertures,
       contaminant mask (cyan, alpha=0.5), and quality flags (green, alpha=0.5).
-    - Right: Radial profile in surface brightness (AB mag / arcsec^2).
+    - Panel 2: Core zoom showing the Gaia (RA, Dec) projected center vs the empirical
+      measured recentered center, with shift vector and astrometric summary.
+    - Panel 3: Radial surface brightness profile in AB mag / arcsec^2.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,8 +228,30 @@ def generate_debug_figure2_apertures_and_profile(
     mag = float(info.get("mag", 0.0))
 
     ny, nx = stamp.shape
-    cx = center_xy[0] if center_xy else (nx - 1.0) / 2.0
-    cy = center_xy[1] if center_xy else (ny - 1.0) / 2.0
+    if center_xy is not None:
+        cx, cy = center_xy
+    elif "center_stamp" in info and info["center_stamp"] is not None:
+        cx, cy = info["center_stamp"]
+    else:
+        cx = (nx - 1.0) / 2.0
+        cy = (ny - 1.0) / 2.0
+
+    if gaia_center_xy is not None:
+        xg, yg = gaia_center_xy
+    elif "gaia_center_stamp" in info and info["gaia_center_stamp"] is not None:
+        xg, yg = info["gaia_center_stamp"]
+    else:
+        xg, yg = cx, cy
+
+    dx = cx - xg
+    dy = cy - yg
+    shift_px_val = info.get("shift_px", None)
+    shift_px = float(shift_px_val) if shift_px_val is not None else float(np.hypot(dx, dy))
+    pix_scale_val = info.get("pixel_scale", None)
+    pix_scale = float(pix_scale_val) if pix_scale_val is not None else 0.11
+    shift_mas = shift_px * pix_scale * 1000.0
+    ra_val = info.get("gaia_ra", None)
+    dec_val = info.get("gaia_dec", None)
 
     if dq_mask is None and star_info is not None:
         dq_mask = star_info.get("dq_mask", None)
@@ -242,9 +267,11 @@ def generate_debug_figure2_apertures_and_profile(
     mag_img = convert_to_ab_mag_arcsec2(stamp, conversion_factor, is_calibrated)
     prof_mag = convert_to_ab_mag_arcsec2(rad_flux, conversion_factor, is_calibrated)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7), facecolor="#0e1117")
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(23, 7.2), facecolor="#0e1117")
 
+    # =========================================================================
     # Panel 1: Image with Overlaid Geometric Apertures and Masks
+    # =========================================================================
     ax1.set_facecolor("#161b22")
     valid_mags = mag_img[np.isfinite(mag_img)]
     vmin = max(float(np.nanpercentile(valid_mags, 0.5)), 8.0) if len(valid_mags) else 12.0
@@ -256,7 +283,7 @@ def generate_debug_figure2_apertures_and_profile(
         cmap.set_bad(color="#1a1e24")
 
     im1 = ax1.imshow(mag_img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax1.set_title("Image with Profile Annuli, Mask (Cyan) & DQ (Green) Overlaid", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
+    ax1.set_title("1. Apertures, Masks & Centroid", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
     ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
     ax1.set_ylabel("Y (pixels)", color="#e6edf3", fontsize=10)
     ax1.tick_params(colors="#8b949e", labelsize=9)
@@ -280,10 +307,7 @@ def generate_debug_figure2_apertures_and_profile(
             circ = Circle((cx, cy), r, fill=False, edgecolor="#00e5ff", alpha=0.35, linewidth=0.8, linestyle=":")
             ax1.add_patch(circ)
 
-    # Highlight centroid
-    ax1.plot(cx, cy, "+", color="#00e5ff", markersize=10, markeredgewidth=1.5, label="Centroid")
-
-    # Overlay Gaia companion star circular apertures
+    # Gaia companions
     comps = info.get("gaia_companions", [])
     for comp in comps:
         circ = Circle(
@@ -297,49 +321,140 @@ def generate_debug_figure2_apertures_and_profile(
         ax1.add_patch(circ)
         ax1.plot(comp["x"], comp["y"], "+", color="#ffd600", markersize=7, markeredgewidth=1.3)
 
-    legend_elements = [
-        plt.Line2D([0], [0], color="#00e5ff", marker="+", linestyle="none", markersize=10, markeredgewidth=1.5, label="Centroid"),
-    ]
-    if np.any(is_contam):
-        legend_elements.append(Patch(facecolor=(0.0, 0.9, 1.0, 0.5), edgecolor="#00e5ff", label="Mask (Cyan, $\\alpha=0.5$)"))
-    if np.any(is_dq):
-        legend_elements.append(Patch(facecolor=(0.0, 0.9, 0.2, 0.5), edgecolor="#00e676", label="Quality Flags (Green, $\\alpha=0.5$)"))
-    if len(comps) > 0:
-        legend_elements.append(plt.Line2D([0], [0], color="#ffd600", linestyle="--", linewidth=1.4, label=f"Gaia Companions ({len(comps)})"))
+    # Highlight centers on Panel 1
+    has_gaia_pos = (abs(xg - cx) > 1e-4) or (abs(yg - cy) > 1e-4) or (shift_px > 0.01)
+    if has_gaia_pos:
+        ax1.plot(xg, yg, marker="s", markersize=8, markeredgewidth=1.6, markeredgecolor="#ff9100", markerfacecolor="none", label="Gaia Center")
+    ax1.plot(cx, cy, "+", color="#00e5ff", markersize=10, markeredgewidth=1.8, label="Recentered")
 
-    ax1.legend(handles=legend_elements, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
+    legend_elements1 = [
+        plt.Line2D([0], [0], color="#00e5ff", marker="+", linestyle="none", markersize=9, markeredgewidth=1.8, label="Recentered"),
+    ]
+    if has_gaia_pos:
+        legend_elements1.append(plt.Line2D([0], [0], color="#ff9100", marker="s", markerfacecolor="none", linestyle="none", markersize=7, markeredgewidth=1.5, label="Gaia Center"))
+    if np.any(is_contam):
+        legend_elements1.append(Patch(facecolor=(0.0, 0.9, 1.0, 0.5), edgecolor="#00e5ff", label="Mask (Cyan, $\\alpha=0.5$)"))
+    if np.any(is_dq):
+        legend_elements1.append(Patch(facecolor=(0.0, 0.9, 0.2, 0.5), edgecolor="#00e676", label="Quality Flags (Green, $\\alpha=0.5$)"))
+    if len(comps) > 0:
+        legend_elements1.append(plt.Line2D([0], [0], color="#ffd600", linestyle="--", linewidth=1.4, label=f"Gaia Companions ({len(comps)})"))
+
+    ax1.legend(handles=legend_elements1, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     cbar1 = fig.colorbar(im1, ax=ax1, shrink=0.85)
     cbar1.set_label("AB mag / arcsec$^2$", color="#e6edf3", fontsize=10)
     cbar1.ax.tick_params(colors="#8b949e", labelsize=8.5)
     cbar1.ax.invert_yaxis()
 
-    # Panel 2: Measured Radial Profile in AB mag / arcsec^2
+    # =========================================================================
+    # Panel 2: Gaia Center & Recentered Measure (Core Zoom)
+    # =========================================================================
     ax2.set_facecolor("#161b22")
+    r_zoom = min(15.0, (nx - 1) / 2.0, (ny - 1) / 2.0)
+    x0_z = max(0, int(round(cx - r_zoom)))
+    x1_z = min(nx, int(round(cx + r_zoom)) + 1)
+    y0_z = max(0, int(round(cy - r_zoom)))
+    y1_z = min(ny, int(round(cy + r_zoom)) + 1)
+    zoom_crop = mag_img[y0_z:y1_z, x0_z:x1_z]
+    v_z = zoom_crop[np.isfinite(zoom_crop)]
+    if len(v_z) > 0:
+        vz_min = float(np.nanpercentile(v_z, 1.0))
+        vz_max = float(np.nanpercentile(v_z, 99.0))
+        if vz_max - vz_min < 2.0:
+            vz_max = vz_min + 3.0
+    else:
+        vz_min, vz_max = vmin, vmax
+
+    im2 = ax2.imshow(mag_img, origin="lower", cmap=cmap, vmin=vz_min, vmax=vz_max)
+    ax2.set_xlim(cx - r_zoom, cx + r_zoom)
+    ax2.set_ylim(cy - r_zoom, cy + r_zoom)
+    ax2.set_title("2. Gaia Center vs Recentered Measure", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
+    ax2.set_xlabel("Stamp X (pixels)", color="#e6edf3", fontsize=10)
+    ax2.set_ylabel("Stamp Y (pixels)", color="#e6edf3", fontsize=10)
+    ax2.tick_params(colors="#8b949e", labelsize=9)
+
+    # Plot Gaia projected center (square with dashed crosshairs)
+    ax2.plot(xg, yg, marker="s", markersize=9, markeredgewidth=2.0, markeredgecolor="#ff9100", markerfacecolor="none", label="Gaia (RA, Dec)")
+    ax2.axvline(xg, color="#ff9100", linestyle="--", alpha=0.55, linewidth=1.1)
+    ax2.axhline(yg, color="#ff9100", linestyle="--", alpha=0.55, linewidth=1.1)
+
+    # Plot empirical measured center (plus with dotted crosshairs)
+    ax2.plot(cx, cy, marker="+", markersize=14, markeredgewidth=2.2, color="#00e5ff", label="Recentered Measure")
+    ax2.axvline(cx, color="#00e5ff", linestyle=":", alpha=0.55, linewidth=1.1)
+    ax2.axhline(cy, color="#00e5ff", linestyle=":", alpha=0.55, linewidth=1.1)
+
+    # Shift arrow if significant
+    if shift_px >= 0.05:
+        ax2.annotate(
+            "",
+            xy=(cx, cy),
+            xytext=(xg, yg),
+            arrowprops=dict(arrowstyle="->", color="#ffd600", lw=2.0, mutation_scale=15),
+        )
+
+    # Range scale rings around Gaia center at 1 px and 2 px
+    circ_1px = Circle((xg, yg), 1.0, fill=False, edgecolor="#ffffff", linestyle=":", alpha=0.35, linewidth=0.9)
+    circ_2px = Circle((xg, yg), 2.0, fill=False, edgecolor="#ffffff", linestyle=":", alpha=0.25, linewidth=0.9)
+    ax2.add_patch(circ_1px)
+    ax2.add_patch(circ_2px)
+
+    # Astrometric recentering summary card
+    ra_str = f"{ra_val:.6f}°" if ra_val is not None else "N/A"
+    dec_str = f"{dec_val:.6f}°" if dec_val is not None else "N/A"
+    summary_text = (
+        f"Gaia RA:  {ra_str}\n"
+        f"Gaia Dec: {dec_str}\n"
+        f"Gaia (x, y):     ({xg:.2f}, {yg:.2f}) px\n"
+        f"Recentered (x,y): ({cx:.2f}, {cy:.2f}) px\n"
+        f"Shift (Δx, Δy):  ({dx:+.2f}, {dy:+.2f}) px\n"
+        f"Offset |Δr|:     {shift_px:.2f} px ({shift_mas:.1f} mas)"
+    )
+    ax2.text(
+        0.04, 0.04,
+        summary_text,
+        transform=ax2.transAxes,
+        fontsize=8.2,
+        fontfamily="monospace",
+        color="#ffffff",
+        verticalalignment="bottom",
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#161b22", edgecolor="#30363d", alpha=0.88),
+    )
+
+    ax2.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
+
+    cbar2 = fig.colorbar(im2, ax=ax2, shrink=0.85)
+    cbar2.set_label("AB mag / arcsec$^2$", color="#e6edf3", fontsize=10)
+    cbar2.ax.tick_params(colors="#8b949e", labelsize=8.5)
+    cbar2.ax.invert_yaxis()
+
+    # =========================================================================
+    # Panel 3: Measured Radial Profile in AB mag / arcsec^2
+    # =========================================================================
+    ax3.set_facecolor("#161b22")
     valid_p = np.isfinite(prof_mag) & (rad_centers > 0)
     if np.any(valid_p):
         r_plot = rad_centers[valid_p]
         m_plot = prof_mag[valid_p]
-        ax2.plot(r_plot, m_plot, color="#00e5ff", lw=2.2, marker="o", markersize=3, label="Radial Profile")
+        ax3.plot(r_plot, m_plot, color="#00e5ff", lw=2.2, marker="o", markersize=3, label="Radial Profile")
 
-        ax2.set_xscale("log")
-        ax2.set_xlabel("Radius from Centroid (pixels)", color="#e6edf3", fontsize=11, labelpad=8)
-        ax2.set_ylabel("Surface Brightness (AB mag / arcsec$^2$)", color="#e6edf3", fontsize=11, labelpad=8)
-        ax2.set_title("Radial Surface Brightness Profile", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
-        ax2.tick_params(colors="#8b949e", labelsize=9.5, which="both")
-        ax2.grid(True, which="both", color="#30363d", alpha=0.4, linestyle=":")
+        ax3.set_xscale("log")
+        ax3.set_xlabel("Radius from Centroid (pixels)", color="#e6edf3", fontsize=11, labelpad=8)
+        ax3.set_ylabel("Surface Brightness (AB mag / arcsec$^2$)", color="#e6edf3", fontsize=11, labelpad=8)
+        ax3.set_title("3. Radial Surface Brightness Profile", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
+        ax3.tick_params(colors="#8b949e", labelsize=9.5, which="both")
+        ax3.grid(True, which="both", color="#30363d", alpha=0.4, linestyle=":")
 
         # Invert y-axis: brighter magnitudes (smaller numbers) at the top!
         y_top = max(float(np.min(m_plot)) - 1.0, 8.0)
         y_bottom = min(float(np.max(m_plot)) + 1.0, 30.0)
-        ax2.set_ylim(y_bottom, y_top)
+        ax3.set_ylim(y_bottom, y_top)
 
-        leg2 = ax2.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", fontsize=9.5)
-        for t in leg2.get_texts():
+        leg3 = ax3.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", fontsize=9.5)
+        for t in leg3.get_texts():
             t.set_color("#e6edf3")
 
     fig.suptitle(
-        f"Debug Figure 2: Profile Annuli & Surface Brightness | {tier} Star (ID: {source_id}, Mag: {mag:.2f})",
+        f"Debug Figure 2: Profile Annuli, Centroid Recentering & Radial Profile | {tier} Star (ID: {source_id}, Mag: {mag:.2f})",
         color="#ffffff",
         fontsize=14,
         fontweight="bold",
@@ -692,6 +807,14 @@ def generate_all_debug_plots(
             "mag": mag_val,
             "gaia_companions": dbg.get("gaia_companions", []),
             "dq_mask": dbg.get("dq_mask", None),
+            "gaia_center_stamp": dbg.get("gaia_center_stamp", center_xy),
+            "center_stamp": center_xy,
+            "gaia_ra": dbg.get("gaia_ra", None),
+            "gaia_dec": dbg.get("gaia_dec", None),
+            "shift_px": dbg.get("shift_px", None),
+            "pixel_scale": dbg.get("pixel_scale", 0.11),
+            "gaia_detector_xy": dbg.get("gaia_detector_xy", None),
+            "meas_detector_xy": dbg.get("meas_detector_xy", None),
         }
 
         # Measure 1D profile for the star stamp

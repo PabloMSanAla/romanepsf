@@ -498,6 +498,10 @@ def refine_stellar_centroids(
         peak_fluxes.append(peak)
 
     df_out = df.copy()
+    if "x_gaia" not in df_out.columns:
+        df_out["x_gaia"] = df["x"].to_numpy(dtype=float)
+    if "y_gaia" not in df_out.columns:
+        df_out["y_gaia"] = df["y"].to_numpy(dtype=float)
     df_out["x"] = x_refined
     df_out["y"] = y_refined
     df_out["peak_flux"] = peak_fluxes

@@ -455,6 +455,27 @@ def process_star_stamps(
             mag = _get_row_magnitude(row, preferred_col=mag_col)
             cx, cy = float(row["x"]), float(row["y"])
 
+            # Resolve Gaia RA, Dec and Gaia projected coordinates on detector
+            ra = float(row["ra"]) if "ra" in row and pd.notna(row["ra"]) else None
+            dec = float(row["dec"]) if "dec" in row and pd.notna(row["dec"]) else None
+            if "x_gaia" in row and pd.notna(row["x_gaia"]) and "y_gaia" in row and pd.notna(row["y_gaia"]):
+                xg_det = float(row["x_gaia"])
+                yg_det = float(row["y_gaia"])
+            elif ra is not None and dec is not None and hasattr(l2_data, "wcs") and l2_data.wcs is not None:
+                try:
+                    if hasattr(l2_data.wcs, "backward_transform"):
+                        xg_val, yg_val = l2_data.wcs.backward_transform(ra, dec)
+                    elif hasattr(l2_data.wcs, "invert"):
+                        xg_val, yg_val = l2_data.wcs.invert(ra, dec)
+                    else:
+                        xg_val, yg_val = cx, cy
+                    xg_det = float(np.asarray(xg_val).flat[0])
+                    yg_det = float(np.asarray(yg_val).flat[0])
+                except Exception:
+                    xg_det, yg_det = cx, cy
+            else:
+                xg_det, yg_det = cx, cy
+
             # 1. Determine adaptive size
             sz = get_adaptive_stamp_size(mag, tier, max_size=max_bright_size, pixel_scale=pixel_scale)
 
@@ -567,6 +588,14 @@ def process_star_stamps(
                         })
 
             rad_model = (flux_cutout - res_map) if res_map is not None else flux_cutout
+            meas_x_stamp = half + sub_dx
+            meas_y_stamp = half + sub_dy
+            gaia_x_stamp = half + (xg_det - ix)
+            gaia_y_stamp = half + (yg_det - iy)
+            shift_px = float(np.hypot(cx - xg_det, cy - yg_det))
+            if shift_px == 0.0 and "centroid_shift_px" in row and pd.notna(row["centroid_shift_px"]):
+                shift_px = float(row["centroid_shift_px"])
+
             debug_dict = {
                 "raw_stamp": flux_cutout,
                 "unaligned_mask": mask,
@@ -574,7 +603,14 @@ def process_star_stamps(
                 "radial_model": rad_model,
                 "conversion_factor": float(getattr(l2_data, "conversion_factor", 1.0)),
                 "is_calibrated": bool(getattr(l2_data, "is_calibrated", True)),
-                "center_stamp": (half + sub_dx, half + sub_dy),
+                "center_stamp": (meas_x_stamp, meas_y_stamp),
+                "gaia_center_stamp": (gaia_x_stamp, gaia_y_stamp),
+                "gaia_ra": ra,
+                "gaia_dec": dec,
+                "gaia_detector_xy": (xg_det, yg_det),
+                "meas_detector_xy": (cx, cy),
+                "shift_px": shift_px,
+                "pixel_scale": pixel_scale,
                 "gaia_companions": stamp_companions,
                 "dq_mask": dq_mask_bool,
             }
