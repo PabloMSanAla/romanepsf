@@ -34,12 +34,23 @@ dependencies = [
     "matplotlib>=3.7.0",
     "torch>=2.0.0",
     "gwcs>=0.19.0",
+    "pyarrow>=10.0.0",
+    "astropy-healpix>=1.0.0",
+    "astroquery>=0.4.6",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+]
+mto2 = [
+    "higra>=0.6.0",
+]
+all = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "higra>=0.6.0",
 ]
 
 [project.scripts]
