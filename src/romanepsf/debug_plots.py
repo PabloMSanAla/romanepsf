@@ -760,8 +760,12 @@ def generate_debug_figure_spike_process(
     core_rad = float(info.get("core_protection_radius_px", 6.0 if tier == "BRIGHT" else (4.0 if tier == "MEDIUM" else 3.0)))
 
     spike_details = info.get("spike_details", {}) or {}
+    primary_spike_angles = spike_details.get("primary_spike_angles", None)
+    secondary_spike_angles = spike_details.get("secondary_spike_angles", None)
+    if base_spike_angles is not None and primary_spike_angles is None:
+        primary_spike_angles = base_spike_angles
     if base_spike_angles is None:
-        base_spike_angles = spike_details.get("base_spike_angles", None)
+        base_spike_angles = primary_spike_angles
     if refined_spike_angles is None:
         refined_spike_angles = spike_details.get("refined_spike_angles", None)
     if theoretical_mask is None:
@@ -770,18 +774,41 @@ def generate_debug_figure_spike_process(
         corrected_mask = spike_details.get("corrected_spike_mask", None)
 
     # Fallback calculation if spike_details not provided
+    from romanepsf.profile import measure_angular_profile_torch
     from romanepsf.masking import (
         get_theoretical_spike_angles,
-        refine_spike_angles,
+        detect_spike_peaks_from_profile,
         create_geometric_spike_mask,
         detect_morphological_spikes,
     )
-    if base_spike_angles is None or len(base_spike_angles) == 0:
-        base_spike_angles = get_theoretical_spike_angles(0.0, detector_offset_deg=-9.70)
+    if primary_spike_angles is None or len(primary_spike_angles) == 0:
+        b_c, p_flx = measure_angular_profile_torch(
+            image=residual,
+            center=(cx, cy),
+            dq_mask=dq_mask,
+            comp_mask=comp_mask,
+            companions=info.get("gaia_companions", []),
+            core_rad=core_rad,
+            num_bins=360,
+        )
+        primary_spike_angles, secondary_spike_angles = detect_spike_peaks_from_profile(
+            b_c, p_flx, n_primary=12
+        )
+        if len(primary_spike_angles) == 0:
+            primary_spike_angles = get_theoretical_spike_angles(0.0, detector_offset_deg=-9.70)
+        base_spike_angles = primary_spike_angles
+
+    if secondary_spike_angles is None:
+        secondary_spike_angles = np.array([], dtype=np.float64)
+
     if refined_spike_angles is None or len(refined_spike_angles) == 0:
-        refined_spike_angles = refine_spike_angles(residual, (cx, cy), base_spike_angles, r_min=max(core_rad, 15.0))
+        if len(secondary_spike_angles) > 0:
+            refined_spike_angles = np.sort(np.unique(np.concatenate([primary_spike_angles, secondary_spike_angles])))
+        else:
+            refined_spike_angles = primary_spike_angles
+
     if theoretical_mask is None or not np.any(theoretical_mask):
-        theoretical_mask = create_geometric_spike_mask((ny, nx), (cx, cy), base_spike_angles, radial_min=core_rad)
+        theoretical_mask = create_geometric_spike_mask((ny, nx), (cx, cy), primary_spike_angles, radial_min=core_rad)
     if corrected_mask is None or not np.any(corrected_mask):
         corr_geom = create_geometric_spike_mask((ny, nx), (cx, cy), refined_spike_angles, radial_min=core_rad)
         corr_morph = detect_morphological_spikes(residual, (cx, cy), threshold_sigma=2.0)
@@ -814,7 +841,7 @@ def generate_debug_figure_spike_process(
     except AttributeError:
         cmap.set_bad(color="#1a1e24")
 
-    # Panel 1: Image + Theoretical Spike Mask
+    # Panel 1: Image + Primary Spike Mask
     ax0.set_facecolor("#161b22")
     im0 = ax0.imshow(mag_img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     if theoretical_mask is not None and np.any(theoretical_mask):
@@ -824,7 +851,7 @@ def generate_debug_figure_spike_process(
 
     max_ray_len = min(nx, ny) * 0.48
     r_start = max(core_rad, 4.0)
-    for ang in base_spike_angles:
+    for ang in primary_spike_angles:
         rad = np.radians(ang)
         ax0.plot(
             [cx + r_start * np.cos(rad), cx + max_ray_len * np.cos(rad)],
@@ -836,15 +863,15 @@ def generate_debug_figure_spike_process(
         )
     ax0.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
     ax0.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
-    ax0.set_title("1. Calibrated Image + Theoretical Mask\n(Starting Point: Nominal Roll & Spider Prior)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
+    ax0.set_title("1. Calibrated Image + Primary Spike Mask\n(Detected 12 Largest Peaks on Azimuthal Profile)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
     ax0.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
     ax0.set_ylabel("Y (pixels)", color="#e6edf3", fontsize=10)
     ax0.tick_params(colors="#8b949e", labelsize=9)
     for s in ax0.spines.values():
         s.set_color("#30363d")
     leg0 = [
-        Patch(facecolor=(0.0, 0.85, 1.0, 0.5), edgecolor="#00e5ff", label="Theoretical Mask"),
-        Line2D([], [], color="#58a6ff", linestyle="--", linewidth=1.2, label=f"Theoretical Rays ({len(base_spike_angles)})"),
+        Patch(facecolor=(0.0, 0.85, 1.0, 0.5), edgecolor="#00e5ff", label="Primary Spike Mask"),
+        Line2D([], [], color="#58a6ff", linestyle="--", linewidth=1.2, label=f"Primary Rays ({len(primary_spike_angles)})"),
         Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"),
     ]
     ax0.legend(handles=leg0, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
@@ -857,7 +884,17 @@ def generate_debug_figure_spike_process(
         overlay_corr[corrected_mask.astype(bool)] = [1.0, 0.35, 0.15, 0.50]  # Coral overlay
         ax1.imshow(overlay_corr, origin="lower")
 
-    for ang in refined_spike_angles:
+    for ang in primary_spike_angles:
+        rad = np.radians(ang)
+        ax1.plot(
+            [cx + r_start * np.cos(rad), cx + max_ray_len * np.cos(rad)],
+            [cy + r_start * np.sin(rad), cy + max_ray_len * np.sin(rad)],
+            linestyle="--",
+            color="#58a6ff",
+            linewidth=1.2,
+            alpha=0.75,
+        )
+    for ang in secondary_spike_angles:
         rad = np.radians(ang)
         ax1.plot(
             [cx + r_start * np.cos(rad), cx + max_ray_len * np.cos(rad)],
@@ -865,20 +902,22 @@ def generate_debug_figure_spike_process(
             linestyle="-",
             color="#ff7b72",
             linewidth=1.4,
-            alpha=0.9,
+            alpha=0.90,
         )
     ax1.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
     ax1.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
-    ax1.set_title("2. Residual Image + Corrected Spike Mask\n(Refined Empirical Ridges & Morphological Spikes)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
+    ax1.set_title("2. Residual Image + Corrected Spike Mask\n(12 Primary + Secondary Peaks & Morphological Spikes)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
     ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
     ax1.tick_params(colors="#8b949e", labelsize=9)
     for s in ax1.spines.values():
         s.set_color("#30363d")
     leg1 = [
         Patch(facecolor=(1.0, 0.35, 0.15, 0.5), edgecolor="#ff7b72", label="Corrected Mask"),
-        Line2D([], [], color="#ff7b72", linestyle="-", linewidth=1.4, label=f"Refined Rays ({len(refined_spike_angles)})"),
-        Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"),
+        Line2D([], [], color="#58a6ff", linestyle="--", linewidth=1.2, label=f"Primary Rays ({len(primary_spike_angles)})"),
     ]
+    if len(secondary_spike_angles) > 0:
+        leg1.append(Line2D([], [], color="#ff7b72", linestyle="-", linewidth=1.4, label=f"Secondary Rays ({len(secondary_spike_angles)})"))
+    leg1.append(Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"))
     ax1.legend(handles=leg1, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
 
     # Add colorbar for Panels 1 & 2
@@ -888,8 +927,6 @@ def generate_debug_figure_spike_process(
     cbar.ax.invert_yaxis()
 
     # Panel 3: Intensity vs Angular Distribution (split into 0->180 top and 180->360 bottom)
-    from romanepsf.profile import measure_angular_profile_torch
-
     comps = info.get("gaia_companions", [])
     if comp_mask is None:
         comp_mask = info.get("comp_mask", None)
@@ -922,25 +959,25 @@ def generate_debug_figure_spike_process(
     ax2_top.plot(bin_centers[m_top], median_res_flx[m_top], color="#ffffff", linewidth=1.8, label=r"Residual Flux ($0^\circ \to 180^\circ$)", zorder=4)
     ax2_top.fill_between(bin_centers[m_top], 0, np.maximum(median_res_flx[m_top], 0), color="#58a6ff", alpha=0.25, zorder=3)
 
-    first_theo_top = True
-    for ang in base_spike_angles:
+    first_prim_top = True
+    for ang in primary_spike_angles:
         if 0.0 <= ang <= 180.0:
-            lbl = "Theoretical Rays" if first_theo_top else None
-            ax2_top.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
-            first_theo_top = False
+            lbl = "Primary Peaks (12)" if first_prim_top else None
+            ax2_top.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.85, zorder=2, label=lbl)
+            first_prim_top = False
 
-    first_ref_top = True
-    for ang in refined_spike_angles:
+    first_sec_top = True
+    for ang in secondary_spike_angles:
         if 0.0 <= ang <= 180.0:
-            lbl = "Corrected Rays" if first_ref_top else None
+            lbl = f"Secondary Peaks ({len(secondary_spike_angles)})" if first_sec_top else None
             ax2_top.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
-            first_ref_top = False
+            first_sec_top = False
 
     ax2_top.set_xlim(0.0, 180.0)
     ax2_top.set_xticks(np.arange(0, 181, 30))
     ax2_top.set_ylim(y_min, y_max)
     ax2_top.set_ylabel(f"Intensity ({flux_unit})", color="#e6edf3", fontsize=9.5)
-    ax2_top.set_title(r"3a. Full-Image Azimuthal Intensity: $0^\circ \to 180^\circ$ (Excl. DQ & Gaia Stars)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_top.set_title(r"3a. Full-Image Azimuthal Intensity: $0^\circ \to 180^\circ$ (12 Largest Peaks & Secondary Peaks)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
     ax2_top.tick_params(colors="#8b949e", labelsize=8.5)
     for s in ax2_top.spines.values():
         s.set_color("#30363d")
@@ -957,19 +994,19 @@ def generate_debug_figure_spike_process(
     if np.any(m_top):
         ax2_bot.plot(bin_centers[m_top] + 180.0, median_res_flx[m_top], color="#e3b341", linestyle=":", linewidth=1.3, alpha=0.75, label=r"Opposing $0^\circ\to 180^\circ$ Reflected", zorder=3)
 
-    first_theo_bot = True
-    for ang in base_spike_angles:
+    first_prim_bot = True
+    for ang in primary_spike_angles:
         if 180.0 <= ang <= 360.0:
-            lbl = "Theoretical Rays" if first_theo_bot else None
-            ax2_bot.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
-            first_theo_bot = False
+            lbl = "Primary Peaks (12)" if first_prim_bot else None
+            ax2_bot.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.85, zorder=2, label=lbl)
+            first_prim_bot = False
 
-    first_ref_bot = True
-    for ang in refined_spike_angles:
+    first_sec_bot = True
+    for ang in secondary_spike_angles:
         if 180.0 <= ang <= 360.0:
-            lbl = "Corrected Rays" if first_ref_bot else None
+            lbl = f"Secondary Peaks ({len(secondary_spike_angles)})" if first_sec_bot else None
             ax2_bot.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
-            first_ref_bot = False
+            first_sec_bot = False
 
     ax2_bot.set_xlim(180.0, 360.0)
     ax2_bot.set_xticks(np.arange(180, 361, 30))

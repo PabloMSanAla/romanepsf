@@ -12,6 +12,7 @@ from romanepsf.masking import (
     build_2d_radial_profile_model,
     create_geometric_spike_mask,
     detect_morphological_spikes,
+    detect_spike_peaks_from_profile,
     fit_moffat_model,
     fit_sersic_model,
     fit_sersic_astrophot,
@@ -813,6 +814,82 @@ class TestRadialProfileMaskingAndConnectedComponents:
         assert not final_mask[50, 50]
         # Core region preserved
         assert np.all(~final_mask[r <= 3.0])
+
+
+class TestDetectSpikePeaksFromProfile:
+    """Unit tests for empirical spike detection on the intensity vs theta profile."""
+
+    def test_detect_12_primary_and_secondary_peaks(self):
+        """Verify that 12 primary peaks and prominent secondary peaks are detected."""
+        angles = np.linspace(0.5, 359.5, 360)
+        # Background with small noise
+        flx = np.random.RandomState(42).randn(360) * 0.02
+
+        # 12 primary spike angles (Roman 6 opposing pairs)
+        prim_true = np.array([13, 49, 74, 111, 134, 168, 193, 229, 254, 291, 314, 348])
+        for a in prim_true:
+            flx[a] += 2.5
+
+        # 4 secondary peaks
+        sec_true = np.array([25, 80, 205, 260])
+        for a in sec_true:
+            flx[a] += 0.5
+
+        prim_detected, sec_detected = detect_spike_peaks_from_profile(
+            bin_centers=angles,
+            profile_flx=flx,
+            n_primary=12,
+            min_distance_deg=5.0,
+        )
+
+        assert len(prim_detected) == 12
+        # Verify detected primary angles match true injected angles within bin resolution (1 deg)
+        for true_a in prim_true:
+            assert np.any(np.isclose(prim_detected, angles[true_a], atol=1.5))
+
+        # Verify secondary peaks detected
+        assert len(sec_detected) >= 2
+        for true_s in sec_true:
+            assert np.any(np.isclose(sec_detected, angles[true_s], atol=1.5))
+
+    def test_empty_or_nan_profile_handled_gracefully(self):
+        """Verify empty and all-NaN inputs return empty arrays without crashing."""
+        p_emp, s_emp = detect_spike_peaks_from_profile(np.array([]), np.array([]))
+        assert len(p_emp) == 0 and len(s_emp) == 0
+
+        p_nan, s_nan = detect_spike_peaks_from_profile(np.linspace(0.5, 359.5, 360), np.full(360, np.nan))
+        assert len(p_nan) == 0 and len(s_nan) == 0
+
+    def test_mask_contaminants_spike_details_contains_detected_peaks(self):
+        """Verify mask_contaminants_with_spikes_protected returns profile peak details."""
+        sz = 101
+        cx, cy = 50.0, 50.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        stamp = (100.0 * np.exp(-r**2 / (2 * 2.0**2))).astype(np.float32)
+
+        # Inject 12 spike rays
+        angles = np.radians([15, 50, 75, 110, 135, 170, 195, 230, 255, 290, 315, 350])
+        for ang in angles:
+            for dist in range(6, 45):
+                px = int(round(cx + dist * np.cos(ang)))
+                py = int(round(cy + dist * np.sin(ang)))
+                if 0 <= px < sz and 0 <= py < sz:
+                    stamp[py, px] += 15.0
+
+        mask, prot, res, details = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="bright",
+            method="radial_profile",
+            return_spike_details=True,
+        )
+
+        assert "primary_spike_angles" in details
+        assert "secondary_spike_angles" in details
+        assert len(details["primary_spike_angles"]) > 0
+        assert "corrected_spike_mask" in details
+        assert np.any(details["corrected_spike_mask"])
+
 
 
 

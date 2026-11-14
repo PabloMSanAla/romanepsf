@@ -218,6 +218,101 @@ def refine_spike_angles(
     return np.sort(np.unique(refined))
 
 
+def detect_spike_peaks_from_profile(
+    bin_centers: np.ndarray,
+    profile_flx: np.ndarray,
+    n_primary: int = 12,
+    min_distance_deg: float = 5.0,
+    min_prominence_sigma: float = 1.5,
+    secondary_threshold_sigma: float = 2.5,
+    min_relative_secondary_height: float = 0.05,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Empirically detect diffraction spike angles by finding peaks on the azimuthal intensity profile.
+
+    Instead of relying on theoretical telescope spider geometry, detects peaks directly
+    from the full-image azimuthal median profile:
+    1. Identifies the n_primary largest peaks (nominally 12 for Roman's 6 struts).
+    2. Identifies secondary peaks corresponding to second-order diffraction features.
+
+    Parameters
+    ----------
+    bin_centers : np.ndarray
+        Array of theta bin center angles in degrees in [0, 360).
+    profile_flx : np.ndarray
+        Azimuthal intensity profile values across bins.
+    n_primary : int, default 12
+        Target number of primary spike peaks to select.
+    min_distance_deg : float, default 5.0
+        Minimum angular separation in degrees between adjacent peaks.
+    min_prominence_sigma : float, default 1.5
+        Prominence threshold in units of MAD noise to qualify as a valid peak.
+    secondary_threshold_sigma : float, default 2.5
+        Threshold above median background (in units of MAD) for secondary peaks.
+    min_relative_secondary_height : float, default 0.05
+        Minimum relative height of secondary peaks relative to the highest primary peak.
+
+    Returns
+    -------
+    primary_angles : np.ndarray
+        Sorted array of the largest detected peak angles in degrees (up to n_primary).
+    secondary_angles : np.ndarray
+        Sorted array of secondary peak angles in degrees.
+    """
+    if len(bin_centers) == 0 or len(profile_flx) == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    valid_mask = np.isfinite(profile_flx)
+    if not np.any(valid_mask):
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    clean = np.nan_to_num(profile_flx, nan=0.0)
+    valid_vals = profile_flx[valid_mask]
+    med_val = float(np.median(valid_vals))
+    mad_val = float(1.4826 * np.median(np.abs(valid_vals - med_val)))
+    if mad_val <= 0.0:
+        mad_val = float(np.std(valid_vals)) if len(valid_vals) > 1 else 1.0
+        if mad_val <= 0.0:
+            mad_val = 0.01
+
+    step = float(bin_centers[1] - bin_centers[0]) if len(bin_centers) > 1 else 1.0
+    dist_bins = max(int(round(min_distance_deg / step)), 1)
+    pad_len = dist_bins * 3
+    padded = np.pad(clean, pad_len, mode="wrap")
+
+    prom_min = max(min_prominence_sigma * mad_val, 0.005)
+    peaks, props = find_peaks(padded, distance=dist_bins, prominence=prom_min)
+    unpadded = peaks - pad_len
+    valid = (unpadded >= 0) & (unpadded < len(bin_centers))
+    p_idx = unpadded[valid]
+    p_height = clean[p_idx]
+
+    if len(p_idx) == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    sort_order = np.argsort(p_height)[::-1]
+    sorted_p_idx = p_idx[sort_order]
+
+    n_top = min(n_primary, len(sorted_p_idx))
+    primary_idx = sorted_p_idx[:n_top]
+    primary_angles = np.sort(np.unique(np.round(bin_centers[primary_idx], 2)))
+
+    max_prim_height = float(np.max(clean[primary_idx])) if n_top > 0 else 1.0
+
+    if len(sorted_p_idx) > n_top:
+        sec_candidates = sorted_p_idx[n_top:]
+        sec_thresh = max(
+            med_val + secondary_threshold_sigma * mad_val,
+            med_val + min_relative_secondary_height * (max_prim_height - med_val),
+        )
+        sec_valid = clean[sec_candidates] > sec_thresh
+        secondary_angles = np.sort(np.unique(np.round(bin_centers[sec_candidates[sec_valid]], 2)))
+    else:
+        secondary_angles = np.array([], dtype=np.float64)
+
+    return primary_angles, secondary_angles
+
+
 def create_geometric_spike_mask(
     shape: Tuple[int, int],
     center: Tuple[float, float],
@@ -2289,29 +2384,30 @@ def mask_contaminants_with_spikes_protected(
             core_exclusion_radius_px=core_protection_radius_px,
         )
 
-    # Resolve base spike angles (theoretical dual-12 rays)
+    # Resolve fallback theoretical spike angles if empirical detection finds 0 peaks
     spike_order = getattr(spikes_cfg, "spike_order", None)
     if spike_order is not None and str(spike_order).lower() in ("both", "all", "combined"):
-        base_spike_angles = get_all_spike_angles(net_rotation)
+        fallback_spike_angles = get_all_spike_angles(net_rotation)
     elif spike_order is not None and str(spike_order).lower() in ("primary", "1"):
-        base_spike_angles = get_theoretical_spike_angles(net_rotation, order="primary")
+        fallback_spike_angles = get_theoretical_spike_angles(net_rotation, order="primary")
     else:
         order_to_use = spike_order if spike_order is not None else "secondary"
-        base_spike_angles = get_theoretical_spike_angles(net_rotation, order=order_to_use)
+        fallback_spike_angles = get_theoretical_spike_angles(net_rotation, order=order_to_use)
 
-    # Pre-compute theoretical geometric spike mask (the starting point before empirical refinement)
     theoretical_spike_mask = create_geometric_spike_mask(
         (ny, nx),
         (cx, cy),
-        base_spike_angles,
+        fallback_spike_angles,
         angular_half_width_deg=angular_half_width,
         radial_min=max(core_protection_radius_px, 1.0),
         spike_width_px=spike_width,
         width_growth_rate=effective_growth_rate,
     )
     spike_diagnostic_details: Dict[str, Any] = {
-        "base_spike_angles": base_spike_angles,
-        "refined_spike_angles": base_spike_angles.copy(),
+        "primary_spike_angles": fallback_spike_angles,
+        "secondary_spike_angles": np.array([], dtype=np.float64),
+        "base_spike_angles": fallback_spike_angles,
+        "refined_spike_angles": fallback_spike_angles.copy(),
         "theoretical_spike_mask": theoretical_spike_mask,
         "corrected_spike_mask": theoretical_spike_mask.copy(),
         "morphological_spike_mask": np.zeros((ny, nx), dtype=bool),
@@ -2322,24 +2418,67 @@ def mask_contaminants_with_spikes_protected(
     }
 
     def _build_spike_and_core_protection(res_map: np.ndarray) -> np.ndarray:
-        refined_angles = refine_spike_angles(
-            res_map,
-            (cx, cy),
-            base_spike_angles,
-            search_window_deg=float(getattr(spikes_cfg, "refine_search_window_deg", 3.5)),
-            step_deg=float(getattr(spikes_cfg, "refine_step_deg", 0.5)),
-            r_min=max(core_protection_radius_px, 15.0),
-            r_max=min(max(cx * 0.8, 35.0), 150.0),
+        from romanepsf.profile import measure_angular_profile_torch
+
+        # 1. Measure azimuthal intensity profile vs theta across the full image
+        b_cents, prof = measure_angular_profile_torch(
+            image=res_map,
+            center=(cx, cy),
+            dq_mask=dq_mask,
+            comp_mask=comp_mask,
+            companions=companion_stars if isinstance(companion_stars, list) else None,
+            core_rad=core_protection_radius_px,
+            num_bins=360,
         )
-        geom_mask = create_geometric_spike_mask(
+
+        # 2. Empirically find the 12 largest peaks (primary) and secondary peaks on profile vs theta
+        min_dist_deg = float(getattr(spikes_cfg, "peak_min_distance_deg", 5.0))
+        min_prom_sig = float(getattr(spikes_cfg, "peak_min_prominence_sigma", 1.5))
+        sec_thresh_sig = float(getattr(spikes_cfg, "peak_secondary_threshold_sigma", 2.5))
+        min_rel_h = float(getattr(spikes_cfg, "peak_min_relative_secondary_height", 0.05))
+
+        primary_angles, secondary_angles = detect_spike_peaks_from_profile(
+            bin_centers=b_cents,
+            profile_flx=prof,
+            n_primary=12,
+            min_distance_deg=min_dist_deg,
+            min_prominence_sigma=min_prom_sig,
+            secondary_threshold_sigma=sec_thresh_sig,
+            min_relative_secondary_height=min_rel_h,
+        )
+
+        if len(primary_angles) == 0:
+            primary_angles = fallback_spike_angles
+            all_detected_angles = fallback_spike_angles
+        else:
+            if len(secondary_angles) > 0:
+                all_detected_angles = np.sort(np.unique(np.concatenate([primary_angles, secondary_angles])))
+            else:
+                all_detected_angles = primary_angles
+
+        # 3. Create primary spike mask (12 largest peaks)
+        primary_geom_mask = create_geometric_spike_mask(
             (ny, nx),
             (cx, cy),
-            refined_angles,
+            primary_angles,
             angular_half_width_deg=angular_half_width,
             radial_min=max(core_protection_radius_px, 1.0),
             spike_width_px=spike_width,
             width_growth_rate=effective_growth_rate,
         )
+
+        # 4. Create full geometric spike mask (12 largest + secondary peaks)
+        geom_mask = create_geometric_spike_mask(
+            (ny, nx),
+            (cx, cy),
+            all_detected_angles,
+            angular_half_width_deg=angular_half_width,
+            radial_min=max(core_protection_radius_px, 1.0),
+            spike_width_px=spike_width,
+            width_growth_rate=effective_growth_rate,
+        )
+
+        # 5. Detect morphological spike ridges
         morph_mask = detect_morphological_spikes(
             res_map,
             (cx, cy),
@@ -2348,13 +2487,18 @@ def mask_contaminants_with_spikes_protected(
             dilation_iterations=morph_dil,
         )
         corrected_mask = geom_mask | morph_mask
+
         spike_diagnostic_details.update({
-            "base_spike_angles": base_spike_angles,
-            "refined_spike_angles": refined_angles,
-            "theoretical_spike_mask": theoretical_spike_mask,
+            "primary_spike_angles": primary_angles,
+            "secondary_spike_angles": secondary_angles,
+            "base_spike_angles": primary_angles,
+            "refined_spike_angles": all_detected_angles,
+            "theoretical_spike_mask": primary_geom_mask,
             "corrected_spike_mask": corrected_mask,
             "morphological_spike_mask": morph_mask,
             "geometric_spike_mask": geom_mask,
+            "angular_profile_theta": b_cents,
+            "angular_profile_flux": prof,
             "net_rotation_deg": net_rotation,
             "center": (cx, cy),
             "core_protection_radius_px": core_protection_radius_px,
@@ -2562,6 +2706,7 @@ __all__ = [
     "get_theoretical_spike_angles",
     "get_all_spike_angles",
     "refine_spike_angles",
+    "detect_spike_peaks_from_profile",
     "create_geometric_spike_mask",
     "detect_morphological_spikes",
     "compute_unsharp_mask_residual",
