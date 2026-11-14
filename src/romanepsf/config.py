@@ -116,7 +116,7 @@ class CatalogSection:
     isolation_safety_factor: float = 1.3
     min_dist_arcsec: float = 2.0
     edge_margin_px: int = 50
-    centroid_refine_box_px: int = 5
+    centroid_refine_box_px: int = 25
     roundtrip_tolerance_arcsec: float = 0.5
 
 

@@ -242,3 +242,53 @@ def test_assign_stellar_tiers():
         "faint",   # 13.0 >= 13.0
         "faint",   # 15.2 >= 13.0
     ]
+
+
+def test_refine_stellar_centroids_saturation_binary_mask_vs_gaussian():
+    """Verify adaptive centroiding: binary mask for >10 saturated/DQ pixels, 2D Gaussian for <=10."""
+    from romanepsf.loader import DQ_FLAGS
+    sz = 100
+    img = np.zeros((sz, sz), dtype=np.float32)
+    dq = np.zeros((sz, sz), dtype=np.uint32)
+
+    # Star 1: Unsaturated Gaussian star (0 bad pixels) at (30.4, 30.7)
+    true_x1, true_y1 = 30.4, 30.7
+    gy, gx = np.indices((sz, sz))
+    star1 = 500.0 * np.exp(-((gx - true_x1)**2 + (gy - true_y1)**2) / (2.0 * 1.5**2)) + 5.0
+
+    # Star 2: Saturated star (>10 saturated pixels) with circular saturated mask at (70.2, 70.4)
+    true_x2, true_y2 = 70.2, 70.4
+    sat_core = np.hypot(gx - true_x2, gy - true_y2) <= 3.0  # ~29 pixels
+    dq[sat_core] = DQ_FLAGS["SATURATED"]
+    star2 = np.zeros((sz, sz), dtype=np.float32)
+    star2[sat_core] = 10000.0
+
+    img = star1 + star2
+
+    df = pd.DataFrame({
+        "source_id": [101, 102],
+        "x": [30.0, 70.0],
+        "y": [30.0, 70.0],
+        "mag_lambda": [15.0, 10.0],
+    })
+
+    l2 = RomanL2Data(
+        detector="WFI01", filter_name="F146",
+        data=img, raw_data=img,
+        err=np.ones_like(img), dq=dq,
+        wcs=None, pa_aperture=0.0, pixel_scale=0.11, conversion_factor=1.0, pixel_area=2.8e-13,
+        zp_ab=26.8, meta={}, is_calibrated=True,
+    )
+
+    refined = refine_stellar_centroids(l2, df, box_radius=25)
+
+    # Star 1: <=10 flagged -> 2d_gaussian
+    assert refined["centroid_method"].iloc[0] == "2d_gaussian"
+    assert refined["x"].iloc[0] == pytest.approx(true_x1, abs=0.05)
+    assert refined["y"].iloc[0] == pytest.approx(true_y1, abs=0.05)
+
+    # Star 2: >10 flagged -> binary_mask
+    assert refined["centroid_method"].iloc[1] == "binary_mask"
+    assert refined["x"].iloc[1] == pytest.approx(true_x2, abs=0.25)
+    assert refined["y"].iloc[1] == pytest.approx(true_y2, abs=0.25)
+
