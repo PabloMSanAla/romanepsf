@@ -518,9 +518,10 @@ def process_star_stamps(
             det_id = getattr(l2_data, "detector", None)
             bp_id = getattr(l2_data, "filter_name", "F146")
             res_map = None
+            spike_diag = None
             if mask_contaminants_with_spikes_protected is not None:
                 if spikes_cfg is not None:
-                    mask, _, res_map = mask_contaminants_with_spikes_protected(
+                    res_tuple = mask_contaminants_with_spikes_protected(
                         flux_cutout,
                         dq_mask_bool,
                         pa_aperture=roll_ref,
@@ -533,9 +534,10 @@ def process_star_stamps(
                         detector=det_id,
                         bandpass=bp_id,
                         var_poisson=raw_vp,
+                        return_spike_details=True,
                     )
                 else:
-                    mask, _, res_map = mask_contaminants_with_spikes_protected(
+                    res_tuple = mask_contaminants_with_spikes_protected(
                         flux_cutout,
                         dq_mask_bool,
                         pa_offset_deg=roll_ref,
@@ -548,7 +550,12 @@ def process_star_stamps(
                         detector=det_id,
                         bandpass=bp_id,
                         var_poisson=raw_vp,
+                        return_spike_details=True,
                     )
+                if len(res_tuple) == 4:
+                    mask, _, res_map, spike_diag = res_tuple
+                else:
+                    mask, _, res_map = res_tuple
             else:
                 mask = dq_mask_bool | (~np.isfinite(flux_cutout))
 
@@ -613,6 +620,7 @@ def process_star_stamps(
                 "pixel_scale": pixel_scale,
                 "gaia_companions": stamp_companions,
                 "dq_mask": dq_mask_bool,
+                "spike_details": spike_diag,
             }
 
             stamp_obj = StellarStamp(

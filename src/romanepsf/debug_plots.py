@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
+from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Patch
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
@@ -720,6 +721,231 @@ def generate_debug_figure5_final_profile(
     return output_path
 
 
+def generate_debug_figure_spike_process(
+    stamp: np.ndarray,
+    residual: np.ndarray,
+    output_path: Union[str, Path],
+    conversion_factor: float = 1.0,
+    star_info: Optional[Dict[str, Any]] = None,
+    is_calibrated: bool = True,
+    center_xy: Optional[Tuple[float, float]] = None,
+    theoretical_mask: Optional[np.ndarray] = None,
+    corrected_mask: Optional[np.ndarray] = None,
+    base_spike_angles: Optional[Sequence[float]] = None,
+    refined_spike_angles: Optional[Sequence[float]] = None,
+) -> Path:
+    """
+    Generate 3-panel spike process diagnostic figure when running with --debug X:
+    1. Calibrated Image + Theoretical Spike Mask (the starting point before empirical refinement).
+    2. Residual Image + Corrected Spike Mask (the empirical refined mask with morphological dilation).
+    3. Plot of Intensity vs Angular Distribution (azimuthal profile of annular flux across theta in [0, 360] deg),
+       annotated with theoretical and corrected spike ray directions.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    info = star_info or {}
+    source_id = str(info.get("source_id", "Star"))
+    tier = str(info.get("tier", "unknown")).upper()
+    mag = float(info.get("mag", 0.0))
+    dq_mask = info.get("dq_mask", None)
+
+    ny, nx = stamp.shape
+    if center_xy is not None:
+        cx, cy = float(center_xy[0]), float(center_xy[1])
+    else:
+        cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
+
+    core_rad = float(info.get("core_protection_radius_px", 6.0 if tier == "BRIGHT" else (4.0 if tier == "MEDIUM" else 3.0)))
+
+    spike_details = info.get("spike_details", {}) or {}
+    if base_spike_angles is None:
+        base_spike_angles = spike_details.get("base_spike_angles", None)
+    if refined_spike_angles is None:
+        refined_spike_angles = spike_details.get("refined_spike_angles", None)
+    if theoretical_mask is None:
+        theoretical_mask = spike_details.get("theoretical_spike_mask", None)
+    if corrected_mask is None:
+        corrected_mask = spike_details.get("corrected_spike_mask", None)
+
+    # Fallback calculation if spike_details not provided
+    from romanepsf.masking import (
+        get_theoretical_spike_angles,
+        refine_spike_angles,
+        create_geometric_spike_mask,
+        detect_morphological_spikes,
+    )
+    if base_spike_angles is None or len(base_spike_angles) == 0:
+        base_spike_angles = get_theoretical_spike_angles(0.0, detector_offset_deg=-9.70)
+    if refined_spike_angles is None or len(refined_spike_angles) == 0:
+        refined_spike_angles = refine_spike_angles(residual, (cx, cy), base_spike_angles, r_min=max(core_rad, 15.0))
+    if theoretical_mask is None or not np.any(theoretical_mask):
+        theoretical_mask = create_geometric_spike_mask((ny, nx), (cx, cy), base_spike_angles, radial_min=core_rad)
+    if corrected_mask is None or not np.any(corrected_mask):
+        corr_geom = create_geometric_spike_mask((ny, nx), (cx, cy), refined_spike_angles, radial_min=core_rad)
+        corr_morph = detect_morphological_spikes(residual, (cx, cy), threshold_sigma=2.0)
+        corrected_mask = corr_geom | corr_morph
+
+    # Magnitude conversions in AB mag / arcsec^2
+    mag_img = convert_to_ab_mag_arcsec2(stamp, conversion_factor, is_calibrated)
+    mag_res = convert_to_ab_mag_arcsec2(np.abs(residual), conversion_factor, is_calibrated)
+
+    valid_mags = mag_img[np.isfinite(mag_img)]
+    if len(valid_mags) > 0:
+        vmin = max(float(np.nanpercentile(valid_mags, 0.5)), 8.0)
+        vmax = min(float(np.nanpercentile(valid_mags, 99.5)), 28.5)
+    else:
+        vmin, vmax = 12.0, 28.0
+    if vmin >= vmax:
+        vmax = vmin + 5.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(22, 6.5), facecolor="#0e1117")
+    cmap = plt.cm.magma_r.copy()
+    try:
+        cmap = cmap.with_extremes(bad="#1a1e24")
+    except AttributeError:
+        cmap.set_bad(color="#1a1e24")
+
+    # Panel 1: Image + Theoretical Spike Mask
+    ax0 = axes[0]
+    ax0.set_facecolor("#161b22")
+    im0 = ax0.imshow(mag_img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    if theoretical_mask is not None and np.any(theoretical_mask):
+        overlay_theo = np.zeros((ny, nx, 4), dtype=np.float32)
+        overlay_theo[theoretical_mask.astype(bool)] = [0.0, 0.85, 1.0, 0.50]  # Cyan overlay
+        ax0.imshow(overlay_theo, origin="lower")
+
+    max_ray_len = min(nx, ny) * 0.48
+    r_start = max(core_rad, 4.0)
+    for ang in base_spike_angles:
+        rad = np.radians(ang)
+        ax0.plot(
+            [cx + r_start * np.cos(rad), cx + max_ray_len * np.cos(rad)],
+            [cy + r_start * np.sin(rad), cy + max_ray_len * np.sin(rad)],
+            linestyle="--",
+            color="#58a6ff",
+            linewidth=1.2,
+            alpha=0.85,
+        )
+    ax0.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
+    ax0.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
+    ax0.set_title("1. Calibrated Image + Theoretical Mask\n(Starting Point: Nominal Roll & Spider Prior)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
+    ax0.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
+    ax0.set_ylabel("Y (pixels)", color="#e6edf3", fontsize=10)
+    ax0.tick_params(colors="#8b949e", labelsize=9)
+    for s in ax0.spines.values():
+        s.set_color("#30363d")
+    leg0 = [
+        Patch(facecolor=(0.0, 0.85, 1.0, 0.5), edgecolor="#00e5ff", label="Theoretical Mask"),
+        Line2D([], [], color="#58a6ff", linestyle="--", linewidth=1.2, label=f"Theoretical Rays ({len(base_spike_angles)})"),
+        Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"),
+    ]
+    ax0.legend(handles=leg0, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+
+    # Panel 2: Residual + Corrected Spike Mask
+    ax1 = axes[1]
+    ax1.set_facecolor("#161b22")
+    im1 = ax1.imshow(mag_res, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+    if corrected_mask is not None and np.any(corrected_mask):
+        overlay_corr = np.zeros((ny, nx, 4), dtype=np.float32)
+        overlay_corr[corrected_mask.astype(bool)] = [1.0, 0.35, 0.15, 0.50]  # Coral overlay
+        ax1.imshow(overlay_corr, origin="lower")
+
+    for ang in refined_spike_angles:
+        rad = np.radians(ang)
+        ax1.plot(
+            [cx + r_start * np.cos(rad), cx + max_ray_len * np.cos(rad)],
+            [cy + r_start * np.sin(rad), cy + max_ray_len * np.sin(rad)],
+            linestyle="-",
+            color="#ff7b72",
+            linewidth=1.4,
+            alpha=0.9,
+        )
+    ax1.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
+    ax1.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
+    ax1.set_title("2. Residual Image + Corrected Spike Mask\n(Refined Empirical Ridges & Morphological Spikes)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
+    ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
+    ax1.tick_params(colors="#8b949e", labelsize=9)
+    for s in ax1.spines.values():
+        s.set_color("#30363d")
+    leg1 = [
+        Patch(facecolor=(1.0, 0.35, 0.15, 0.5), edgecolor="#ff7b72", label="Corrected Mask"),
+        Line2D([], [], color="#ff7b72", linestyle="-", linewidth=1.4, label=f"Refined Rays ({len(refined_spike_angles)})"),
+        Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"),
+    ]
+    ax1.legend(handles=leg1, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+
+    # Add colorbar for Panels 1 & 2
+    cbar = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar.set_label("Surface Brightness (AB mag / arcsec$^2$)", color="#e6edf3", fontsize=9.5, labelpad=8)
+    cbar.ax.tick_params(colors="#8b949e", labelsize=8.5)
+    cbar.ax.invert_yaxis()
+
+    # Panel 3: Intensity vs Angular Distribution
+    ax2 = axes[2]
+    ax2.set_facecolor("#161b22")
+    r_inner = max(core_rad, 15.0)
+    r_outer = min(0.85 * min(cx, cy, nx - 1 - cx, ny - 1 - cy), 90.0)
+    if r_outer <= r_inner + 5.0:
+        r_inner = max(core_rad, 5.0)
+        r_outer = max(r_inner + 8.0, min(cx, 30.0))
+
+    gy, gx = np.ogrid[:ny, :nx]
+    r_map = np.hypot(gx - cx, gy - cy)
+    theta_map = np.degrees(np.arctan2(gy - cy, gx - cx)) % 360.0
+    ann_mask = (r_map >= r_inner) & (r_map <= r_outer) & np.isfinite(residual)
+    if dq_mask is not None:
+        ann_mask &= (~dq_mask.astype(bool))
+
+    bin_edges = np.linspace(0.0, 360.0, 361)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    bin_idx = np.digitize(theta_map[ann_mask], bin_edges) - 1
+
+    median_res_flx = np.zeros(360, dtype=np.float32)
+    median_raw_flx = np.zeros(360, dtype=np.float32)
+    for b in range(360):
+        in_bin = (bin_idx == b)
+        if np.any(in_bin):
+            median_res_flx[b] = float(np.median(residual[ann_mask][in_bin]))
+            median_raw_flx[b] = float(np.median(stamp[ann_mask][in_bin]))
+
+    # Plot residual curve with shaded region
+    ax2.plot(bin_centers, median_res_flx, color="#ffffff", linewidth=1.8, label=f"Residual Flux (Annulus {r_inner:.0f}-{r_outer:.0f}px)", zorder=4)
+    ax2.fill_between(bin_centers, 0, np.maximum(median_res_flx, 0), color="#58a6ff", alpha=0.25, zorder=3)
+
+    # Plot theoretical vs refined spike lines
+    for i, ang in enumerate(base_spike_angles):
+        lbl = "Theoretical Rays" if i == 0 else None
+        ax2.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
+
+    for i, ang in enumerate(refined_spike_angles):
+        lbl = "Corrected / Refined Rays" if i == 0 else None
+        ax2.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
+
+    ax2.set_xlim(0, 360)
+    ax2.set_xticks(np.arange(0, 361, 45))
+    ax2.set_xlabel(r"Azimuthal Angle $\theta$ (degrees)", color="#e6edf3", fontsize=10)
+    ax2.set_ylabel("Annular Intensity / Flux (MJy/sr)", color="#e6edf3", fontsize=10)
+    ax2.set_title(r"3. Intensity vs Angular Distribution" + f"\n(Annulus $r \\in [{r_inner:.0f}, {r_outer:.0f}]$ px)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
+    ax2.tick_params(colors="#8b949e", labelsize=9)
+    for s in ax2.spines.values():
+        s.set_color("#30363d")
+    ax2.grid(True, color="#30363d", linestyle=":", alpha=0.6)
+    ax2.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+
+    fig.suptitle(
+        f"Diffraction Spike Refinement Diagnostic — {tier} Star {source_id} (Mag={mag:.2f})",
+        color="#ffffff",
+        fontsize=13.5,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    fig.savefig(str(output_path), dpi=200, bbox_inches="tight", facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    logger.info(f"Generated Spike Process Debug Figure: {output_path}")
+    return output_path
+
+
 def generate_all_debug_plots(
     pooled_stamps: Dict[str, List[Any]],
     composite_epsf: np.ndarray,
@@ -815,6 +1041,7 @@ def generate_all_debug_plots(
             "pixel_scale": dbg.get("pixel_scale", 0.11),
             "gaia_detector_xy": dbg.get("gaia_detector_xy", None),
             "meas_detector_xy": dbg.get("meas_detector_xy", None),
+            "spike_details": dbg.get("spike_details", None),
         }
 
         # Measure 1D profile for the star stamp
@@ -890,6 +1117,18 @@ def generate_all_debug_plots(
             output_path=fig3_star_path,
         )
 
+        # Generate Spike Process Diagnostic Figure per star
+        fig_spike_star_path = debug_dir / f"debug_spike_process_{tier_name}_{sid}.png"
+        generate_debug_figure_spike_process(
+            stamp=stamp_img,
+            residual=res_map,
+            output_path=fig_spike_star_path,
+            conversion_factor=conv,
+            star_info=star_meta,
+            is_calibrated=is_cal,
+            center_xy=center_xy,
+        )
+
         # Canonical / representative assignment
         if idx == representative_star_idx:
             fig1_canon = debug_dir / "debug_1_masking_procedure.png"
@@ -919,6 +1158,30 @@ def generate_all_debug_plots(
                 center_xy=center_xy,
             )
             generated_files["debug_2_apertures_and_profile"] = fig2_canon
+
+            fig_spike_canon = debug_dir / "debug_spike_process.png"
+            generate_debug_figure_spike_process(
+                stamp=stamp_img,
+                residual=res_map,
+                output_path=fig_spike_canon,
+                conversion_factor=conv,
+                star_info=star_meta,
+                is_calibrated=is_cal,
+                center_xy=center_xy,
+            )
+            generated_files["debug_spike_process"] = fig_spike_canon
+
+            fig6_canon = debug_dir / "debug_6_spike_process.png"
+            generate_debug_figure_spike_process(
+                stamp=stamp_img,
+                residual=res_map,
+                output_path=fig6_canon,
+                conversion_factor=conv,
+                star_info=star_meta,
+                is_calibrated=is_cal,
+                center_xy=center_xy,
+            )
+            generated_files["debug_6_spike_process"] = fig6_canon
 
     # Figure 3: Multi-Star Composite Normalization Summary
     fig3_path = debug_dir / "debug_3_profile_normalization.png"
@@ -966,5 +1229,6 @@ __all__ = [
     "generate_debug_figure3_profile_normalization",
     "generate_debug_figure4_model_psf",
     "generate_debug_figure5_final_profile",
+    "generate_debug_figure_spike_process",
     "generate_all_debug_plots",
 ]

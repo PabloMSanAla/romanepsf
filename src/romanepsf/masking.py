@@ -2117,7 +2117,8 @@ def mask_contaminants_with_spikes_protected(
     var_poisson: Optional[np.ndarray] = None,
     n_iterations: int = 2,
     contaminant_detector: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return_spike_details: bool = False,
+) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
 
@@ -2254,6 +2255,20 @@ def mask_contaminants_with_spikes_protected(
         if dq_mask is not None:
             final_mask |= dq_mask
         final_mask |= (~np.isfinite(stamp))
+        if return_spike_details:
+            faint_details = {
+                "base_spike_angles": np.array([], dtype=float),
+                "refined_spike_angles": np.array([], dtype=float),
+                "theoretical_spike_mask": np.zeros(stamp.shape, dtype=bool),
+                "corrected_spike_mask": np.zeros(stamp.shape, dtype=bool),
+                "morphological_spike_mask": np.zeros(stamp.shape, dtype=bool),
+                "geometric_spike_mask": np.zeros(stamp.shape, dtype=bool),
+                "net_rotation_deg": float(pa_offset_deg or 0.0),
+                "center": (cx, cy),
+                "core_protection_radius_px": core_protection_radius_px,
+            }
+        if return_spike_details:
+            return final_mask, protected_stellar_area, residual, faint_details
         return final_mask, protected_stellar_area, residual
 
     # Dynamic central saturation detection: expand core protection if central pixels are NaN
@@ -2284,6 +2299,28 @@ def mask_contaminants_with_spikes_protected(
         order_to_use = spike_order if spike_order is not None else "secondary"
         base_spike_angles = get_theoretical_spike_angles(net_rotation, order=order_to_use)
 
+    # Pre-compute theoretical geometric spike mask (the starting point before empirical refinement)
+    theoretical_spike_mask = create_geometric_spike_mask(
+        (ny, nx),
+        (cx, cy),
+        base_spike_angles,
+        angular_half_width_deg=angular_half_width,
+        radial_min=max(core_protection_radius_px, 1.0),
+        spike_width_px=spike_width,
+        width_growth_rate=effective_growth_rate,
+    )
+    spike_diagnostic_details: Dict[str, Any] = {
+        "base_spike_angles": base_spike_angles,
+        "refined_spike_angles": base_spike_angles.copy(),
+        "theoretical_spike_mask": theoretical_spike_mask,
+        "corrected_spike_mask": theoretical_spike_mask.copy(),
+        "morphological_spike_mask": np.zeros((ny, nx), dtype=bool),
+        "geometric_spike_mask": theoretical_spike_mask.copy(),
+        "net_rotation_deg": net_rotation,
+        "center": (cx, cy),
+        "core_protection_radius_px": core_protection_radius_px,
+    }
+
     def _build_spike_and_core_protection(res_map: np.ndarray) -> np.ndarray:
         refined_angles = refine_spike_angles(
             res_map,
@@ -2310,7 +2347,19 @@ def mask_contaminants_with_spikes_protected(
             min_length_px=morph_length,
             dilation_iterations=morph_dil,
         )
-        return geom_mask | morph_mask | (r <= core_protection_radius_px)
+        corrected_mask = geom_mask | morph_mask
+        spike_diagnostic_details.update({
+            "base_spike_angles": base_spike_angles,
+            "refined_spike_angles": refined_angles,
+            "theoretical_spike_mask": theoretical_spike_mask,
+            "corrected_spike_mask": corrected_mask,
+            "morphological_spike_mask": morph_mask,
+            "geometric_spike_mask": geom_mask,
+            "net_rotation_deg": net_rotation,
+            "center": (cx, cy),
+            "core_protection_radius_px": core_protection_radius_px,
+        })
+        return corrected_mask | (r <= core_protection_radius_px)
 
     # Resolve contaminant detector ('erosion_dilation' or 'mto2')
     if contaminant_detector is None:
@@ -2407,6 +2456,8 @@ def mask_contaminants_with_spikes_protected(
             final_mask |= dq_mask
         final_mask |= (~np.isfinite(stamp))
 
+        if return_spike_details:
+            return final_mask, protected_stellar_area, residual, spike_diagnostic_details
         return final_mask, protected_stellar_area, residual
 
     elif method_lower == "mto2":
@@ -2498,6 +2549,8 @@ def mask_contaminants_with_spikes_protected(
         final_mask |= dq_mask
     final_mask |= (~np.isfinite(stamp))
 
+    if return_spike_details:
+        return final_mask, protected_stellar_area, residual, spike_diagnostic_details
     return final_mask, protected_stellar_area, residual
 
 
