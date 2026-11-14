@@ -275,6 +275,7 @@ def process_single_detector_stamps(
             catalog_df=tiered,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
+            companion_stars=refined,
         )
         t_stamps = time.perf_counter() - t_stamps_start
 
@@ -587,6 +588,7 @@ def run_single_detector(
             catalog_df=tiered_df,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
+            companion_stars=refined_df,
         )
 
     finally:
@@ -1035,6 +1037,7 @@ def _sca_file_worker_task(
             catalog_df=tiered,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
+            companion_stars=refined,
         )
 
         n_b = len(stamps_dict.get("bright", []))
