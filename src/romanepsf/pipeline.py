@@ -195,6 +195,15 @@ def process_single_detector_stamps(
         empty_stamps: Dict[str, List[StellarStamp]] = {"bright": [], "medium": [], "faint": []}
 
         if cand.empty:
+            cand = query_gaia_for_detector(
+                l2_data=l2_data,
+                mag_limit=20.0,
+                cache_dir=cfg.data.cache_dir,
+                precomputed_catalog=None,
+                mag_col=cfg.catalog.mag_col,
+            )
+
+        if cand.empty:
             return det_name, empty_stamps, {
                 "detector": det_name.upper(),
                 "faint": 0, "medium": 0, "bright": 0, "total": 0,
@@ -472,8 +481,10 @@ def run_single_detector(
     # 5. Resolve Source Catalog Path
     if catalog_path is not None:
         resolved_catalog_path = Path(catalog_path)
-    else:
+    elif cfg.data.catalog_path is not None:
         resolved_catalog_path = Path(cfg.data.catalog_path)
+    else:
+        resolved_catalog_path = None
 
     # 6. Lazy Load and Calibrate L2 ASDF Image
     logger.info(f"Loading Level 2 ASDF image: {resolved_asdf_path}")
@@ -487,7 +498,7 @@ def run_single_detector(
         filter_name = str(l2_data.filter_name)
 
         # 7. Spatial Catalog Pre-Filtering using Detector Sky Bounds
-        if resolved_catalog_path.is_file():
+        if resolved_catalog_path is not None and resolved_catalog_path.is_file():
             logger.info(f"Ingesting precomputed master catalog from: {resolved_catalog_path}")
             raw_df = pd.read_csv(resolved_catalog_path, low_memory=False)
             clean_df = sanitize_source_catalog(raw_df, mag_col=cfg.catalog.mag_col)
@@ -503,7 +514,7 @@ def run_single_detector(
             ].copy()
         else:
             logger.info(
-                f"Precomputed catalog not found at {resolved_catalog_path}. "
+                f"No precomputed catalog provided or found. "
                 f"Querying Gaia DR3 for {resolved_detector.upper()}..."
             )
             sub_df = query_gaia_for_detector(
@@ -738,12 +749,20 @@ def run_pipeline(
         f"Starting pipeline execution across {len(det_map)} detector(s): {list(det_map.keys())}"
     )
 
-    # 2. Ingest Master Catalog once
-    logger.info(f"Loading master source catalog from: {cfg.data.catalog_path}")
-    raw_df = pd.read_csv(cfg.data.catalog_path, low_memory=False)
-    cat_df = sanitize_source_catalog(raw_df, mag_col=cfg.catalog.mag_col)
-    del raw_df
-    gc.collect()
+    # 2. Ingest Master Catalog if available
+    has_master = (
+        cfg.data.catalog_path is not None
+        and Path(cfg.data.catalog_path).is_file()
+    )
+    if has_master:
+        logger.info(f"Loading master source catalog from: {cfg.data.catalog_path}")
+        raw_df = pd.read_csv(cfg.data.catalog_path, low_memory=False)
+        cat_df = sanitize_source_catalog(raw_df, mag_col=cfg.catalog.mag_col)
+        del raw_df
+        gc.collect()
+    else:
+        logger.info("No master catalog provided (catalog_path is None). Querying Gaia DR3 dynamically...")
+        cat_df = pd.DataFrame()
 
     # 3. Sequential Extraction Loop with Strict Per-Detector Garbage Collection
     pooled_stamps: Dict[str, List[StellarStamp]] = {"bright": [], "medium": [], "faint": []}
@@ -1204,7 +1223,7 @@ def run_sca_batch_pipeline(
             str(f),
             target_sca,
             str(resolved_hpx_dir),
-            str(resolved_cfg.data.catalog_path) if resolved_cfg.data.catalog_path.is_file() else None,
+            str(resolved_cfg.data.catalog_path) if (resolved_cfg.data.catalog_path and resolved_cfg.data.catalog_path.is_file()) else None,
             resolved_cfg,
             None,
         )

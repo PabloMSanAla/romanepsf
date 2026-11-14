@@ -79,7 +79,7 @@ class EnvironmentSection:
 @dataclass
 class DataSection:
     detectors_dir: Path = field(default_factory=lambda: Path("/Users/pmsanch1/storage/ROMAN/simulated_comissioning/PID1083/detectors"))
-    catalog_path: Path = field(default_factory=lambda: Path("/Users/pmsanch1/storage/ROMAN/simulated_comissioning/PID1083/detectors/code/r0108301001001001001_0001_wfi_source_catalog.csv"))
+    catalog_path: Optional[Path] = field(default_factory=lambda: Path("/Users/pmsanch1/storage/ROMAN/simulated_comissioning/PID1083/detectors/code/r0108301001001001001_0001_wfi_source_catalog.csv"))
     output_dir: Path = field(default_factory=lambda: Path("output"))
     cache_dir: Path = field(default_factory=lambda: Path("cache"))
     gaia_cache_dir: Path = field(default_factory=lambda: Path("cache/gaia_healpix"))
@@ -91,7 +91,9 @@ class DataSection:
     def __post_init__(self):
         if isinstance(self.detectors_dir, str):
             self.detectors_dir = Path(self.detectors_dir)
-        if isinstance(self.catalog_path, str):
+        if self.catalog_path is not None and str(self.catalog_path).strip().lower() in ["none", "null", ""]:
+            self.catalog_path = None
+        elif isinstance(self.catalog_path, str):
             self.catalog_path = Path(self.catalog_path)
         if isinstance(self.output_dir, str):
             self.output_dir = Path(self.output_dir)
