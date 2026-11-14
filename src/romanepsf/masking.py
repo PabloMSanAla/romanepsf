@@ -1976,6 +1976,124 @@ def _detect_contaminants_mto2(
     return contaminants
 
 
+def segment_connected_components(binary_mask: np.ndarray) -> Tuple[int, np.ndarray]:
+    """
+    Segment binary mask into distinct integer component IDs using 8-connectivity.
+    Tries cv2.connectedComponents first; falls back to scipy.ndimage.label.
+    """
+    try:
+        import cv2
+        num_labels, labels = cv2.connectedComponents(binary_mask.astype(np.uint8), connectivity=8)
+        return int(num_labels), labels
+    except Exception:
+        from scipy.ndimage import label, generate_binary_structure
+        labels, num_labels = label(binary_mask, structure=generate_binary_structure(2, 2))
+        return int(num_labels), labels
+
+
+def build_2d_radial_profile_model(
+    stamp: np.ndarray,
+    center: Tuple[float, float],
+    dq_mask: Optional[np.ndarray] = None,
+    comp_mask: Optional[np.ndarray] = None,
+    growth_rate: float = 1.03,
+    r_min: float = 0.5,
+    sigma_clip_val: float = 3.0,
+    max_iters: int = 3,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Construct a smooth 2D stellar model from an azimuthal 1D radial profile
+    computed with iterative sigma-clipping in geometric logarithmic annuli.
+
+    Parameters
+    ----------
+    stamp : np.ndarray
+        2D flux array.
+    center : Tuple[float, float]
+        Centroid (cx, cy) of the primary star in stamp coordinates.
+    dq_mask : np.ndarray, optional
+        DQ bad pixel mask (True = bad).
+    comp_mask : np.ndarray, optional
+        Companion star mask (True = companion).
+    growth_rate : float, default 1.03
+        Radial bin geometric growth rate (bin_{k+1} = bin_k * growth_rate).
+    r_min : float, default 0.5
+        Inner radius of the first radial bin.
+    sigma_clip_val : float, default 3.0
+        Sigma clipping threshold for outlier rejection in each annulus.
+    max_iters : int, default 3
+        Maximum iterations for sigma clipping.
+
+    Returns
+    -------
+    model_2d : np.ndarray
+        2D interpolated radial profile model matching stamp.shape.
+    residual : np.ndarray
+        (stamp - model_2d) float32 array.
+    r_map : np.ndarray
+        2D radius coordinate map from center.
+    std_2d : np.ndarray
+        2D azimuthal scatter map matching stamp.shape.
+    """
+    from astropy.stats import sigma_clip, mad_std
+    from romanepsf.profile import get_geometric_radial_bins
+
+    ny, nx = stamp.shape
+    cx, cy = center
+    gy, gx = np.indices((ny, nx))
+    r_map = np.hypot(gx - cx, gy - cy)
+
+    valid_mask = np.isfinite(stamp)
+    if dq_mask is not None:
+        valid_mask &= (~dq_mask)
+    if comp_mask is not None:
+        valid_mask &= (~comp_mask)
+
+    r_max = float(np.hypot(max(cx, nx - 1 - cx), max(cy, ny - 1 - cy))) + 1.0
+    r_max = max(r_max, r_min + 1.0)
+
+    bins = get_geometric_radial_bins(r_min=float(r_min), r_max=float(r_max), growth_rate=float(growth_rate))
+    r_mids = np.sqrt(bins[:-1] * bins[1:])
+
+    f_prof = []
+    s_prof = []
+    for i in range(len(bins) - 1):
+        in_bin = (r_map >= bins[i]) & (r_map < bins[i + 1]) & valid_mask
+        pix = stamp[in_bin]
+        n_valid = len(pix)
+
+        if n_valid >= 4:
+            clipped = sigma_clip(pix, sigma=sigma_clip_val, maxiters=max_iters)
+            c_data = clipped.compressed() if hasattr(clipped, "compressed") else clipped[~clipped.mask]
+            f_prof.append(float(np.median(c_data)) if len(c_data) > 0 else float(np.median(pix)))
+            s_prof.append(float(mad_std(c_data, ignore_nan=True)) if len(c_data) > 1 else float(np.std(pix)))
+        elif n_valid > 0:
+            f_prof.append(float(np.median(pix)))
+            s_prof.append(float(np.std(pix)) if n_valid > 1 else 0.0)
+        else:
+            f_prof.append(np.nan)
+            s_prof.append(np.nan)
+
+    f_arr = np.array(f_prof, dtype=np.float64)
+    s_arr = np.array(s_prof, dtype=np.float64)
+    valid_bins = np.isfinite(f_arr) & (f_arr > 0)
+
+    if np.any(valid_bins):
+        r_v = r_mids[valid_bins]
+        f_v = f_arr[valid_bins]
+        s_v = np.where(np.isfinite(s_arr[valid_bins]), s_arr[valid_bins], 0.0)
+        model_2d = np.interp(r_map, r_v, f_v, left=float(f_v[0]), right=float(f_v[-1])).astype(np.float32)
+        std_2d = np.interp(r_map, r_v, s_v, left=float(s_v[0]), right=float(s_v[-1])).astype(np.float32)
+    else:
+        model_2d = np.zeros_like(stamp, dtype=np.float32)
+        std_2d = np.zeros_like(stamp, dtype=np.float32)
+
+    model_2d = np.maximum(model_2d, 0.0)
+    std_2d = np.maximum(std_2d, 0.0)
+    residual = (stamp - model_2d).astype(np.float32)
+    return model_2d, residual, r_map, std_2d
+
+
 def mask_contaminants_with_spikes_protected(
     stamp: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
@@ -1990,7 +2108,7 @@ def mask_contaminants_with_spikes_protected(
     target_center_xy: Optional[Tuple[float, float]] = None,
     pixel_scale: float = 0.11,
     companion_depth: float = 28.0,
-    method: str = "moffat",
+    method: str = "radial_profile",
     unsharp_sigma: float = 7.0,
     width_growth_rate: Optional[float] = None,
     detector: Optional[Union[str, int]] = None,
@@ -2232,7 +2350,66 @@ def mask_contaminants_with_spikes_protected(
         )
 
     method_lower = str(method).lower().strip()
-    if method_lower == "mto2":
+    if method_lower in ("radial_profile", "radial", "profile", "default"):
+        # 1. Construct 2D radial profile model from sigma-clipped annuli
+        growth_val = effective_growth_rate if (effective_growth_rate is not None and effective_growth_rate > 1.0) else 1.03
+        model_2d, residual, r_map_2d, std_2d = build_2d_radial_profile_model(
+            stamp=stamp,
+            center=(cx, cy),
+            dq_mask=dq_mask,
+            comp_mask=comp_mask,
+            growth_rate=growth_val,
+            r_min=0.5,
+            sigma_clip_val=3.0,
+            max_iters=3,
+        )
+        protected_stellar_area = _build_spike_and_core_protection(residual)
+        core_region = (r_map_2d <= core_protection_radius_px)
+
+        # 2. Contaminant detection via 2-sigma thresholding above background/local residual scatter
+        det_sig = float(detection_sigma) if detection_sigma is not None else 2.0
+        from astropy.stats import mad_std
+        outer_finite = (r_map_2d > (nx // 3)) & np.isfinite(residual) & (~protected_stellar_area)
+        bkg_sigma = float(mad_std(residual[outer_finite], ignore_nan=True)) if np.any(outer_finite) else 0.05
+        effective_sigma = np.maximum(std_2d, bkg_sigma)
+
+        threshold_map = np.maximum(det_sig * effective_sigma, 0.05)
+        contam_raw = (residual > threshold_map) & (~protected_stellar_area) & (~core_region)
+        if dq_mask is not None:
+            contam_raw &= (~dq_mask)
+
+        # 3. Morphological erosion (2x2) then dilation (3x3); retain compact bright peaks
+        contam_opened = binary_erosion(contam_raw, structure=np.ones((2, 2), dtype=bool), iterations=1) | (
+            contam_raw & (residual > 5.0 * effective_sigma)
+        )
+        contam_dilated = binary_dilation(contam_opened, structure=np.ones((3, 3), dtype=bool), iterations=1)
+        cand_mask = contam_dilated.copy()
+
+        # 4. Connected components labeling: eliminate any segmented ID overlapping with protected inner core
+        num_labels, labels = segment_connected_components(cand_mask)
+        if num_labels > 0:
+            overlap_ids = np.unique(labels[core_region])
+            overlap_ids = overlap_ids[overlap_ids > 0]
+            if len(overlap_ids) > 0:
+                cand_mask[np.isin(labels, overlap_ids)] = False
+
+        # Strictly preserve core and diffraction spikes from residual contaminant masking
+        cand_mask[core_region] = False
+        cand_mask[protected_stellar_area] = False
+
+        # 5. Add circular aperture masks for neighbor Gaia companion stars outside inner core
+        if comp_mask is not None:
+            cand_mask |= (comp_mask & (~core_region))
+
+        # 6. Assemble final mask with DQ bad pixels and NaNs
+        final_mask = cand_mask.copy()
+        if dq_mask is not None:
+            final_mask |= dq_mask
+        final_mask |= (~np.isfinite(stamp))
+
+        return final_mask, protected_stellar_area, residual
+
+    elif method_lower == "mto2":
         # MTO2 directly on stamp with unsharp-based spike protection
         residual = compute_unsharp_mask_residual(stamp, sigma=unsharp_sigma, dq_mask=dq_mask)
         protected_stellar_area = _build_spike_and_core_protection(residual)
@@ -2299,9 +2476,21 @@ def mask_contaminants_with_spikes_protected(
         else:
             contaminants = contam_1
 
+    core_region = (r <= core_protection_radius_px)
+    # Connected components core overlap removal for fallback methods
+    num_labels, labels = segment_connected_components(contaminants)
+    if num_labels > 0:
+        overlap_ids = np.unique(labels[core_region])
+        overlap_ids = overlap_ids[overlap_ids > 0]
+        if len(overlap_ids) > 0:
+            contaminants[np.isin(labels, overlap_ids)] = False
+
+    contaminants[core_region] = False
+    contaminants[protected_stellar_area] = False
+
     # 5. Include circular aperture masks for other Gaia stars using get_psf_extension_moffat
     if comp_mask is not None:
-        contaminants |= comp_mask
+        contaminants |= (comp_mask & (~core_region))
 
     # 6. Assemble final mask
     final_mask = contaminants.copy()

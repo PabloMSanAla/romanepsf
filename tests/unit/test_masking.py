@@ -4,10 +4,12 @@ dual-prior spike protection, and contaminant masking.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 from romanepsf.config import SpikesConfig, SpikesSection
 from romanepsf.masking import (
     ROMAN_BASE_SPIKE_ANGLES_DEG,
+    build_2d_radial_profile_model,
     create_geometric_spike_mask,
     detect_morphological_spikes,
     fit_moffat_model,
@@ -20,6 +22,7 @@ from romanepsf.masking import (
     fit_stellar_model,
     get_theoretical_spike_angles,
     mask_contaminants_with_spikes_protected,
+    segment_connected_components,
 )
 
 
@@ -515,6 +518,7 @@ class TestSuperbackAndStpsfFitting:
     """Tests for SUPERBACK (rosalia) and STPSF physical PSF fitting."""
 
     def test_fit_superback_model(self):
+        pytest.importorskip("bottleneck")
         sz = 81
         stamp = np.full((sz, sz), 2.0, dtype=np.float32)
         stamp[40, 40] = 500.0
@@ -545,6 +549,7 @@ class TestSuperbackAndStpsfFitting:
         assert np.all(np.isfinite(model_img))
 
     def test_fit_stellar_model_dispatch_tiers(self):
+        pytest.importorskip("bottleneck")
         sz = 81
         stamp = np.full((sz, sz), 2.0, dtype=np.float32)
         stamp[40, 40] = 500.0
@@ -664,6 +669,7 @@ class TestSersicAndCompoundFitting:
         assert abs(model.amplitude.value - 400.0) < 100.0
 
     def test_fit_sersic_astrophot(self):
+        pytest.importorskip("astrophot")
         sz = 61
         cy, cx = 30.0, 30.0
         gy, gx = np.ogrid[:sz, :sz]
@@ -725,6 +731,88 @@ class TestSersicAndCompoundFitting:
         assert final_mask[20, 20]
         assert not final_mask[40, 40]
         assert prot_area[40, 40]
+
+
+class TestRadialProfileMaskingAndConnectedComponents:
+    """Tests for 2D radial profile model masking, Gaia companion stars, and connected components core protection."""
+
+    def test_build_2d_radial_profile_model_smooth(self):
+        sz = 81
+        cx, cy = 40.0, 40.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        star = (250.0 / (1.0 + (r / 2.0)**2)**1.1).astype(np.float32)
+
+        model_2d, residual, r_map, std_2d = build_2d_radial_profile_model(
+            star, (cx, cy), growth_rate=1.03
+        )
+        assert model_2d.shape == (sz, sz)
+        assert residual.shape == (sz, sz)
+        assert r_map.shape == (sz, sz)
+        assert std_2d.shape == (sz, sz)
+        assert np.all(np.isfinite(model_2d))
+        # Smooth star residual should be close to zero
+        assert np.nanmean(np.abs(residual[r > 5.0])) < 1.0
+
+    def test_connected_components_eliminates_core_overlap_only(self):
+        sz = 61
+        cand_mask = np.zeros((sz, sz), dtype=bool)
+        # Component 1: touching core (cx=30, cy=30)
+        cand_mask[30, 27:35] = True
+        # Component 2: isolated companion at (10, 10)
+        cand_mask[9:12, 9:12] = True
+
+        gy, gx = np.ogrid[:sz, :sz]
+        r_map = np.hypot(gx - 30.0, gy - 30.0)
+        core_region = (r_map <= 5.0)
+
+        num_labels, labels = segment_connected_components(cand_mask)
+        assert num_labels >= 2
+        overlap_ids = np.unique(labels[core_region])
+        overlap_ids = overlap_ids[overlap_ids > 0]
+        assert len(overlap_ids) > 0
+
+        # Remove overlapping IDs
+        cand_mask[np.isin(labels, overlap_ids)] = False
+        # Component 1 removed, Component 2 preserved
+        assert not np.any(cand_mask[30, 27:35])
+        assert np.all(cand_mask[9:12, 9:12])
+
+    def test_radial_profile_masking_with_gaia_companion_and_core_protection(self):
+        sz = 101
+        cx, cy = 50.0, 50.0
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        star = (300.0 / (1.0 + (r / 2.5)**2)**1.2).astype(np.float32)
+
+        # Off-axis companion star at (25, 25)
+        comp_r = np.hypot(gx - 25.0, gy - 25.0)
+        companion = (40.0 * np.exp(-comp_r**2 / (2 * 1.5**2))).astype(np.float32)
+        stamp = star + companion
+
+        # Synthetic Gaia companion table
+        gaia_df = pd.DataFrame([{
+            "source_id": 999001,
+            "mag_lambda": 15.0,
+            "x": 25.0,
+            "y": 25.0,
+        }])
+
+        final_mask, prot_area, residual = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="medium",
+            method="radial_profile",
+            companion_stars=gaia_df,
+            target_center_xy=(cx, cy),
+        )
+
+        assert final_mask.shape == (sz, sz)
+        # Companion star must be masked
+        assert final_mask[25, 25]
+        # Primary central core must NOT be masked
+        assert not final_mask[50, 50]
+        # Core region preserved
+        assert np.all(~final_mask[r <= 3.0])
 
 
 
