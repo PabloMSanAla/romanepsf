@@ -143,7 +143,9 @@ def run_test_for_star(
     # 1. Determine size and extract cutout
     sz = get_adaptive_stamp_size(mag, tier=tier_label, max_size=1001 if tier_label == "bright" else 201)
     cutout, (ix, iy) = extract_cutout(l2_data.data, (cx, cy), sz, fill_value=np.nan)
-    scx, scy = cx - ix, cy - iy
+    # The cutout is centered at integer pixel (ix, iy). The star's center in stamp coordinates is:
+    scx = (sz - 1) / 2.0 + (cx - ix)
+    scy = (sz - 1) / 2.0 + (cy - iy)
 
     # Background subtraction
     bkg_val, bkg_rms = estimate_stamp_background(cutout)
