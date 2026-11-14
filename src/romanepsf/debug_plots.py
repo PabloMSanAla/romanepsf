@@ -23,7 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Patch
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 
@@ -74,10 +74,12 @@ def generate_debug_figure1_masking_procedure(
     output_path: Path,
     star_info: Optional[Dict[str, Any]] = None,
     is_calibrated: bool = True,
+    dq_mask: Optional[np.ndarray] = None,
 ) -> Path:
     """
     Figure 1: Masking procedure in 4 panels with identical magnitude scale:
-    (image, radial model, residual, image+mask).
+    (image, radial model, residual, image + mask & quality flags overlay).
+    Mask is overlaid in semi-transparent cyan (alpha~0.5) and quality flags in green (alpha~0.5).
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,13 +88,20 @@ def generate_debug_figure1_masking_procedure(
     tier = str(info.get("tier", "unknown")).upper()
     mag = float(info.get("mag", 0.0))
 
+    if dq_mask is None and star_info is not None:
+        dq_mask = star_info.get("dq_mask", None)
+
+    if dq_mask is not None:
+        is_dq = dq_mask.astype(bool)
+        is_contam = final_mask.astype(bool) & (~is_dq)
+    else:
+        is_dq = np.zeros_like(final_mask, dtype=bool)
+        is_contam = final_mask.astype(bool)
+
     # Convert to AB mag / arcsec^2
     mag_img = convert_to_ab_mag_arcsec2(stamp, conversion_factor, is_calibrated)
     mag_mod = convert_to_ab_mag_arcsec2(radial_model, conversion_factor, is_calibrated)
     mag_res = convert_to_ab_mag_arcsec2(np.abs(residual), conversion_factor, is_calibrated)
-
-    masked_stamp = np.where(final_mask, np.nan, stamp)
-    mag_masked = convert_to_ab_mag_arcsec2(masked_stamp, conversion_factor, is_calibrated)
 
     # Establish common magnitude dynamic range from the valid star image
     valid_mags = mag_img[np.isfinite(mag_img)]
@@ -116,9 +125,9 @@ def generate_debug_figure1_masking_procedure(
         "1. Calibrated Image",
         "2. Radial Model (2D)",
         "3. Residual (|Image - Model|)",
-        "4. Image + Mask (Cleaned)",
+        "4. Mask & DQ Overlay (alpha=0.5)",
     ]
-    data_list = [mag_img, mag_mod, mag_res, mag_masked]
+    data_list = [mag_img, mag_mod, mag_res, mag_img]
 
     for idx, (ax, data, title) in enumerate(zip(axes, data_list, titles)):
         ax.set_facecolor("#161b22")
@@ -131,12 +140,21 @@ def generate_debug_figure1_masking_procedure(
         for spine in ax.spines.values():
             spine.set_color("#30363d")
 
-        # In panel 4, overlay subtle red contour on masked regions and circle Gaia companion stars
+        # In panel 4: overlay cyan mask and green quality flags with alpha=0.5
         if idx == 3:
-            if np.any(final_mask):
-                ax.contour(final_mask, levels=[0.5], colors=["#ff5252"], linewidths=1.0)
+            ny, nx = stamp.shape
+            if np.any(is_contam):
+                overlay_cyan = np.zeros((ny, nx, 4), dtype=np.float32)
+                overlay_cyan[is_contam] = [0.0, 0.9, 1.0, 0.5]  # Entire mask with cyan, alpha=0.5
+                ax.imshow(overlay_cyan, origin="lower")
+
+            if np.any(is_dq):
+                overlay_green = np.zeros((ny, nx, 4), dtype=np.float32)
+                overlay_green[is_dq] = [0.0, 0.9, 0.2, 0.5]  # Quality flags with green, alpha=0.5
+                ax.imshow(overlay_green, origin="lower")
+
             comps = info.get("gaia_companions", [])
-            for c_idx, comp in enumerate(comps):
+            for comp in comps:
                 circ = Circle(
                     (comp["x"], comp["y"]),
                     comp["radius_px"],
@@ -144,12 +162,19 @@ def generate_debug_figure1_masking_procedure(
                     edgecolor="#ffd600",
                     linestyle="--",
                     linewidth=1.4,
-                    label="Gaia Companion Mask" if c_idx == 0 else None,
                 )
                 ax.add_patch(circ)
                 ax.plot(comp["x"], comp["y"], "+", color="#ffd600", markersize=7, markeredgewidth=1.3)
+
+            legend_elements = []
+            if np.any(is_contam):
+                legend_elements.append(Patch(facecolor=(0.0, 0.9, 1.0, 0.5), edgecolor="#00e5ff", label="Mask (Cyan, $\\alpha=0.5$)"))
+            if np.any(is_dq):
+                legend_elements.append(Patch(facecolor=(0.0, 0.9, 0.2, 0.5), edgecolor="#00e676", label="Quality Flags (Green, $\\alpha=0.5$)"))
             if len(comps) > 0:
-                ax.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
+                legend_elements.append(plt.Line2D([0], [0], color="#ffd600", linestyle="--", linewidth=1.4, label=f"Gaia Companions ({len(comps)})"))
+            if legend_elements:
+                ax.legend(handles=legend_elements, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     # Shared colorbar
     cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
@@ -184,10 +209,12 @@ def generate_debug_figure2_apertures_and_profile(
     star_info: Optional[Dict[str, Any]] = None,
     is_calibrated: bool = True,
     center_xy: Optional[Tuple[float, float]] = None,
+    dq_mask: Optional[np.ndarray] = None,
 ) -> Path:
     """
     Figure 2: 2 panels:
-    - Left: Masked image with overlaid concentric radial profile apertures.
+    - Left: Calibrated image with overlaid concentric profile apertures,
+      contaminant mask (cyan, alpha=0.5), and quality flags (green, alpha=0.5).
     - Right: Radial profile in surface brightness (AB mag / arcsec^2).
     """
     output_path = Path(output_path)
@@ -201,13 +228,23 @@ def generate_debug_figure2_apertures_and_profile(
     cx = center_xy[0] if center_xy else (nx - 1.0) / 2.0
     cy = center_xy[1] if center_xy else (ny - 1.0) / 2.0
 
-    masked_img = np.where(mask, np.nan, stamp)
-    mag_img = convert_to_ab_mag_arcsec2(masked_img, conversion_factor, is_calibrated)
+    if dq_mask is None and star_info is not None:
+        dq_mask = star_info.get("dq_mask", None)
+
+    if dq_mask is not None:
+        is_dq = dq_mask.astype(bool)
+        is_contam = mask.astype(bool) & (~is_dq)
+    else:
+        is_dq = np.zeros_like(mask, dtype=bool)
+        is_contam = mask.astype(bool)
+
+    # Use full stamp so sources below masks can be seen
+    mag_img = convert_to_ab_mag_arcsec2(stamp, conversion_factor, is_calibrated)
     prof_mag = convert_to_ab_mag_arcsec2(rad_flux, conversion_factor, is_calibrated)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7), facecolor="#0e1117")
 
-    # Panel 1: Masked Image with Overlaid Geometric Apertures
+    # Panel 1: Image with Overlaid Geometric Apertures and Masks
     ax1.set_facecolor("#161b22")
     valid_mags = mag_img[np.isfinite(mag_img)]
     vmin = max(float(np.nanpercentile(valid_mags, 0.5)), 8.0) if len(valid_mags) else 12.0
@@ -219,10 +256,22 @@ def generate_debug_figure2_apertures_and_profile(
         cmap.set_bad(color="#1a1e24")
 
     im1 = ax1.imshow(mag_img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
-    ax1.set_title("Masked Image with Profile Annuli Overlaid", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
+    ax1.set_title("Image with Profile Annuli, Mask (Cyan) & DQ (Green) Overlaid", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
     ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
     ax1.set_ylabel("Y (pixels)", color="#e6edf3", fontsize=10)
     ax1.tick_params(colors="#8b949e", labelsize=9)
+
+    # Overlay cyan contaminant mask (alpha=0.5)
+    if np.any(is_contam):
+        overlay_cyan = np.zeros((ny, nx, 4), dtype=np.float32)
+        overlay_cyan[is_contam] = [0.0, 0.9, 1.0, 0.5]
+        ax1.imshow(overlay_cyan, origin="lower")
+
+    # Overlay green quality flags (alpha=0.5)
+    if np.any(is_dq):
+        overlay_green = np.zeros((ny, nx, 4), dtype=np.float32)
+        overlay_green[is_dq] = [0.0, 0.9, 0.2, 0.5]
+        ax1.imshow(overlay_green, origin="lower")
 
     # Draw subset of concentric geometric circles (sample every 6th bin to prevent visual saturation)
     sub_bins = rad_bins[::6] if len(rad_bins) > 12 else rad_bins
@@ -236,7 +285,7 @@ def generate_debug_figure2_apertures_and_profile(
 
     # Overlay Gaia companion star circular apertures
     comps = info.get("gaia_companions", [])
-    for c_idx, comp in enumerate(comps):
+    for comp in comps:
         circ = Circle(
             (comp["x"], comp["y"]),
             comp["radius_px"],
@@ -244,12 +293,21 @@ def generate_debug_figure2_apertures_and_profile(
             edgecolor="#ffd600",
             linestyle="--",
             linewidth=1.4,
-            label="Gaia Companion Mask" if c_idx == 0 else None,
         )
         ax1.add_patch(circ)
         ax1.plot(comp["x"], comp["y"], "+", color="#ffd600", markersize=7, markeredgewidth=1.3)
 
-    ax1.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+    legend_elements = [
+        plt.Line2D([0], [0], color="#00e5ff", marker="+", linestyle="none", markersize=10, markeredgewidth=1.5, label="Centroid"),
+    ]
+    if np.any(is_contam):
+        legend_elements.append(Patch(facecolor=(0.0, 0.9, 1.0, 0.5), edgecolor="#00e5ff", label="Mask (Cyan, $\\alpha=0.5$)"))
+    if np.any(is_dq):
+        legend_elements.append(Patch(facecolor=(0.0, 0.9, 0.2, 0.5), edgecolor="#00e676", label="Quality Flags (Green, $\\alpha=0.5$)"))
+    if len(comps) > 0:
+        legend_elements.append(plt.Line2D([0], [0], color="#ffd600", linestyle="--", linewidth=1.4, label=f"Gaia Companions ({len(comps)})"))
+
+    ax1.legend(handles=legend_elements, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     cbar1 = fig.colorbar(im1, ax=ax1, shrink=0.85)
     cbar1.set_label("AB mag / arcsec$^2$", color="#e6edf3", fontsize=10)
@@ -633,6 +691,7 @@ def generate_all_debug_plots(
             "tier": tier_name,
             "mag": mag_val,
             "gaia_companions": dbg.get("gaia_companions", []),
+            "dq_mask": dbg.get("dq_mask", None),
         }
 
         # Measure 1D profile for the star stamp

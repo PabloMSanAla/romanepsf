@@ -576,6 +576,7 @@ def process_star_stamps(
                 "is_calibrated": bool(getattr(l2_data, "is_calibrated", True)),
                 "center_stamp": (half + sub_dx, half + sub_dy),
                 "gaia_companions": stamp_companions,
+                "dq_mask": dq_mask_bool,
             }
 
             stamp_obj = StellarStamp(
