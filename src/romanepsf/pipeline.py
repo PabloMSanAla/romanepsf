@@ -284,6 +284,8 @@ def process_single_detector_stamps(
             l2_data=l2_data,
             df=proj,
             box_radius=cfg.catalog.centroid_refine_box_px,
+            box_fraction=cfg.catalog.centroid_box_fraction,
+            cfg=cfg,
         )
         isolated = filter_isolated_stars(
             df=refined,
@@ -619,6 +621,8 @@ def run_single_detector(
             l2_data=l2_data,
             df=projected_df,
             box_radius=cfg.catalog.centroid_refine_box_px,
+            box_fraction=cfg.catalog.centroid_box_fraction,
+            cfg=cfg,
         )
 
         # 10. Pairwise Moffat Isolation Clearance Filtering
@@ -1148,6 +1152,8 @@ def _sca_file_worker_task(
             l2_data=l2_data,
             df=proj,
             box_radius=cfg.catalog.centroid_refine_box_px,
+            box_fraction=cfg.catalog.centroid_box_fraction,
+            cfg=cfg,
         )
         isolated = filter_isolated_stars(
             df=refined,

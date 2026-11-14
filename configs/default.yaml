@@ -29,7 +29,8 @@ catalog:
   isolation_safety_factor: 1.3
   min_dist_arcsec: 2.0
   edge_margin_px: 50
-  centroid_refine_box_px: 5
+  centroid_box_fraction: 0.30 # 30% of region size for faint, medium, and bright
+  centroid_refine_box_px: null
   roundtrip_tolerance_arcsec: 0.5
 
 tiers:

@@ -647,7 +647,11 @@ def catalog_command(
             tolerance_arcsec=cfg.catalog.roundtrip_tolerance_arcsec,
         )
         refined_df = refine_stellar_centroids(
-            l2_data, projected_df, box_radius=cfg.catalog.centroid_refine_box_px
+            l2_data,
+            projected_df,
+            box_radius=cfg.catalog.centroid_refine_box_px,
+            box_fraction=cfg.catalog.centroid_box_fraction,
+            cfg=cfg,
         )
         isolated_df = filter_isolated_stars(
             df=refined_df,

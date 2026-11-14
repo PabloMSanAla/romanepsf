@@ -244,32 +244,33 @@ def test_assign_stellar_tiers():
     ]
 
 
-def test_refine_stellar_centroids_saturation_binary_mask_vs_gaussian():
-    """Verify adaptive centroiding: binary mask for >10 saturated/DQ pixels, 2D Gaussian for <=10."""
+def test_refine_stellar_centroids_2d_gaussian_tier_box_fraction():
+    """Verify 2D Gaussian centroiding using 30% box of region for faint, medium, bright."""
     from romanepsf.loader import DQ_FLAGS
-    sz = 100
+    sz = 200
     img = np.zeros((sz, sz), dtype=np.float32)
     dq = np.zeros((sz, sz), dtype=np.uint32)
 
-    # Star 1: Unsaturated Gaussian star (0 bad pixels) at (30.4, 30.7)
-    true_x1, true_y1 = 30.4, 30.7
+    # Star 1 (faint, region 81 -> 30% is 25x25) at (40.4, 40.7)
+    true_x1, true_y1 = 40.4, 40.7
     gy, gx = np.indices((sz, sz))
-    star1 = 500.0 * np.exp(-((gx - true_x1)**2 + (gy - true_y1)**2) / (2.0 * 1.5**2)) + 5.0
+    star1 = 200.0 * np.exp(-((gx - true_x1)**2 + (gy - true_y1)**2) / (2.0 * 1.5**2)) + 5.0
 
-    # Star 2: Saturated star (>10 saturated pixels) with circular saturated mask at (70.2, 70.4)
-    true_x2, true_y2 = 70.2, 70.4
-    sat_core = np.hypot(gx - true_x2, gy - true_y2) <= 3.0  # ~29 pixels
+    # Star 2 (medium, region 201 -> 30% is 61x61) with saturated core at (140.2, 140.5)
+    true_x2, true_y2 = 140.2, 140.5
+    star2 = 5000.0 * np.exp(-((gx - true_x2)**2 + (gy - true_y2)**2) / (2.0 * 2.5**2)) + 5.0
+    sat_core = np.hypot(gx - true_x2, gy - true_y2) <= 3.0
     dq[sat_core] = DQ_FLAGS["SATURATED"]
-    star2 = np.zeros((sz, sz), dtype=np.float32)
     star2[sat_core] = 10000.0
 
     img = star1 + star2
 
     df = pd.DataFrame({
         "source_id": [101, 102],
-        "x": [30.0, 70.0],
-        "y": [30.0, 70.0],
-        "mag_lambda": [15.0, 10.0],
+        "x": [40.0, 140.0],
+        "y": [40.0, 140.0],
+        "mag_lambda": [14.0, 12.0],
+        "tier": ["faint", "medium"],
     })
 
     l2 = RomanL2Data(
@@ -280,15 +281,13 @@ def test_refine_stellar_centroids_saturation_binary_mask_vs_gaussian():
         zp_ab=26.8, meta={}, is_calibrated=True,
     )
 
-    refined = refine_stellar_centroids(l2, df, box_radius=25)
+    refined = refine_stellar_centroids(l2, df, box_fraction=0.30)
 
-    # Star 1: <=10 flagged -> 2d_gaussian
     assert refined["centroid_method"].iloc[0] == "2d_gaussian"
     assert refined["x"].iloc[0] == pytest.approx(true_x1, abs=0.05)
     assert refined["y"].iloc[0] == pytest.approx(true_y1, abs=0.05)
 
-    # Star 2: >10 flagged -> binary_mask
-    assert refined["centroid_method"].iloc[1] == "binary_mask"
-    assert refined["x"].iloc[1] == pytest.approx(true_x2, abs=0.25)
-    assert refined["y"].iloc[1] == pytest.approx(true_y2, abs=0.25)
+    assert refined["centroid_method"].iloc[1] == "2d_gaussian"
+    assert refined["x"].iloc[1] == pytest.approx(true_x2, abs=0.15)
+    assert refined["y"].iloc[1] == pytest.approx(true_y2, abs=0.15)
 

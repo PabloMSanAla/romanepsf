@@ -395,10 +395,10 @@ def _fit_2d_gaussian_center(
     valid_mask: np.ndarray,
     x0_init: float,
     y0_init: float,
-    fit_radius: int = 10,
+    max_shift: float = 5.0,
 ) -> Tuple[float, float, bool]:
     """
-    Fit a 2D Gaussian to the stellar core to determine the subpixel continuous center.
+    Fit a 2D Gaussian model to the stellar flux array to determine the subpixel center.
 
     Parameters
     ----------
@@ -410,47 +410,33 @@ def _fit_2d_gaussian_center(
         Initial continuous guess for X in local box coordinates.
     y0_init : float
         Initial continuous guess for Y in local box coordinates.
-    fit_radius : int, default 10
-        Radius in pixels around initial center defining the Gaussian fitting domain.
+    max_shift : float, default 5.0
+        Maximum allowed offset from initial center for bounding the fit.
 
     Returns
     -------
     (x_fit, y_fit, success) : Tuple[float, float, bool]
         Fitted continuous center coordinates in local box pixels, and success flag.
     """
-    ny, nx = box.shape
-    ix_loc = int(round(x0_init))
-    iy_loc = int(round(y0_init))
+    grid_y, grid_x = np.indices(box.shape)
 
-    x_min = max(0, ix_loc - fit_radius)
-    x_max = min(nx, ix_loc + fit_radius + 1)
-    y_min = max(0, iy_loc - fit_radius)
-    y_max = min(ny, iy_loc + fit_radius + 1)
-
-    sub_box = box[y_min:y_max, x_min:x_max]
-    sub_valid = valid_mask[y_min:y_max, x_min:x_max]
-
-    grid_y, grid_x = np.indices(sub_box.shape)
-    grid_x_abs = grid_x + x_min
-    grid_y_abs = grid_y + y_min
-
-    valid_pts = sub_valid & np.isfinite(sub_box)
-    if np.sum(valid_pts) < 6 or (np.max(sub_box[valid_pts]) - np.min(sub_box[valid_pts]) <= 1e-6):
+    valid_pts = valid_mask & np.isfinite(box)
+    if np.sum(valid_pts) < 6 or (np.max(box[valid_pts]) - np.min(box[valid_pts]) <= 1e-6):
         return x0_init, y0_init, False
 
-    x_pts = grid_x_abs[valid_pts].astype(np.float64)
-    y_pts = grid_y_abs[valid_pts].astype(np.float64)
-    flux_pts = sub_box[valid_pts].astype(np.float64)
+    x_pts = grid_x[valid_pts].astype(np.float64)
+    y_pts = grid_y[valid_pts].astype(np.float64)
+    flux_pts = box[valid_pts].astype(np.float64)
 
     bg_est = float(np.percentile(flux_pts, 10))
     amp_est = float(np.max(flux_pts) - bg_est)
     if amp_est <= 0:
         amp_est = 1.0
 
-    p0 = [amp_est, float(x0_init), float(y0_init), 1.5, bg_est]
+    p0 = [amp_est, float(x0_init), float(y0_init), 2.0, bg_est]
     bounds = (
-        [0.0, x0_init - 5.0, y0_init - 5.0, 0.3, -np.inf],
-        [np.inf, x0_init + 5.0, y0_init + 5.0, 10.0, np.inf],
+        [0.0, x0_init - max_shift, y0_init - max_shift, 0.3, -np.inf],
+        [np.inf, x0_init + max_shift, y0_init + max_shift, 50.0, np.inf],
     )
 
     def _gauss_func(coords, A, xc, yc, sigma, B):
@@ -464,7 +450,7 @@ def _fit_2d_gaussian_center(
             flux_pts,
             p0=p0,
             bounds=bounds,
-            maxfev=600,
+            maxfev=1000,
         )
         A_f, xc_f, yc_f, sig_f, B_f = popt
         if np.isfinite(xc_f) and np.isfinite(yc_f):
@@ -478,15 +464,20 @@ def _fit_2d_gaussian_center(
 def refine_stellar_centroids(
     l2_data: RomanL2Data,
     df: pd.DataFrame,
-    box_radius: int = 25,
+    box_radius: Optional[int] = None,
+    box_fraction: float = 0.30,
     max_shift_px: float = 5.0,
-    sat_flag_threshold: int = 10,
+    cfg: Optional[Any] = None,
+    faint_size: int = 81,
+    medium_size: int = 201,
+    max_bright_size: int = 1001,
+    bright_limit: float = 11.0,
+    faint_limit: float = 13.0,
 ) -> pd.DataFrame:
     """
-    Refine stellar subpixel centers using adaptive saturation/quality flag partitioning:
-    - If the center in box_radius (default=25, 51 width) has > 10 pixels saturated or
-      with quality flags, measure the center using the binary mask from the quality flag mask.
-    - If <= 10 pixels flagged, fit a 2D Gaussian to find the center.
+    Refine stellar subpixel centers by fitting a 2D Gaussian model over a local box.
+    The box size is defined as 30% (configurable via centroid_box_fraction) of the
+    region size for each tier: faint, medium, and bright.
 
     Parameters
     ----------
@@ -494,12 +485,15 @@ def refine_stellar_centroids(
         Calibrated detector dataset with science flux and DQ arrays.
     df : pd.DataFrame
         Catalog with projected 'x' and 'y' coordinates.
-    box_radius : int, default 25
-        Radius in pixels around integer center defining bounding box (2*box_radius + 1 = 51 width).
+    box_radius : int, optional
+        Explicit fixed box radius. If None, dynamically computes the box as box_fraction
+        of the tier region size.
+    box_fraction : float, default 0.30
+        Fraction of the tier region size used to define the bounding box (default: 30%).
     max_shift_px : float, default 5.0
         Maximum allowable shift from initial catalog coordinates before falling back.
-    sat_flag_threshold : int, default 10
-        Threshold number of saturated or quality-flagged pixels to trigger binary mask centroiding.
+    cfg : PipelineConfig, optional
+        Pipeline configuration providing tier boundaries and stamp sizes.
 
     Returns
     -------
@@ -514,8 +508,31 @@ def refine_stellar_centroids(
         df_out["centroid_method"] = []
         return df_out
 
+    # Resolve configuration parameters if provided
+    if cfg is not None:
+        cat_sec = getattr(cfg, "catalog", None)
+        if cat_sec is not None:
+            box_fraction = getattr(cat_sec, "centroid_box_fraction", box_fraction)
+            cfg_box_px = getattr(cat_sec, "centroid_refine_box_px", None)
+            if cfg_box_px is not None:
+                box_radius = cfg_box_px
+        stamps_sec = getattr(cfg, "stamps", None)
+        if stamps_sec is not None:
+            sizes = getattr(stamps_sec, "sizes", None)
+            if sizes is not None:
+                faint_size = getattr(sizes, "faint", faint_size)
+                medium_size = getattr(sizes, "medium", medium_size)
+                max_bright_size = getattr(sizes, "bright_max", max_bright_size)
+        tiers_sec = getattr(cfg, "tiers", None)
+        if tiers_sec is not None:
+            bright_limit = getattr(tiers_sec, "bright_limit", bright_limit)
+            faint_limit = getattr(tiers_sec, "faint_limit", faint_limit)
+
     data = l2_data.data
     height, width = data.shape
+    pixel_scale = float(getattr(l2_data, "pixel_scale", 0.11))
+
+    from romanepsf.stamps import get_adaptive_stamp_size
 
     x_refined, y_refined = [], []
     peak_fluxes, shifts = [], []
@@ -525,13 +542,50 @@ def refine_stellar_centroids(
         x_init = float(row["x"])
         y_init = float(row["y"])
 
+        # Determine tier and adaptive region size for this star
+        if "tier" in row and pd.notna(row["tier"]):
+            tier = str(row["tier"]).lower().strip()
+        else:
+            mag_val = row.get("mag_lambda", row.get("phot_g_mean_mag", np.nan))
+            try:
+                mag_float = float(mag_val)
+                tier = "bright" if mag_float < bright_limit else ("medium" if mag_float < faint_limit else "faint")
+            except (ValueError, TypeError):
+                tier = "faint"
+
+        mag_val = row.get("mag_lambda", row.get("phot_g_mean_mag", 15.0))
+        try:
+            mag_float = float(mag_val)
+            if np.isnan(mag_float):
+                mag_float = 15.0
+        except (ValueError, TypeError):
+            mag_float = 15.0
+
+        region_sz = get_adaptive_stamp_size(
+            mag=mag_float,
+            tier=tier,
+            max_size=max_bright_size,
+            pixel_scale=pixel_scale,
+            faint_size=faint_size,
+            medium_size=medium_size,
+        )
+
+        if box_radius is not None:
+            b_rad = int(box_radius)
+        else:
+            box_sz = int(round(region_sz * box_fraction))
+            if box_sz % 2 == 0:
+                box_sz += 1
+            box_sz = max(box_sz, 11)
+            b_rad = (box_sz - 1) // 2
+
         ix = int(round(x_init))
         iy = int(round(y_init))
 
-        x0 = max(0, ix - box_radius)
-        x1 = min(width, ix + box_radius + 1)
-        y0 = max(0, iy - box_radius)
-        y1 = min(height, iy + box_radius + 1)
+        x0 = max(0, ix - b_rad)
+        x1 = min(width, ix + b_rad + 1)
+        y0 = max(0, iy - b_rad)
+        y1 = min(height, iy + b_rad + 1)
 
         box = data[y0:y1, x0:x1]
 
@@ -543,7 +597,7 @@ def refine_stellar_centroids(
             methods.append("fallback_nan")
             continue
 
-        # Extract quality flags & saturation mask
+        # Extract quality flags & saturation mask (exclude from fit)
         hard_flags = (
             DQ_FLAGS.get("SATURATED", 2)
             | DQ_FLAGS.get("DO_NOT_USE", 1)
@@ -553,73 +607,39 @@ def refine_stellar_centroids(
         )
         if hasattr(l2_data, "dq") and l2_data.dq is not None:
             dq_box = l2_data.dq[y0:y1, x0:x1]
-            flag_mask = ((dq_box & hard_flags) > 0) | (~np.isfinite(box))
+            bad_mask = ((dq_box & hard_flags) > 0) | (~np.isfinite(box))
         else:
-            flag_mask = ~np.isfinite(box)
+            bad_mask = ~np.isfinite(box)
 
-        n_flagged = int(np.sum(flag_mask))
+        valid_mask = np.isfinite(box) & (~bad_mask)
+        valid_pix = box[valid_mask]
+
+        if len(valid_pix) < 6 or np.max(valid_pix) <= 0.0 or (np.max(valid_pix) - np.min(valid_pix) <= 1e-6):
+            x_refined.append(x_init)
+            y_refined.append(y_init)
+            peak_fluxes.append(float(np.max(valid_pix)) if len(valid_pix) > 0 else 0.0)
+            shifts.append(0.0)
+            methods.append("fallback_flat_or_empty")
+            continue
+
         center_x_box = ix - x0
         center_y_box = iy - y0
 
-        valid_pix = box[np.isfinite(box)]
-        peak = float(np.max(valid_pix)) if len(valid_pix) > 0 else 0.0
+        cx_fit, cy_fit, success = _fit_2d_gaussian_center(
+            box=box,
+            valid_mask=valid_mask,
+            x0_init=center_x_box,
+            y0_init=center_y_box,
+            max_shift=max_shift_px,
+        )
 
-        if peak <= 0.0:
-            x_refined.append(x_init)
-            y_refined.append(y_init)
-            peak_fluxes.append(peak)
-            shifts.append(0.0)
-            methods.append("fallback_zero_flux")
-            continue
-
-        if n_flagged > sat_flag_threshold:
-            # Measure center using the binary mask from the quality flag mask
-            labeled, n_features = ndimage.label(flag_mask)
-            if n_features == 0:
-                cx, cy = x_init, y_init
-                method_used = "binary_mask_empty"
-            elif n_features == 1:
-                ys, xs = np.where(flag_mask)
-                cx = x0 + float(np.mean(xs))
-                cy = y0 + float(np.mean(ys))
-                method_used = "binary_mask"
-            else:
-                # Isolate the connected component of the saturated/flagged mask at/closest to center
-                lbl_center = (
-                    labeled[center_y_box, center_x_box]
-                    if (0 <= center_y_box < labeled.shape[0] and 0 <= center_x_box < labeled.shape[1])
-                    else 0
-                )
-                if lbl_center > 0:
-                    core_component = labeled == lbl_center
-                else:
-                    coords = np.argwhere(flag_mask)
-                    dists = np.hypot(coords[:, 1] - center_x_box, coords[:, 0] - center_y_box)
-                    closest_idx = int(np.argmin(dists))
-                    cy_c, cx_c = coords[closest_idx]
-                    core_component = labeled == labeled[cy_c, cx_c]
-
-                ys, xs = np.where(core_component)
-                cx = x0 + float(np.mean(xs))
-                cy = y0 + float(np.mean(ys))
-                method_used = "binary_mask"
+        if success:
+            cx = x0 + cx_fit
+            cy = y0 + cy_fit
+            method_used = "2d_gaussian"
         else:
-            # Fit 2D Gaussian to find the center
-            valid_mask = np.isfinite(box) & (~flag_mask)
-            cx_fit, cy_fit, success = _fit_2d_gaussian_center(
-                box=box,
-                valid_mask=valid_mask,
-                x0_init=center_x_box,
-                y0_init=center_y_box,
-                fit_radius=10,
-            )
-            if success:
-                cx = x0 + cx_fit
-                cy = y0 + cy_fit
-                method_used = "2d_gaussian"
-            else:
-                cx, cy = x_init, y_init
-                method_used = "gaussian_fallback"
+            cx, cy = x_init, y_init
+            method_used = "gaussian_fallback"
 
         shift = float(np.hypot(cx - x_init, cy - y_init))
         if np.isfinite(cx) and np.isfinite(cy) and (shift <= max_shift_px):
@@ -633,7 +653,7 @@ def refine_stellar_centroids(
             shifts.append(0.0)
             methods.append("fallback_divergence")
 
-        peak_fluxes.append(peak)
+        peak_fluxes.append(float(np.max(valid_pix)))
 
     df_out = df.copy()
     if "x_gaia" not in df_out.columns:
