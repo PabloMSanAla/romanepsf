@@ -183,21 +183,22 @@ class GaiaSpatialManager:
             if tile_path.is_file():
                 continue
 
-            # Compute tile polygon or cone
+            # Compute tile center and bounding radius using fast spherical CIRCLE
+            # (Note: ADQL POLYGON triggers unindexed full-table scans in Gaia TAP causing 5-minute timeouts;
+            # CIRCLE uses the indexed Q3C/pg_sphere engine and executes in ~10-15s).
             if self._hpx is not None:
-                lon_c, lat_c = self._hpx.boundaries_lonlat([tile_id], step=1)
-                poly_pts = ", ".join(
-                    [f"{float(lon.deg):.6f}, {float(lat.deg):.6f}" for lon, lat in zip(lon_c[0], lat_c[0])]
-                )
-                spatial_clause = f"1 = CONTAINS(POINT('ICRS', ra, dec), POLYGON('ICRS', {poly_pts}))"
+                lon_c, lat_c = self._hpx.healpix_to_lonlat([tile_id])
+                ra_c = float(lon_c.deg[0])
+                dec_c = float(lat_c.deg[0])
             else:
                 theta, phi = hp.pix2ang(self.nside, tile_id, nest=False)
                 ra_c = float(np.degrees(phi))
                 dec_c = float(90.0 - np.degrees(theta))
-                approx_radius = float(np.degrees(hp.max_pixrad(self.nside)))
-                spatial_clause = (
-                    f"1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra_c:.6f}, {dec_c:.6f}, {approx_radius:.6f}))"
-                )
+
+            approx_radius = 0.35  # covers NSIDE=128 tile (~0.46 deg diameter) with margin
+            spatial_clause = (
+                f"1 = CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra_c:.6f}, {dec_c:.6f}, {approx_radius:.6f}))"
+            )
 
             adql = f"""
             SELECT source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag
@@ -215,12 +216,27 @@ class GaiaSpatialManager:
                     res = job.get_results()
                     df_res = res.to_pandas()
                     df_res = sanitize_source_catalog(df_res, mag_col="phot_g_mean_mag")
+
+                    # Keep stars that belong to this HEALPix tile
+                    if not df_res.empty:
+                        ras = df_res["ra"].to_numpy(dtype=float)
+                        decs = df_res["dec"].to_numpy(dtype=float)
+                        if self._hpx is not None:
+                            pix_arr = self._hpx.lonlat_to_healpix(ras * u.deg, decs * u.deg)
+                        else:
+                            thetas = np.radians(90.0 - decs)
+                            phis = np.radians(ras)
+                            pix_arr = hp.ang2pix(self.nside, thetas, phis, nest=False)
+                        df_res = df_res[pix_arr == tile_id].reset_index(drop=True)
+
                     df_res.to_parquet(tile_path, index=False)
                     fetched += 1
                     success = True
                     break
                 except Exception as exc:
-                    wait_backoff = (attempt + 1) * 3.0
+                    exc_str = str(exc)
+                    is_rate_limit = "429" in exc_str or "Too Many Requests" in exc_str
+                    wait_backoff = 30.0 if is_rate_limit else (attempt + 1) * 5.0
                     logger.warning(
                         f"Gaia TAP query failed on tile {tile_id} (attempt {attempt+1}/{max_retries}): {exc}. "
                         f"Retrying in {wait_backoff:.1f}s..."
