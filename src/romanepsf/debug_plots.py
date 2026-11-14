@@ -798,7 +798,14 @@ def generate_debug_figure_spike_process(
     if vmin >= vmax:
         vmax = vmin + 5.0
 
-    fig, axes = plt.subplots(1, 3, figsize=(22, 6.5), facecolor="#0e1117")
+    fig = plt.figure(figsize=(24, 8.0), facecolor="#0e1117")
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.0, 1.0, 1.55], height_ratios=[1.0, 1.0], hspace=0.38, wspace=0.25)
+
+    ax0 = fig.add_subplot(gs[:, 0])
+    ax1 = fig.add_subplot(gs[:, 1])
+    ax2_top = fig.add_subplot(gs[0, 2])
+    ax2_bot = fig.add_subplot(gs[1, 2])
+
     cmap = plt.cm.magma_r.copy()
     try:
         cmap = cmap.with_extremes(bad="#1a1e24")
@@ -806,7 +813,6 @@ def generate_debug_figure_spike_process(
         cmap.set_bad(color="#1a1e24")
 
     # Panel 1: Image + Theoretical Spike Mask
-    ax0 = axes[0]
     ax0.set_facecolor("#161b22")
     im0 = ax0.imshow(mag_img, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     if theoretical_mask is not None and np.any(theoretical_mask):
@@ -842,7 +848,6 @@ def generate_debug_figure_spike_process(
     ax0.legend(handles=leg0, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
 
     # Panel 2: Residual + Corrected Spike Mask
-    ax1 = axes[1]
     ax1.set_facecolor("#161b22")
     im1 = ax1.imshow(mag_res, origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
     if corrected_mask is not None and np.any(corrected_mask):
@@ -880,9 +885,7 @@ def generate_debug_figure_spike_process(
     cbar.ax.tick_params(colors="#8b949e", labelsize=8.5)
     cbar.ax.invert_yaxis()
 
-    # Panel 3: Intensity vs Angular Distribution
-    ax2 = axes[2]
-    ax2.set_facecolor("#161b22")
+    # Panel 3: Intensity vs Angular Distribution (split into 0->180 top and 180->360 bottom)
     r_inner = max(core_rad, 15.0)
     r_outer = min(0.85 * min(cx, cy, nx - 1 - cx, ny - 1 - cy), 90.0)
     if r_outer <= r_inner + 5.0:
@@ -908,29 +911,75 @@ def generate_debug_figure_spike_process(
             median_res_flx[b] = float(np.median(residual[ann_mask][in_bin]))
             median_raw_flx[b] = float(np.median(stamp[ann_mask][in_bin]))
 
-    # Plot residual curve with shaded region
-    ax2.plot(bin_centers, median_res_flx, color="#ffffff", linewidth=1.8, label=f"Residual Flux (Annulus {r_inner:.0f}-{r_outer:.0f}px)", zorder=4)
-    ax2.fill_between(bin_centers, 0, np.maximum(median_res_flx, 0), color="#58a6ff", alpha=0.25, zorder=3)
+    y_max = max(float(np.nanmax(median_res_flx)), 0.1) * 1.15
+    y_min = min(float(np.nanmin(median_res_flx)), -0.05)
 
-    # Plot theoretical vs refined spike lines
-    for i, ang in enumerate(base_spike_angles):
-        lbl = "Theoretical Rays" if i == 0 else None
-        ax2.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
+    # Panel 3a: Top Panel [0° to 180°]
+    ax2_top.set_facecolor("#161b22")
+    m_top = (bin_centers >= 0.0) & (bin_centers <= 180.0)
+    ax2_top.plot(bin_centers[m_top], median_res_flx[m_top], color="#ffffff", linewidth=1.8, label=r"Residual Flux ($0^\circ \to 180^\circ$)", zorder=4)
+    ax2_top.fill_between(bin_centers[m_top], 0, np.maximum(median_res_flx[m_top], 0), color="#58a6ff", alpha=0.25, zorder=3)
 
-    for i, ang in enumerate(refined_spike_angles):
-        lbl = "Corrected / Refined Rays" if i == 0 else None
-        ax2.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
+    first_theo_top = True
+    for ang in base_spike_angles:
+        if 0.0 <= ang <= 180.0:
+            lbl = "Theoretical Rays" if first_theo_top else None
+            ax2_top.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
+            first_theo_top = False
 
-    ax2.set_xlim(0, 360)
-    ax2.set_xticks(np.arange(0, 361, 45))
-    ax2.set_xlabel(r"Azimuthal Angle $\theta$ (degrees)", color="#e6edf3", fontsize=10)
-    ax2.set_ylabel("Annular Intensity / Flux (MJy/sr)", color="#e6edf3", fontsize=10)
-    ax2.set_title(r"3. Intensity vs Angular Distribution" + f"\n(Annulus $r \\in [{r_inner:.0f}, {r_outer:.0f}]$ px)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
-    ax2.tick_params(colors="#8b949e", labelsize=9)
-    for s in ax2.spines.values():
+    first_ref_top = True
+    for ang in refined_spike_angles:
+        if 0.0 <= ang <= 180.0:
+            lbl = "Corrected Rays" if first_ref_top else None
+            ax2_top.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
+            first_ref_top = False
+
+    ax2_top.set_xlim(0.0, 180.0)
+    ax2_top.set_xticks(np.arange(0, 181, 30))
+    ax2_top.set_ylim(y_min, y_max)
+    ax2_top.set_ylabel("Intensity (MJy/sr)", color="#e6edf3", fontsize=9.5)
+    ax2_top.set_title(r"3a. Azimuthal Intensity: $0^\circ \to 180^\circ$" + f" (Annulus ${r_inner:.0f}-{r_outer:.0f}$ px)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_top.tick_params(colors="#8b949e", labelsize=8.5)
+    for s in ax2_top.spines.values():
         s.set_color("#30363d")
-    ax2.grid(True, color="#30363d", linestyle=":", alpha=0.6)
-    ax2.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+    ax2_top.grid(True, color="#30363d", linestyle=":", alpha=0.6)
+    ax2_top.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
+
+    # Panel 3b: Bottom Panel [180° to 360°]
+    ax2_bot.set_facecolor("#161b22")
+    m_bot = (bin_centers >= 180.0) & (bin_centers <= 360.0)
+    ax2_bot.plot(bin_centers[m_bot], median_res_flx[m_bot], color="#ffffff", linewidth=1.8, label=r"Residual Flux ($180^\circ \to 360^\circ$)", zorder=4)
+    ax2_bot.fill_between(bin_centers[m_bot], 0, np.maximum(median_res_flx[m_bot], 0), color="#58a6ff", alpha=0.25, zorder=3)
+
+    # Plot opposing half folded (+180 deg) in dotted gold to explicitly visualize symmetry!
+    if np.any(m_top):
+        ax2_bot.plot(bin_centers[m_top] + 180.0, median_res_flx[m_top], color="#e3b341", linestyle=":", linewidth=1.3, alpha=0.75, label=r"Opposing $0^\circ\to 180^\circ$ Reflected", zorder=3)
+
+    first_theo_bot = True
+    for ang in base_spike_angles:
+        if 180.0 <= ang <= 360.0:
+            lbl = "Theoretical Rays" if first_theo_bot else None
+            ax2_bot.axvline(ang, color="#388bfd", linestyle="--", linewidth=1.2, alpha=0.75, zorder=2, label=lbl)
+            first_theo_bot = False
+
+    first_ref_bot = True
+    for ang in refined_spike_angles:
+        if 180.0 <= ang <= 360.0:
+            lbl = "Corrected Rays" if first_ref_bot else None
+            ax2_bot.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
+            first_ref_bot = False
+
+    ax2_bot.set_xlim(180.0, 360.0)
+    ax2_bot.set_xticks(np.arange(180, 361, 30))
+    ax2_bot.set_ylim(y_min, y_max)
+    ax2_bot.set_xlabel(r"Azimuthal Angle $\theta$ (degrees)", color="#e6edf3", fontsize=9.5)
+    ax2_bot.set_ylabel("Intensity (MJy/sr)", color="#e6edf3", fontsize=9.5)
+    ax2_bot.set_title(r"3b. Azimuthal Intensity: $180^\circ \to 360^\circ$ (Symmetric Counterparts $\theta + 180^\circ$)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_bot.tick_params(colors="#8b949e", labelsize=8.5)
+    for s in ax2_bot.spines.values():
+        s.set_color("#30363d")
+    ax2_bot.grid(True, color="#30363d", linestyle=":", alpha=0.6)
+    ax2_bot.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     fig.suptitle(
         f"Diffraction Spike Refinement Diagnostic — {tier} Star {source_id} (Mag={mag:.2f})",
