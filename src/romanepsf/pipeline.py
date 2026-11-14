@@ -57,6 +57,7 @@ from romanepsf.assembly import (
     assemble_composite_extended_psf,
     serialize_composite_epsf_fits,
 )
+from romanepsf.plot_utils import save_radial_profiles_data, generate_diagnostic_plots
 
 logger = logging.getLogger("romanepsf.pipeline")
 
@@ -615,6 +616,28 @@ def run_single_detector(
     csv_path = resolved_output_dir / f"{resolved_detector.lower()}_stars_tiered.csv"
     tiered_df.to_csv(csv_path, index=False)
 
+    # 16. Persist Radial Profiles Data (.npz) and Generate Default Diagnostic Plots 1 & 2
+    npz_path = resolved_output_dir / f"roman_epsf_{resolved_detector.lower()}_radial_profiles.npz"
+    try:
+        save_radial_profiles_data(
+            output_npz_path=npz_path,
+            composite_epsf=epsf_model,
+            pooled_stamps=stamps_by_tier,
+            diagnostics=diagnostics,
+            pixel_scale=pixel_scale,
+        )
+        plots_dir = resolved_output_dir / "plots"
+        generate_diagnostic_plots(
+            profiles_data_or_path=npz_path,
+            composite_epsf=epsf_model,
+            output_dir=plots_dir,
+            sca_name=resolved_detector,
+            pixel_scale=pixel_scale,
+            dpi=getattr(cfg.reporting, "dpi", 300),
+        )
+    except Exception as e:
+        logger.warning(f"Default plot generation failed on {resolved_detector}: {e}", exc_info=True)
+
     execution_time = time.time() - t0
     logger.info(
         f"Single-detector {resolved_detector.upper()} succeeded in {execution_time:.2f}s. "
@@ -786,6 +809,28 @@ def run_pipeline(
         pixel_scale=0.11,
     )
     logger.info(f"Composite extended PSF FITS successfully written to: {fits_path}")
+
+    # 6. Persist Radial Profiles Data (.npz) and Generate Default Diagnostic Plots 1 & 2
+    npz_path = cfg.data.output_dir / "roman_epsf_radial_profiles.npz"
+    try:
+        save_radial_profiles_data(
+            output_npz_path=npz_path,
+            composite_epsf=composite_epsf,
+            pooled_stamps=pooled_stamps,
+            diagnostics=diagnostics,
+            pixel_scale=0.11,
+        )
+        plots_dir = cfg.data.output_dir / "plots"
+        generate_diagnostic_plots(
+            profiles_data_or_path=npz_path,
+            composite_epsf=composite_epsf,
+            output_dir=plots_dir,
+            sca_name="Composite",
+            pixel_scale=0.11,
+            dpi=getattr(cfg.reporting, "dpi", 300),
+        )
+    except Exception as e:
+        logger.warning(f"Default plot generation failed: {e}", exc_info=True)
 
     total_time = time.perf_counter() - t_start
     diagnostics.update({
@@ -1245,6 +1290,28 @@ def run_sca_batch_pipeline(
         pixel_scale=0.11,
     )
     logger.info(f"Composite extended PSF for {target_sca.upper()} successfully saved to: {fits_path}")
+
+    # 9. Persist Radial Profiles Data (.npz) and Generate Default Diagnostic Plots 1 & 2
+    npz_path = resolved_cfg.data.output_dir / f"roman_epsf_{target_sca.lower()}_radial_profiles.npz"
+    try:
+        save_radial_profiles_data(
+            output_npz_path=npz_path,
+            composite_epsf=composite_epsf,
+            pooled_stamps=pooled_stamps,
+            diagnostics=diagnostics,
+            pixel_scale=0.11,
+        )
+        plots_dir = resolved_cfg.data.output_dir / "plots"
+        generate_diagnostic_plots(
+            profiles_data_or_path=npz_path,
+            composite_epsf=composite_epsf,
+            output_dir=plots_dir,
+            sca_name=target_sca,
+            pixel_scale=0.11,
+            dpi=getattr(resolved_cfg.reporting, "dpi", 300),
+        )
+    except Exception as e:
+        logger.warning(f"Default plot generation failed on {target_sca}: {e}", exc_info=True)
 
     total_time = time.perf_counter() - t_start
     diagnostics.update({

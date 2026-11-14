@@ -87,7 +87,40 @@ def main():
     if not fits_path.exists():
         fits_path = Path("output/roman_epsf_composite.fits")
     if not fits_path.exists():
-        raise FileNotFoundError(f"Cannot find {fits_path}")
+        fits_matches = list(Path("output").glob("roman_epsf_*_composite.fits"))
+        if fits_matches:
+            fits_path = fits_matches[0]
+    if not fits_path.exists():
+        raise FileNotFoundError(f"Cannot find composite ePSF FITS in output/")
+
+    # Check for pre-computed radial profiles archive (.npz) for fast instantaneous rendering
+    npz_candidates = [
+        Path("output/roman_epsf_radial_profiles.npz"),
+        Path(f"output/{fits_path.stem.replace('_composite', '')}_radial_profiles.npz"),
+        Path(f"output/roman_epsf_{fits_path.name.split('_')[2] if len(fits_path.name.split('_')) > 2 else 'wfi01'}_radial_profiles.npz"),
+    ]
+    cached_npz = next((p for p in npz_candidates if p.is_file()), None)
+
+    if cached_npz is not None:
+        print(f"Discovered precomputed radial profiles cache: {cached_npz}!")
+        print("Rendering Plot 1 and Plot 2 instantaneously from cached profiles...")
+        from romanepsf.plot_utils import generate_diagnostic_plots
+        with fits.open(fits_path) as hdul:
+            epsf_model = hdul[0].data.astype(np.float32)
+            header = hdul[0].header
+        pix_s = float(header.get("PIXSCALE", 0.11))
+        det_name = str(header.get("DETECTOR", "WFI01"))
+        plots_dict = generate_diagnostic_plots(
+            profiles_data_or_path=cached_npz,
+            composite_epsf=epsf_model,
+            output_dir=out_dir,
+            sca_name=det_name,
+            pixel_scale=pix_s,
+        )
+        print(f"Generated Plot 1: {plots_dict['plot1']}")
+        print(f"Generated Plot 2: {plots_dict['plot2']}")
+        print("Done rendering Plots 1 & 2 from cache.")
+        return
 
     print(f"Loading composite ePSF model from {fits_path}...")
     with fits.open(fits_path) as hdul:
