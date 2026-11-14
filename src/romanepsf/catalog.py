@@ -226,26 +226,28 @@ def query_gaia_for_detector(
 
     ra_cen, dec_cen, radius_deg, ra_min, ra_max, dec_min, dec_max = get_detector_sky_bounds(l2_data)
 
-    # 1. Pull from precomputed master catalog if provided
+    # 1. Fast Spatial HEALPix Cache / Master Catalog Slice
+    from romanepsf.gaia_spatial import GaiaSpatialManager
+    hpx_dir = Path(cache_dir) / "gaia_healpix" if cache_dir else Path("cache/gaia_healpix")
+    mgr = GaiaSpatialManager(cache_dir=hpx_dir, precomputed_catalog=precomputed_catalog, mag_col=mag_col)
+    
+    # Check if we can slice from local HEALPix cache
+    sub = mgr.get_catalog_for_bounds(ra_min, ra_max, dec_min, dec_max, mag_limit=mag_limit)
+    if len(sub) > 0:
+        clean_sub = sanitize_source_catalog(sub, mag_col=mag_col)
+        if cache_file and not cache_file.is_file():
+            clean_sub.to_csv(cache_file, index=False)
+        return clean_sub
+
+    # 2. Pull from precomputed master catalog if provided directly
     if precomputed_catalog and Path(precomputed_catalog).is_file():
-        full_df = pd.read_csv(precomputed_catalog, low_memory=False)
-        full_df = sanitize_source_catalog(full_df, mag_col=mag_col)
-
-        effective_mag_col = mag_col if mag_col in full_df.columns else "phot_g_mean_mag"
-        sub = full_df[
-            (full_df["ra"] >= ra_min)
-            & (full_df["ra"] <= ra_max)
-            & (full_df["dec"] >= dec_min)
-            & (full_df["dec"] <= dec_max)
-        ].copy()
-
-        if effective_mag_col in sub.columns:
-            sub = sub[sub[effective_mag_col] <= mag_limit].copy()
-
+        mgr.partition_from_master_catalog(precomputed_catalog, mag_limit=mag_limit)
+        sub = mgr.get_catalog_for_bounds(ra_min, ra_max, dec_min, dec_max, mag_limit=mag_limit)
         if len(sub) > 0:
+            clean_sub = sanitize_source_catalog(sub, mag_col=mag_col)
             if cache_file:
-                sub.to_csv(cache_file, index=False)
-            return sub.reset_index(drop=True)
+                clean_sub.to_csv(cache_file, index=False)
+            return clean_sub
 
     # 2. Fallback to online Gaia DR3 query via TAP ADQL
     from astroquery.gaia import Gaia
@@ -568,29 +570,64 @@ def filter_isolated_stars(
     is_kept = np.ones(n, dtype=bool)
     min_clearance_px = min_dist_arcsec / pixel_scale
 
-    for i in range(n):
-        if not is_kept[i]:
-            continue
+    if n > 20:
+        from scipy.spatial import cKDTree
 
-        dx = coords[:, 0] - coords[i, 0]
-        dy = coords[:, 1] - coords[i, 1]
-        dist_px = np.hypot(dx, dy)
-        dist_px[i] = np.inf  # Ignore self
-
-        required_clearance = np.maximum(
-            isolation_safety_factor * (extensions_px[i] + extensions_px),
-            min_clearance_px,
+        tree = cKDTree(coords)
+        max_clearance = float(
+            max(np.max(extensions_px) * 2.0 * isolation_safety_factor, min_clearance_px)
         )
 
-        # Check only against currently active/kept stars
-        violators = np.where((dist_px < required_clearance) & is_kept)[0]
-        if len(violators) > 0:
-            # If any brighter star (index < i) violates clearance, star i must be rejected
-            if np.any(violators < i):
-                is_kept[i] = False
-            else:
-                # Violators are fainter (index > i); reject them to protect primary star i
-                is_kept[violators] = False
+        for i in range(n):
+            if not is_kept[i]:
+                continue
+
+            cand_indices = tree.query_ball_point(coords[i], r=max_clearance)
+            cand_indices = [idx for idx in cand_indices if idx != i and is_kept[idx]]
+
+            if not cand_indices:
+                continue
+
+            cand_arr = np.array(cand_indices, dtype=int)
+            dx = coords[cand_arr, 0] - coords[i, 0]
+            dy = coords[cand_arr, 1] - coords[i, 1]
+            dist_px = np.hypot(dx, dy)
+
+            req_clearance = np.maximum(
+                isolation_safety_factor * (extensions_px[i] + extensions_px[cand_arr]),
+                min_clearance_px,
+            )
+
+            violators = cand_arr[dist_px < req_clearance]
+            if len(violators) > 0:
+                if np.any(violators < i):
+                    is_kept[i] = False
+                else:
+                    is_kept[violators] = False
+    else:
+        for i in range(n):
+            if not is_kept[i]:
+                continue
+
+            dx = coords[:, 0] - coords[i, 0]
+            dy = coords[:, 1] - coords[i, 1]
+            dist_px = np.hypot(dx, dy)
+            dist_px[i] = np.inf  # Ignore self
+
+            required_clearance = np.maximum(
+                isolation_safety_factor * (extensions_px[i] + extensions_px),
+                min_clearance_px,
+            )
+
+            # Check only against currently active/kept stars
+            violators = np.where((dist_px < required_clearance) & is_kept)[0]
+            if len(violators) > 0:
+                # If any brighter star (index < i) violates clearance, star i must be rejected
+                if np.any(violators < i):
+                    is_kept[i] = False
+                else:
+                    # Violators are fainter (index > i); reject them to protect primary star i
+                    is_kept[violators] = False
 
     return df_sorted[is_kept].copy().reset_index(drop=True)
 

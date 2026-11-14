@@ -121,7 +121,21 @@ def cli(
     ctx.obj["verbose"] = verbose
 
 
-@cli.command("run", help="Execute complete end-to-end ePSF measurement pipeline across all 18 detectors.")
+@cli.command("run", help="Execute complete end-to-end ePSF measurement pipeline across all 18 detectors or batch SCA mode.")
+@click.option(
+    "--file-list",
+    "-fl",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Text file listing input Level 2 ASDF detector files (activates batch SCA pipeline).",
+)
+@click.option(
+    "--sca",
+    "-s",
+    type=str,
+    default=None,
+    help="Target Sensor Chip Assembly (e.g. 'wfi01') when processing file list.",
+)
 @click.option(
     "--input-dir",
     "-i",
@@ -135,6 +149,12 @@ def cli(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
     help="Path to precomputed source catalog CSV.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory for local HEALPix Parquet cache (default: 'cache/gaia_healpix').",
 )
 @click.option(
     "--config",
@@ -153,7 +173,6 @@ def cli(
 )
 @click.option(
     "--canvas-size",
-    "-s",
     type=int,
     default=None,
     help="Composite ePSF canvas dimension (e.g. 1025 or 2049). Default: 1025.",
@@ -180,8 +199,11 @@ def cli(
 @click.pass_context
 def run_command(
     ctx: click.Context,
+    file_list: Optional[Path],
+    sca: Optional[str],
     input_dir: Optional[Path],
     catalog: Optional[Path],
+    cache_dir: Optional[Path],
     sub_config: Optional[Path],
     output_dir: Optional[Path],
     canvas_size: Optional[int],
@@ -189,7 +211,7 @@ def run_command(
     detectors: Optional[str],
     num_workers: Optional[int],
 ):
-    """Execute complete end-to-end ePSF pipeline across all designated detectors."""
+    """Execute complete end-to-end ePSF pipeline across all designated detectors or file list."""
     if sub_config is not None:
         cfg = load_config(sub_config)
         ctx.obj["config"] = cfg
@@ -198,6 +220,12 @@ def run_command(
 
     logger: logging.Logger = ctx.obj["logger"]
 
+    if file_list is not None:
+        cfg.data.file_list = file_list
+    if sca is not None:
+        cfg.data.sca = sca
+    if cache_dir is not None:
+        cfg.data.gaia_cache_dir = cache_dir
     if input_dir is not None:
         cfg.data.detectors_dir = input_dir
     if catalog is not None:
@@ -228,7 +256,40 @@ def run_command(
         cfg.validate()
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
+        click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
+
+    # If file list is specified, run the high-throughput batch SCA pipeline
+    if cfg.data.file_list is not None:
+        target_sca = cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")
+        logger.info(
+            f"Executing High-Throughput Batch SCA Pipeline for {target_sca.upper()} "
+            f"using file list: {cfg.data.file_list}"
+        )
+        try:
+            from romanepsf.pipeline import run_sca_batch_pipeline
+
+            outputs = run_sca_batch_pipeline(
+                files=cfg.data.file_list,
+                sca_id=target_sca,
+                cfg=cfg,
+                output_dir=cfg.data.output_dir,
+                canvas_size=cfg.assembly.canvas_size,
+                num_workers=cfg.environment.num_workers,
+                gaia_cache_dir=cfg.data.gaia_cache_dir,
+                master_catalog_path=cfg.data.catalog_path,
+                device=cfg.environment.device,
+            )
+            logger.info(
+                f"Batch SCA pipeline completed successfully. Composite FITS model saved: {outputs.fits_path}"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Batch SCA pipeline execution failed: {e}")
+            if ctx.obj.get("verbose"):
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
 
     logger.info(f"Starting pipeline execution across detectors: {cfg.data.detectors}")
     try:
@@ -238,6 +299,148 @@ def run_command(
         logger.info(f"Pipeline completed successfully. FITS model saved to: {outputs.fits_path}")
     except Exception as e:
         logger.error(f"Pipeline execution failed: {e}")
+        if ctx.obj.get("verbose"):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+@cli.command("batch", help="High-throughput batch synthesis of 1 composite ePSF model for a specific SCA.")
+@click.option(
+    "--file-list",
+    "-fl",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Text file listing paths to Level 2 ASDF detector files (one per line).",
+)
+@click.option(
+    "--sca",
+    "-s",
+    type=str,
+    default=None,
+    help="Target Sensor Chip Assembly (e.g. 'wfi01'). Default: auto-detect from files.",
+)
+@click.option(
+    "--config",
+    "-c",
+    "sub_config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to YAML configuration file.",
+)
+@click.option(
+    "--catalog",
+    "-cat",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to precomputed Gaia master catalog CSV/Parquet (optional).",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory for local HEALPix Parquet cache (default: 'cache/gaia_healpix').",
+)
+@click.option(
+    "--output-dir",
+    "-o",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory to store synthesized models, FITS outputs, and logs.",
+)
+@click.option(
+    "--canvas-size",
+    type=int,
+    default=None,
+    help="Composite ePSF canvas dimension (e.g. 1025 or 2049). Default: 1025.",
+)
+@click.option(
+    "--device",
+    "-d",
+    type=click.Choice(["auto", "mps", "cuda", "cpu"], case_sensitive=False),
+    default=None,
+    help="Compute device for PyTorch operations ('auto', 'mps', 'cuda', 'cpu').",
+)
+@click.option(
+    "--num-workers",
+    "-w",
+    type=int,
+    default=None,
+    help="Number of parallel worker processes (e.g. 56).",
+)
+@click.pass_context
+def batch_command(
+    ctx: click.Context,
+    file_list: Path,
+    sca: Optional[str],
+    sub_config: Optional[Path],
+    catalog: Optional[Path],
+    cache_dir: Optional[Path],
+    output_dir: Optional[Path],
+    canvas_size: Optional[int],
+    device: Optional[str],
+    num_workers: Optional[int],
+):
+    """Execute high-throughput batch pipeline synthesizing 1 composite ePSF model for a specific SCA."""
+    if sub_config is not None:
+        cfg = load_config(sub_config)
+        ctx.obj["config"] = cfg
+    else:
+        cfg: Config = ctx.obj["config"]
+
+    logger: logging.Logger = ctx.obj["logger"]
+
+    cfg.data.file_list = file_list
+    if sca is not None:
+        cfg.data.sca = sca
+    if cache_dir is not None:
+        cfg.data.gaia_cache_dir = cache_dir
+    if catalog is not None:
+        cfg.data.catalog_path = catalog
+    if output_dir is not None:
+        cfg.data.output_dir = output_dir
+    if canvas_size is not None:
+        if canvas_size > 0 and canvas_size % 2 == 0:
+            canvas_size += 1
+        cfg.assembly.canvas_size = canvas_size
+    if device is not None:
+        cfg.environment.device = device.lower()
+        ctx.obj["device"] = resolve_device(cfg.environment.device)
+    if num_workers is not None:
+        cfg.environment.num_workers = num_workers
+
+    try:
+        cfg.validate()
+    except Exception as e:
+        logger.error(f"Configuration validation failed: {e}")
+        click.echo(f"Configuration validation failed: {e}", err=True)
+        sys.exit(1)
+
+    target_sca = cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")
+    logger.info(
+        f"Starting Batch SCA Pipeline for {target_sca.upper()} "
+        f"across file list: {file_list} with {cfg.environment.num_workers} workers"
+    )
+
+    try:
+        from romanepsf.pipeline import run_sca_batch_pipeline
+
+        outputs = run_sca_batch_pipeline(
+            files=file_list,
+            sca_id=target_sca,
+            cfg=cfg,
+            output_dir=cfg.data.output_dir,
+            canvas_size=cfg.assembly.canvas_size,
+            num_workers=cfg.environment.num_workers,
+            gaia_cache_dir=cfg.data.gaia_cache_dir,
+            master_catalog_path=cfg.data.catalog_path,
+            device=cfg.environment.device,
+        )
+        logger.info(
+            f"Batch SCA pipeline completed successfully. Composite FITS model saved: {outputs.fits_path}"
+        )
+    except Exception as e:
+        logger.error(f"Batch SCA pipeline execution failed: {e}")
         if ctx.obj.get("verbose"):
             import traceback
             traceback.print_exc()
@@ -325,6 +528,7 @@ def single_command(
         cfg.validate()
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
+        click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
 
     logger.info(f"Executing single-detector run on: {detector.upper()}")
@@ -534,6 +738,7 @@ def assemble_command(
         cfg.validate()
     except Exception as e:
         logger.error(f"Configuration validation failed: {e}")
+        click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
 
     out_fits = output_fits or (cfg.data.output_dir / "roman_epsf_composite.fits")

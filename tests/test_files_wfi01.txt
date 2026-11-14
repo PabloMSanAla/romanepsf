@@ -1,0 +1,2 @@
+# List of Roman Level 2 ASDF files for SCA WFI01
+/Users/pmsanch1/storage/ROMAN/simulated_comissioning/PID1083/detectors/r0108301001001001001_0001_wfi01_f146_cal.asdf

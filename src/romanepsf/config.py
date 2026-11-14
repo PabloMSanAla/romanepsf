@@ -82,6 +82,9 @@ class DataSection:
     catalog_path: Path = field(default_factory=lambda: Path("/Users/pmsanch1/storage/ROMAN/simulated_comissioning/PID1083/detectors/code/r0108301001001001001_0001_wfi_source_catalog.csv"))
     output_dir: Path = field(default_factory=lambda: Path("output"))
     cache_dir: Path = field(default_factory=lambda: Path("cache"))
+    gaia_cache_dir: Path = field(default_factory=lambda: Path("cache/gaia_healpix"))
+    file_list: Optional[Path] = None
+    sca: Optional[str] = None
     filter_name: str = "F146"
     detectors: List[str] = field(default_factory=lambda: ["wfi01"])
 
@@ -94,6 +97,10 @@ class DataSection:
             self.output_dir = Path(self.output_dir)
         if isinstance(self.cache_dir, str):
             self.cache_dir = Path(self.cache_dir)
+        if isinstance(self.gaia_cache_dir, str):
+            self.gaia_cache_dir = Path(self.gaia_cache_dir)
+        if isinstance(self.file_list, str):
+            self.file_list = Path(self.file_list)
         if isinstance(self.detectors, str):
             self.detectors = [self.detectors]
 

@@ -24,20 +24,25 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import asdf
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+import torch
 
 from romanepsf import __version__
 from romanepsf.config import PipelineConfig, Config, load_config, resolve_device
 from romanepsf.loader import load_l2_image, RomanL2Data
+from romanepsf.gaia_spatial import GaiaSpatialManager
 from romanepsf.catalog import (
     sanitize_source_catalog,
     get_detector_sky_bounds,
@@ -802,6 +807,466 @@ def run_pipeline(
     )
 
 
+def fast_scan_asdf_footprint(
+    asdf_path: Union[str, Path],
+    margin_deg: float = 0.02,
+) -> Tuple[str, Tuple[float, float, float, float, float, float, float]]:
+    """
+    Rapidly extract detector identifier and celestial bounding box from L2 ASDF header
+    without allocating 2D pixel image arrays (memory mapped, ~20ms execution).
+
+    Returns
+    -------
+    (detector_id, (ra_cen, dec_cen, radius_deg, ra_min, ra_max, dec_min, dec_max))
+    """
+    p = Path(asdf_path)
+    try:
+        with asdf.open(p, memmap=True) as af:
+            det = str(af.tree["roman"]["meta"]["instrument"]["detector"]).lower()
+            wcs = af.tree["roman"]["meta"]["wcs"]
+            pts = [(0.0, 0.0), (4087.0, 0.0), (4087.0, 4087.0), (0.0, 4087.0), (2044.0, 2044.0)]
+            ras, decs = [], []
+            for x, y in pts:
+                r, d = wcs(x, y)
+                if np.isfinite(r) and np.isfinite(d):
+                    ras.append(float(r))
+                    decs.append(float(d))
+            if not ras or not decs:
+                raise ValueError("WCS evaluation returned non-finite coordinates.")
+            cen_r, cen_d = wcs(2044.0, 2044.0)
+            ra_cen = float(cen_r) if np.isfinite(cen_r) else 0.5 * (min(ras) + max(ras))
+            dec_cen = float(cen_d) if np.isfinite(cen_d) else 0.5 * (min(decs) + max(decs))
+            diag = np.hypot(max(ras) - min(ras), max(decs) - min(decs))
+            radius = (diag / 2.0) + margin_deg
+            bounds = (
+                ra_cen,
+                dec_cen,
+                radius,
+                min(ras) - margin_deg,
+                max(ras) + margin_deg,
+                min(decs) - margin_deg,
+                max(decs) + margin_deg,
+            )
+            return det, bounds
+    except Exception as e:
+        logger.debug(f"Fast header scan failed for {p.name}: {e}. Falling back to load_l2_image.")
+        l2 = load_l2_image(p, calibrate=False)
+        det = l2.detector.lower()
+        bounds = get_detector_sky_bounds(l2, margin_deg=margin_deg)
+        del l2
+        gc.collect()
+        return det, bounds
+
+
+def _sca_file_worker_task(
+    task_args: Tuple[str, Optional[str], Optional[str], Optional[str], Config, Optional[Dict[str, int]]],
+) -> Tuple[str, Dict[str, List[StellarStamp]], Dict[str, Any]]:
+    """
+    Multiprocessing worker task for single L2 ASDF stamp extraction.
+    Ensures prompt deallocation of full image arrays to keep worker RSS << 4 GB.
+    """
+    asdf_path_str, target_sca, hpx_cache_dir, master_catalog_path, cfg, max_stars_per_file = task_args
+    asdf_path = Path(asdf_path_str)
+    t0 = time.perf_counter()
+    l2_data: Optional[RomanL2Data] = None
+    empty_stamps: Dict[str, List[StellarStamp]] = {"bright": [], "medium": [], "faint": []}
+
+    try:
+        l2_data = load_l2_image(asdf_path, calibrate=True)
+        det_name = l2_data.detector.lower()
+
+        if target_sca is not None and det_name != target_sca.lower():
+            return det_name, empty_stamps, {
+                "file": asdf_path.name,
+                "detector": det_name.upper(),
+                "status": "SKIPPED_WRONG_SCA",
+                "time_s": time.perf_counter() - t0,
+                "total": 0, "bright": 0, "medium": 0, "faint": 0,
+            }
+
+        ra_c, dec_c, rad, ra_min, ra_max, dec_min, dec_max = get_detector_sky_bounds(l2_data, margin_deg=0.02)
+
+        # Sub-millisecond slice from local HEALPix cache
+        mgr = GaiaSpatialManager(
+            cache_dir=hpx_cache_dir or "cache/gaia_healpix",
+            precomputed_catalog=master_catalog_path,
+            mag_col=cfg.catalog.mag_col,
+        )
+        cand = mgr.get_catalog_for_bounds(ra_min, ra_max, dec_min, dec_max, mag_limit=20.0)
+
+        if cand.empty:
+            # Fallback to general detector query if HEALPix cache miss
+            cand = query_gaia_for_detector(
+                l2_data=l2_data,
+                mag_limit=20.0,
+                cache_dir=cfg.data.cache_dir,
+                precomputed_catalog=master_catalog_path,
+                mag_col=cfg.catalog.mag_col,
+            )
+
+        if cand.empty:
+            return det_name, empty_stamps, {
+                "file": asdf_path.name,
+                "detector": det_name.upper(),
+                "status": "NO_STARS",
+                "time_s": time.perf_counter() - t0,
+                "total": 0, "bright": 0, "medium": 0, "faint": 0,
+            }
+
+        proj = project_catalog_to_pixels(
+            l2_data=l2_data,
+            catalog_df=cand,
+            margin_px=cfg.catalog.edge_margin_px,
+            tolerance_arcsec=cfg.catalog.roundtrip_tolerance_arcsec,
+        )
+        if proj.empty:
+            return det_name, empty_stamps, {
+                "file": asdf_path.name,
+                "detector": det_name.upper(),
+                "status": "NO_PROJECTED_STARS",
+                "time_s": time.perf_counter() - t0,
+                "total": 0, "bright": 0, "medium": 0, "faint": 0,
+            }
+
+        refined = refine_stellar_centroids(
+            l2_data=l2_data,
+            df=proj,
+            box_radius=cfg.catalog.centroid_refine_box_px,
+        )
+        isolated = filter_isolated_stars(
+            df=refined,
+            pixel_scale=float(l2_data.pixel_scale),
+            isolation_safety_factor=cfg.catalog.isolation_safety_factor,
+            min_dist_arcsec=cfg.catalog.min_dist_arcsec,
+            mag_col=cfg.catalog.mag_col,
+        )
+        if isolated.empty:
+            return det_name, empty_stamps, {
+                "file": asdf_path.name,
+                "detector": det_name.upper(),
+                "status": "NO_ISOLATED_STARS",
+                "time_s": time.perf_counter() - t0,
+                "total": 0, "bright": 0, "medium": 0, "faint": 0,
+            }
+
+        tiered = assign_stellar_tiers(
+            df=isolated,
+            bright_limit=cfg.tiers.bright_limit,
+            faint_limit=cfg.tiers.faint_limit,
+            mag_col=cfg.catalog.mag_col,
+        )
+
+        stamps_dict = process_star_stamps(
+            l2_data=l2_data,
+            catalog_df=tiered,
+            spikes_cfg=cfg.spikes,
+            stamps_cfg=cfg.stamps,
+        )
+
+        n_b = len(stamps_dict.get("bright", []))
+        n_m = len(stamps_dict.get("medium", []))
+        n_f = len(stamps_dict.get("faint", []))
+        n_tot = n_b + n_m + n_f
+
+        stats = {
+            "file": asdf_path.name,
+            "detector": det_name.upper(),
+            "bright": n_b,
+            "medium": n_m,
+            "faint": n_f,
+            "total": n_tot,
+            "status": "SUCCESS" if n_tot > 0 else "NO_VALID_STAMPS",
+            "time_s": time.perf_counter() - t0,
+            "pixel_scale": float(l2_data.pixel_scale),
+            "pa_aperture": float(l2_data.pa_aperture),
+        }
+        return det_name, stamps_dict, stats
+
+    except Exception as exc:
+        logger.warning(f"Worker failed on {asdf_path.name}: {exc}", exc_info=True)
+        return "unknown", empty_stamps, {
+            "file": asdf_path.name,
+            "detector": (target_sca or "unknown").upper(),
+            "status": f"ERROR: {str(exc)[:60]}",
+            "time_s": time.perf_counter() - t0,
+            "total": 0, "bright": 0, "medium": 0, "faint": 0,
+        }
+    finally:
+        if l2_data is not None:
+            del l2_data
+        gc.collect()
+
+
+def run_sca_batch_pipeline(
+    files: Union[Sequence[Union[str, Path]], str, Path],
+    sca_id: Optional[str] = None,
+    cfg: Optional[Union[Config, str, Path]] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    canvas_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+    gaia_cache_dir: Optional[Union[str, Path]] = None,
+    master_catalog_path: Optional[Union[str, Path]] = None,
+    device: Optional[str] = None,
+    max_stamps_per_tier: Optional[Dict[str, int]] = None,
+) -> PipelineOutputs:
+    """
+    High-throughput batch pipeline for synthesizing a composite extended PSF model
+    for a single Roman Sensor Chip Assembly (SCA) across hundreds/thousands of L2 images.
+
+    Architectural optimizations:
+    1. Pre-flight spatial harvesting: Aggregates all HEALPix tiles across input footprints
+       and fetches missing tiles in a single-threaded polite rate-limited phase to completely
+       prevent ESA Gaia TAP rate limits (HTTP 429).
+    2. Parallel multi-core multiprocessing via ProcessPoolExecutor: Full utilization of
+       large multi-core servers (e.g. 56-60 CPUs).
+    3. Strict per-image RAM reclamation (peak RSS << 4 GB per core, safe for 500 GB RAM).
+    4. Overlap flux scaling and annular blending into 1 composite model per SCA.
+    """
+    t_start = time.perf_counter()
+
+    # 1. Resolve Configuration
+    if cfg is None or isinstance(cfg, (str, Path)):
+        resolved_cfg = load_config(cfg) if cfg is not None else load_config()
+    else:
+        resolved_cfg = cfg
+
+    if output_dir is not None:
+        resolved_cfg.data.output_dir = Path(output_dir)
+    if canvas_size is not None:
+        resolved_cfg.assembly.canvas_size = int(canvas_size)
+    if device is not None:
+        resolved_cfg.environment.device = str(device).lower()
+    if num_workers is not None:
+        resolved_cfg.environment.num_workers = int(num_workers)
+    if master_catalog_path is not None:
+        resolved_cfg.data.catalog_path = Path(master_catalog_path)
+    if gaia_cache_dir is not None:
+        resolved_cfg.data.gaia_cache_dir = Path(gaia_cache_dir)
+
+    resolved_cfg.validate()
+    resolved_cfg.data.output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_hpx_dir = resolved_cfg.data.gaia_cache_dir
+    resolved_hpx_dir.mkdir(parents=True, exist_ok=True)
+
+    # 2. Parse and Expand Input File List
+    raw_files: List[Path] = []
+    if isinstance(files, (str, Path)):
+        p_files = Path(files)
+        if p_files.is_file() and p_files.suffix.lower() in [".txt", ".lst", ".list", ".csv"]:
+            with open(p_files, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        raw_files.append(Path(stripped))
+        elif p_files.is_file():
+            raw_files.append(p_files)
+        elif p_files.is_dir():
+            raw_files.extend(sorted(p_files.glob("*_cal.asdf")))
+        else:
+            raise FileNotFoundError(f"Specified input path does not exist: {p_files}")
+    else:
+        for f in files:
+            p = Path(f)
+            if p.is_file():
+                raw_files.append(p)
+
+    if not raw_files:
+        raise ValueError("No valid input L2 ASDF files found to process.")
+
+    logger.info(f"Loaded {len(raw_files)} total input file path(s).")
+
+    # 3. Detect or Filter Target SCA
+    target_sca = sca_id.lower().strip() if sca_id else None
+    if target_sca is None:
+        # Auto-detect from first file
+        det_found, _ = fast_scan_asdf_footprint(raw_files[0])
+        target_sca = det_found
+        logger.info(f"Auto-detected target SCA: {target_sca.upper()} from {raw_files[0].name}")
+
+    # Filter files belonging to target_sca
+    matching_files: List[Path] = []
+    pattern = re.compile(rf"_{target_sca}_", re.IGNORECASE)
+    for f in raw_files:
+        if pattern.search(f.name):
+            matching_files.append(f)
+
+    if not matching_files:
+        # Fallback to header inspection if filename doesn't contain standard SCA token
+        logger.info(f"Filename pattern didn't match '{target_sca}'; verifying via ASDF headers...")
+        for f in raw_files:
+            det, _ = fast_scan_asdf_footprint(f)
+            if det == target_sca:
+                matching_files.append(f)
+
+    if not matching_files:
+        raise ValueError(f"No files matched target SCA '{target_sca.upper()}' out of {len(raw_files)} inputs.")
+
+    logger.info(
+        f"Selected {len(matching_files)} file(s) for target SCA: {target_sca.upper()}"
+    )
+
+    # 4. Pre-Flight Spatial Harvesting (Zero Gaia API Overload)
+    logger.info("Starting Pre-Flight celestial coverage scan...")
+    mgr = GaiaSpatialManager(
+        cache_dir=resolved_hpx_dir,
+        precomputed_catalog=resolved_cfg.data.catalog_path,
+        mag_col=resolved_cfg.catalog.mag_col,
+    )
+
+    all_required_tiles: set[int] = set()
+    for f in matching_files:
+        _, (ra_c, dec_c, rad, _, _, _, _) = fast_scan_asdf_footprint(f)
+        tiles = mgr.query_disc_tiles(ra_c, dec_c, rad)
+        all_required_tiles.update(tiles)
+
+    missing_tiles = mgr.get_missing_tiles(sorted(all_required_tiles))
+    logger.info(
+        f"Pre-Flight scan: {len(all_required_tiles)} HEALPix tiles cover all footprints. "
+        f"Missing from local cache: {len(missing_tiles)}."
+    )
+
+    if missing_tiles:
+        if resolved_cfg.data.catalog_path and resolved_cfg.data.catalog_path.is_file():
+            logger.info("Partitioning missing tiles from local master catalog...")
+            mgr.partition_from_master_catalog(target_tiles=missing_tiles)
+            missing_tiles = mgr.get_missing_tiles(missing_tiles)
+
+        if missing_tiles:
+            logger.info(
+                f"Fetching {len(missing_tiles)} missing tiles via rate-limited TAP (polite single-threaded)..."
+            )
+            mgr.fetch_missing_tiles_polite(missing_tiles, delay_seconds=1.5)
+
+    # 5. Multiprocessing Parallel Stamp Extraction
+    n_cpus = os.cpu_count() or 4
+    default_workers = max(1, min(len(matching_files), n_cpus - 2, 56))
+    effective_workers = (
+        resolved_cfg.environment.num_workers
+        if resolved_cfg.environment.num_workers > 0
+        else default_workers
+    )
+
+    logger.info(
+        f"Launching parallel extraction across {effective_workers} worker processes "
+        f"for {len(matching_files)} image(s)..."
+    )
+
+    pooled_stamps: Dict[str, List[StellarStamp]] = {"bright": [], "medium": [], "faint": []}
+    detector_summaries: List[Dict[str, Any]] = []
+
+    tasks = [
+        (
+            str(f),
+            target_sca,
+            str(resolved_hpx_dir),
+            str(resolved_cfg.data.catalog_path) if resolved_cfg.data.catalog_path.is_file() else None,
+            resolved_cfg,
+            None,
+        )
+        for f in matching_files
+    ]
+
+    if effective_workers <= 1:
+        for task in tasks:
+            det_name, stamps_dict, stats = _sca_file_worker_task(task)
+            detector_summaries.append(stats)
+            for tier in ["bright", "medium", "faint"]:
+                pooled_stamps[tier].extend(stamps_dict.get(tier, []))
+    else:
+        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+            futures = [executor.submit(_sca_file_worker_task, t) for t in tasks]
+            completed_count = 0
+            for fut in as_completed(futures):
+                completed_count += 1
+                det_name, stamps_dict, stats = fut.result()
+                detector_summaries.append(stats)
+                for tier in ["bright", "medium", "faint"]:
+                    pooled_stamps[tier].extend(stamps_dict.get(tier, []))
+
+                if completed_count % 10 == 0 or completed_count == len(matching_files):
+                    logger.info(
+                        f"Processed {completed_count}/{len(matching_files)} files | "
+                        f"Pooled: B={len(pooled_stamps['bright'])}, "
+                        f"M={len(pooled_stamps['medium'])}, "
+                        f"F={len(pooled_stamps['faint'])}"
+                    )
+
+    total_pooled = sum(len(v) for v in pooled_stamps.values())
+    if total_pooled == 0:
+        raise RuntimeError(
+            f"No valid stars extracted across {len(matching_files)} files for SCA {target_sca.upper()}."
+        )
+
+    # 6. Reservoir Sampling / Tier Capacity Capping
+    caps = max_stamps_per_tier or {}
+    for tier in ["bright", "medium", "faint"]:
+        cap = caps.get(tier)
+        if cap is None and hasattr(resolved_cfg.tiers.max_stars_per_tier, tier):
+            cap = getattr(resolved_cfg.tiers.max_stars_per_tier, tier)
+
+        if cap and len(pooled_stamps[tier]) > cap:
+            # Keep highest SNR / cleanest stamps
+            pooled_stamps[tier].sort(
+                key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
+                reverse=True,
+            )
+            pooled_stamps[tier] = pooled_stamps[tier][:cap]
+            logger.info(f"Reservoir sampled '{tier}' tier to top {cap} highest SNR stamps.")
+
+    logger.info(
+        f"Final stamp pool for {target_sca.upper()}: "
+        f"Bright={len(pooled_stamps['bright'])}, "
+        f"Medium={len(pooled_stamps['medium'])}, "
+        f"Faint={len(pooled_stamps['faint'])} (Total={sum(len(v) for v in pooled_stamps.values())})"
+    )
+
+    # 7. Composite Canvas Assembly
+    torch_dev = resolved_cfg.get_torch_device()
+    if torch_dev.type == "cpu":
+        torch.set_num_threads(effective_workers)
+
+    t_asm_start = time.perf_counter()
+    composite_epsf, diagnostics = assemble_composite_extended_psf(
+        tier_stamps=pooled_stamps,
+        output_size=resolved_cfg.assembly.canvas_size,
+        cfg=resolved_cfg.assembly,
+        device=torch_dev,
+    )
+    t_asm = time.perf_counter() - t_asm_start
+
+    # 8. Serialize 4-HDU Composite FITS
+    fits_path = resolved_cfg.data.output_dir / f"roman_epsf_{target_sca.lower()}_composite.fits"
+    serialize_composite_epsf_fits(
+        composite_epsf=composite_epsf,
+        diagnostics=diagnostics,
+        detector_summaries=detector_summaries,
+        output_fits_path=fits_path,
+        filter_name=resolved_cfg.data.filter_name,
+        pixel_scale=0.11,
+    )
+    logger.info(f"Composite extended PSF for {target_sca.upper()} successfully saved to: {fits_path}")
+
+    total_time = time.perf_counter() - t_start
+    diagnostics.update({
+        "target_sca": target_sca.upper(),
+        "input_files_count": len(matching_files),
+        "detector_summaries": detector_summaries,
+        "assembly_time_s": t_asm,
+        "total_pipeline_time_s": total_time,
+        "fits_path": fits_path,
+    })
+
+    return PipelineOutputs(
+        composite_epsf=composite_epsf,
+        fits_path=fits_path,
+        diagnostics=diagnostics,
+        detector_results={},
+        detector_summaries=detector_summaries,
+        pooled_stamps=pooled_stamps,
+        stamps_by_tier=pooled_stamps,
+    )
+
+
 __all__ = [
     "SingleDetectorResult",
     "PipelineOutputs",
@@ -811,4 +1276,6 @@ __all__ = [
     "export_single_detector_fits",
     "run_single_detector",
     "run_pipeline",
+    "fast_scan_asdf_footprint",
+    "run_sca_batch_pipeline",
 ]

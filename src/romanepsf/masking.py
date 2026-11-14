@@ -2209,18 +2209,21 @@ def mask_contaminants_with_spikes_protected(
             mf = float(getattr(mto2_cfg, "move_factor", 0.1)) if mto2_cfg else 0.1
             ar = float(getattr(mto2_cfg, "area_ratio", 0.90)) if mto2_cfg else 0.90
             dil = int(getattr(mto2_cfg, "dilation_px", 2)) if mto2_cfg else 2
-            return _detect_contaminants_mto2(
-                res_or_stamp,
-                (cx, cy),
-                core_protection_radius_px,
-                prot_area,
-                dq_mask=dq_mask,
-                s_sigma=s_sig,
-                alpha=alp,
-                move_factor=mf,
-                area_ratio=ar,
-                dilation_px=dil,
-            )
+            try:
+                return _detect_contaminants_mto2(
+                    res_or_stamp,
+                    (cx, cy),
+                    core_protection_radius_px,
+                    prot_area,
+                    dq_mask=dq_mask,
+                    s_sigma=s_sig,
+                    alpha=alp,
+                    move_factor=mf,
+                    area_ratio=ar,
+                    dilation_px=dil,
+                )
+            except ImportError:
+                logger.debug("MTO2 unavailable (higra missing); falling back to erosion_dilation.")
         return _detect_contaminants_erosion_dilation(
             res_or_stamp,
             prot_area,
