@@ -536,6 +536,36 @@ def process_star_stamps(
             sub_dy = cy - iy
             aligned_data, aligned_mask = recenter_and_align_stamp(flux_cutout, mask, (sub_dx, sub_dy))
 
+            # Record companion stars within stamp for debug diagnostics & overlay
+            stamp_companions = []
+            if comps_table is not None and isinstance(comps_table, pd.DataFrame):
+                max_extent = half + 50.0
+                df_c = comps_table[
+                    (comps_table["x"] >= cx - max_extent)
+                    & (comps_table["x"] <= cx + max_extent)
+                    & (comps_table["y"] >= cy - max_extent)
+                    & (comps_table["y"] <= cy + max_extent)
+                ]
+                for _, c_row in df_c.iterrows():
+                    if "source_id" in c_row and str(c_row["source_id"]) == str(row.get("source_id")):
+                        continue
+                    sc_x = (half + sub_dx) + (float(c_row["x"]) - cx)
+                    sc_y = (half + sub_dy) + (float(c_row["y"]) - cy)
+                    dist_c = np.hypot(sc_x - (half + sub_dx), sc_y - (half + sub_dy))
+                    if dist_c <= core_rad:
+                        continue
+                    c_mag = float(c_row.get("phot_g_mean_mag", c_row.get("mag_lambda", c_row.get(mag_col, companion_depth))))
+                    from romanepsf.catalog import get_psf_extension_moffat
+                    r_ext = max(float(get_psf_extension_moffat(c_mag, depth=companion_depth)) / pixel_scale, 3.0)
+                    if (sc_x + r_ext >= 0) and (sc_x - r_ext < sz) and (sc_y + r_ext >= 0) and (sc_y - r_ext < sz):
+                        stamp_companions.append({
+                            "source_id": c_row.get("source_id", "Companion"),
+                            "x": sc_x,
+                            "y": sc_y,
+                            "radius_px": r_ext,
+                            "mag": c_mag,
+                        })
+
             rad_model = (flux_cutout - res_map) if res_map is not None else flux_cutout
             debug_dict = {
                 "raw_stamp": flux_cutout,
@@ -545,6 +575,7 @@ def process_star_stamps(
                 "conversion_factor": float(getattr(l2_data, "conversion_factor", 1.0)),
                 "is_calibrated": bool(getattr(l2_data, "is_calibrated", True)),
                 "center_stamp": (half + sub_dx, half + sub_dy),
+                "gaia_companions": stamp_companions,
             }
 
             stamp_obj = StellarStamp(

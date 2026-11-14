@@ -131,9 +131,25 @@ def generate_debug_figure1_masking_procedure(
         for spine in ax.spines.values():
             spine.set_color("#30363d")
 
-        # In panel 4, overlay subtle red contour on masked regions
-        if idx == 3 and np.any(final_mask):
-            ax.contour(final_mask, levels=[0.5], colors=["#ff5252"], linewidths=1.0)
+        # In panel 4, overlay subtle red contour on masked regions and circle Gaia companion stars
+        if idx == 3:
+            if np.any(final_mask):
+                ax.contour(final_mask, levels=[0.5], colors=["#ff5252"], linewidths=1.0)
+            comps = info.get("gaia_companions", [])
+            for c_idx, comp in enumerate(comps):
+                circ = Circle(
+                    (comp["x"], comp["y"]),
+                    comp["radius_px"],
+                    fill=False,
+                    edgecolor="#ffd600",
+                    linestyle="--",
+                    linewidth=1.4,
+                    label="Gaia Companion Mask" if c_idx == 0 else None,
+                )
+                ax.add_patch(circ)
+                ax.plot(comp["x"], comp["y"], "+", color="#ffd600", markersize=7, markeredgewidth=1.3)
+            if len(comps) > 0:
+                ax.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     # Shared colorbar
     cbar_ax = fig.add_axes([0.92, 0.15, 0.015, 0.7])
@@ -217,6 +233,22 @@ def generate_debug_figure2_apertures_and_profile(
 
     # Highlight centroid
     ax1.plot(cx, cy, "+", color="#00e5ff", markersize=10, markeredgewidth=1.5, label="Centroid")
+
+    # Overlay Gaia companion star circular apertures
+    comps = info.get("gaia_companions", [])
+    for c_idx, comp in enumerate(comps):
+        circ = Circle(
+            (comp["x"], comp["y"]),
+            comp["radius_px"],
+            fill=False,
+            edgecolor="#ffd600",
+            linestyle="--",
+            linewidth=1.4,
+            label="Gaia Companion Mask" if c_idx == 0 else None,
+        )
+        ax1.add_patch(circ)
+        ax1.plot(comp["x"], comp["y"], "+", color="#ffd600", markersize=7, markeredgewidth=1.3)
+
     ax1.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
 
     cbar1 = fig.colorbar(im1, ax=ax1, shrink=0.85)
@@ -600,6 +632,7 @@ def generate_all_debug_plots(
             "source_id": sid,
             "tier": tier_name,
             "mag": mag_val,
+            "gaia_companions": dbg.get("gaia_companions", []),
         }
 
         # Measure 1D profile for the star stamp

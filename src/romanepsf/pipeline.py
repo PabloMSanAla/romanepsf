@@ -310,13 +310,33 @@ def process_single_detector_stamps(
         )
         t_proj = time.perf_counter() - t_proj_start
 
+        # Always obtain full detector Gaia catalog for companion star masking
+        full_companions = refined
+        try:
+            full_gaia = query_gaia_for_detector(
+                l2_data=l2_data,
+                mag_limit=20.0,
+                cache_dir=cfg.data.cache_dir,
+                precomputed_catalog=None,
+                mag_col=cfg.catalog.mag_col,
+            )
+            if not full_gaia.empty:
+                full_companions = project_catalog_to_pixels(
+                    l2_data=l2_data,
+                    catalog_df=full_gaia,
+                    margin_px=100.0,
+                    tolerance_arcsec=cfg.catalog.roundtrip_tolerance_arcsec,
+                )
+        except Exception as e:
+            logger.warning(f"Could not load full Gaia companions for masking ({e}); falling back to target catalog.")
+
         t_stamps_start = time.perf_counter()
         stamps_dict = process_star_stamps(
             l2_data=l2_data,
             catalog_df=tiered,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
-            companion_stars=refined,
+            companion_stars=full_companions,
         )
         t_stamps = time.perf_counter() - t_stamps_start
 
@@ -622,6 +642,26 @@ def run_single_detector(
             mag_col=cfg.catalog.mag_col,
         )
 
+        # Always obtain full detector Gaia catalog for companion star masking
+        full_companions_df = refined_df
+        try:
+            full_gaia_df = query_gaia_for_detector(
+                l2_data=l2_data,
+                mag_limit=20.0,
+                cache_dir=cfg.data.cache_dir,
+                precomputed_catalog=None,
+                mag_col=cfg.catalog.mag_col,
+            )
+            if not full_gaia_df.empty:
+                full_companions_df = project_catalog_to_pixels(
+                    l2_data=l2_data,
+                    catalog_df=full_gaia_df,
+                    margin_px=100.0,
+                    tolerance_arcsec=cfg.catalog.roundtrip_tolerance_arcsec,
+                )
+        except Exception as e:
+            logger.warning(f"Could not load full Gaia companions for masking ({e}); falling back to target catalog.")
+
         # 12. Extract Stamps, Bicubic Subpixel Align, and Mask Contaminants (with Spike Protection)
         logger.info(f"Extracting postage stamps for detector {resolved_detector.upper()}...")
         stamps_by_tier = process_star_stamps(
@@ -629,7 +669,7 @@ def run_single_detector(
             catalog_df=tiered_df,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
-            companion_stars=refined_df,
+            companion_stars=full_companions_df,
         )
 
     finally:
