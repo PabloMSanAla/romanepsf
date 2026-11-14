@@ -116,7 +116,7 @@ def sample_config_dict() -> dict:
                 "min_length_px": 15,
                 "dilation_iterations": 2,
             },
-            "contaminant_detection_sigma": 3.0,
+            "contaminant_detection_sigma": 1.3,
         },
         "profile": {
             "ellipticity": 0.0,

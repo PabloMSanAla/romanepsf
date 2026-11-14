@@ -193,7 +193,7 @@ class SpikesSection:
     width_growth_rate: float = 0.025
     core_protection_radius_px: CoreProtectionRadius = field(default_factory=CoreProtectionRadius)
     morphological: MorphologicalConfig = field(default_factory=MorphologicalConfig)
-    contaminant_detection_sigma: float = 3.0
+    contaminant_detection_sigma: float = 1.3
     contaminant_detector: str = "erosion_dilation"
     mto2: MTO2ConfigSection = field(default_factory=MTO2ConfigSection)
 

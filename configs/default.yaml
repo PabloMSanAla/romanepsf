@@ -64,7 +64,7 @@ spikes:
     threshold_sigma: 2.0
     min_length_px: 15
     dilation_iterations: 2
-  contaminant_detection_sigma: 3.0
+  contaminant_detection_sigma: 1.3
   contaminant_detector: "mto2" # Options: 'mto2', 'erosion_dilation'
   mto2:
     s_sigma: 1.6

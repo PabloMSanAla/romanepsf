@@ -2220,9 +2220,9 @@ def mask_contaminants_with_spikes_protected(
     else:
         core_protection_radius_px = float(core_protection_radius_px)
 
-    # Resolve detection threshold (user formula: median + 1.5 * std)
+    # Resolve detection threshold
     if detection_sigma is None:
-        detection_sigma = float(getattr(spikes_cfg, "contaminant_detection_sigma", 1.5))
+        detection_sigma = float(getattr(spikes_cfg, "contaminant_detection_sigma", 1.3))
     else:
         detection_sigma = float(detection_sigma)
 
@@ -2366,8 +2366,8 @@ def mask_contaminants_with_spikes_protected(
         protected_stellar_area = _build_spike_and_core_protection(residual)
         core_region = (r_map_2d <= core_protection_radius_px)
 
-        # 2. Contaminant detection via 2-sigma thresholding above background/local residual scatter
-        det_sig = float(detection_sigma) if detection_sigma is not None else 2.0
+        # 2. Contaminant detection via 1.3-sigma thresholding above background/local residual scatter
+        det_sig = float(detection_sigma) if detection_sigma is not None else 1.3
         from astropy.stats import mad_std
         outer_finite = (r_map_2d > (nx // 3)) & np.isfinite(residual) & (~protected_stellar_area)
         bkg_sigma = float(mad_std(residual[outer_finite], ignore_nan=True)) if np.any(outer_finite) else 0.05
