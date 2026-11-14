@@ -44,6 +44,7 @@ class StellarStamp:
     bkg_value: float = 0.0      # Estimated local background subtracted from stamp
     bkg_rms: float = 0.0        # Background RMS uncertainty
     oversample: int = 1         # Subpixel oversampling factor (e.g. 4 for faint/medium)
+    debug_info: Optional[Dict[str, Any]] = None
 
 
 # Alias for PROJECT.md contract compatibility
@@ -495,9 +496,10 @@ def process_star_stamps(
             comps_table = companion_stars if companion_stars is not None else catalog_df
             det_id = getattr(l2_data, "detector", None)
             bp_id = getattr(l2_data, "filter_name", "F146")
+            res_map = None
             if mask_contaminants_with_spikes_protected is not None:
                 if spikes_cfg is not None:
-                    mask, _, _ = mask_contaminants_with_spikes_protected(
+                    mask, _, res_map = mask_contaminants_with_spikes_protected(
                         flux_cutout,
                         dq_mask_bool,
                         pa_aperture=roll_ref,
@@ -512,7 +514,7 @@ def process_star_stamps(
                         var_poisson=raw_vp,
                     )
                 else:
-                    mask, _, _ = mask_contaminants_with_spikes_protected(
+                    mask, _, res_map = mask_contaminants_with_spikes_protected(
                         flux_cutout,
                         dq_mask_bool,
                         pa_offset_deg=roll_ref,
@@ -534,6 +536,17 @@ def process_star_stamps(
             sub_dy = cy - iy
             aligned_data, aligned_mask = recenter_and_align_stamp(flux_cutout, mask, (sub_dx, sub_dy))
 
+            rad_model = (flux_cutout - res_map) if res_map is not None else flux_cutout
+            debug_dict = {
+                "raw_stamp": flux_cutout,
+                "unaligned_mask": mask,
+                "residual": res_map if res_map is not None else np.zeros_like(flux_cutout),
+                "radial_model": rad_model,
+                "conversion_factor": float(getattr(l2_data, "conversion_factor", 1.0)),
+                "is_calibrated": bool(getattr(l2_data, "is_calibrated", True)),
+                "center_stamp": (half + sub_dx, half + sub_dy),
+            }
+
             stamp_obj = StellarStamp(
                 source_id=row.get("source_id", None),
                 tier=tier,
@@ -545,6 +558,7 @@ def process_star_stamps(
                 norm_factor=1.0,
                 bkg_value=bkg_val,
                 bkg_rms=bkg_rms,
+                debug_info=debug_dict,
             )
             stamps_by_tier[tier].append(stamp_obj)
 

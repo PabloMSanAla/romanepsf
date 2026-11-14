@@ -106,6 +106,9 @@ from .report import (
     ReportDataBundle,
     generate_publication_pdf_report,
 )
+from .debug_plots import (
+    generate_all_debug_plots,
+)
 
 __all__ = [
     "__version__",
@@ -173,4 +176,5 @@ __all__ = [
     "evaluate_epsf_validation",
     "ReportDataBundle",
     "generate_publication_pdf_report",
+    "generate_all_debug_plots",
 ]

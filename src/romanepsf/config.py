@@ -67,6 +67,7 @@ class PipelineSection:
     integrity_mode: str = "development"
     log_level: str = "INFO"
     random_seed: int = 42
+    debug: Optional[int] = None
 
 
 @dataclass
@@ -315,6 +316,11 @@ class PipelineConfig:
         if self.tiers.bright_limit >= self.tiers.faint_limit:
             raise ValueError(
                 f"bright_limit must be strictly less than faint_limit: {self.tiers.bright_limit} >= {self.tiers.faint_limit}"
+            )
+
+        if self.pipeline.debug is not None and self.pipeline.debug <= 0:
+            raise ValueError(
+                f"pipeline.debug must be a positive integer, got {self.pipeline.debug}"
             )
 
         if self.profile.growth_rate <= 1.0:

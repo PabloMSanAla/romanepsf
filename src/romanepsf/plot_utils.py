@@ -299,11 +299,16 @@ def generate_diagnostic_plots(
         "bright": ("#ff9800", 0.35, 1.0),
     }
 
+    # Scale master curve to peak at 10^11 to match [10^-2, 10^11] dynamic range
+    max_1d = float(np.nanmax(f_composite)) if len(f_composite) > 0 else 1.0
+    scale_1d = (1e11 / max_1d) if (max_1d > 0 and max_1d < 1.0) else 1.0
+    f_comp_plot = f_composite * scale_1d
+
     # Plot individual normalized star profiles in background
     for i in range(n_stars_total):
         t = str(star_tiers[i])
         col, alpha_val, lw = tier_colors.get(t, ("#888888", 0.15, 0.8))
-        f_vals = star_fluxes[i]
+        f_vals = star_fluxes[i] * scale_1d
         valid = np.isfinite(f_vals) & (f_vals > 0)
         if np.any(valid):
             ax1.plot(r_grid[valid], f_vals[valid], color=col, alpha=alpha_val, linewidth=lw)
@@ -318,13 +323,13 @@ def generate_diagnostic_plots(
     ax1.axvspan(30.0, 48.0, color="#ffd600", alpha=0.12, label="Medium-Bright Blend ($30-48$ px / $3.3-5.3''$)")
 
     # Foreground: Final Composite ePSF profile
-    ax1.plot(r_composite, f_composite, color="#ffffff", linewidth=3.0, label="Final Composite ePSF (Multi-Tier Blend)")
-    ax1.plot(r_composite, f_composite, color="#00e5ff", linewidth=1.6, linestyle="--")
+    ax1.plot(r_composite, f_comp_plot, color="#ffffff", linewidth=3.0, label="Final Composite ePSF (Multi-Tier Blend)")
+    ax1.plot(r_composite, f_comp_plot, color="#00e5ff", linewidth=1.6, linestyle="--")
 
     ax1.set_xscale("log")
     ax1.set_yscale("log")
     ax1.set_xlim(0.1, 520.0)
-    ax1.set_ylim(1e-9, 1e-1)
+    ax1.set_ylim(1e-2, 1e11)
 
     ax1.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=12, labelpad=8)
@@ -366,12 +371,17 @@ def generate_diagnostic_plots(
         -half_canvas * pixel_scale, half_canvas * pixel_scale,
     ]
 
-    vmin_2d = 1e-8
-    vmax_2d = float(np.nanmax(composite_epsf))
-    norm_2d = LogNorm(vmin=vmin_2d, vmax=max(vmax_2d, 1e-3))
+    vmin_2d = 1e-2
+    vmax_2d = 1e11
+    norm_2d = LogNorm(vmin=vmin_2d, vmax=vmax_2d)
+
+    # Scale peak to 10^11 to match [10^-2, 10^11] dynamic range
+    max_2d = float(np.nanmax(composite_epsf))
+    scale_2d = (1e11 / max_2d) if (max_2d > 0 and max_2d < 1.0) else 1.0
+    scaled_epsf = composite_epsf * scale_2d
 
     im2 = ax2.imshow(
-        np.maximum(composite_epsf, vmin_2d),
+        np.maximum(scaled_epsf, vmin_2d),
         origin="lower",
         cmap="inferno",
         norm=norm_2d,
@@ -406,7 +416,7 @@ def generate_diagnostic_plots(
     ax_inset.set_facecolor("#161b22")
     core_rad_inset = min(22, canvas_size // 4)
     c_mid = canvas_size // 2
-    core_cutout = composite_epsf[
+    core_cutout = scaled_epsf[
         c_mid - core_rad_inset : c_mid + core_rad_inset + 1,
         c_mid - core_rad_inset : c_mid + core_rad_inset + 1,
     ]
@@ -415,10 +425,10 @@ def generate_diagnostic_plots(
         -core_rad_inset * pixel_scale, core_rad_inset * pixel_scale,
     ]
     ax_inset.imshow(
-        np.maximum(core_cutout, 1e-4),
+        np.maximum(core_cutout, vmin_2d),
         origin="lower",
         cmap="inferno",
-        norm=LogNorm(vmin=1e-4, vmax=vmax_2d),
+        norm=LogNorm(vmin=vmin_2d, vmax=vmax_2d),
         extent=extent_inset,
     )
     ax_inset.set_title(f"Core Zoom ({2*core_rad_inset+1}x{2*core_rad_inset+1} px)", color="#e6edf3", fontsize=8.5, fontweight="bold", pad=3)

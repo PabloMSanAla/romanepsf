@@ -68,6 +68,7 @@ from romanepsf.assembly import (
     serialize_composite_epsf_fits,
 )
 from romanepsf.plot_utils import save_radial_profiles_data, generate_diagnostic_plots
+from romanepsf.debug_plots import generate_all_debug_plots
 
 logger = logging.getLogger("romanepsf.pipeline")
 
@@ -135,6 +136,46 @@ class PipelineOutputs:
             self.stamps_by_tier = self.pooled_stamps
         elif self.pooled_stamps is None and self.stamps_by_tier is not None:
             self.pooled_stamps = self.stamps_by_tier
+
+
+def allocate_debug_stars_per_tier(
+    total_stars: int,
+    available_counts: Dict[str, int],
+) -> Dict[str, int]:
+    """
+    Evenly partition X debug stars across bright, medium, and faint tiers,
+    rebalancing overflow/shortfall to maximize tier diversity up to total_stars.
+    """
+    tiers = ["bright", "medium", "faint"]
+    total_avail = sum(available_counts.get(t, 0) for t in tiers)
+    target = min(total_stars, total_avail)
+    if target <= 0:
+        return {t: 0 for t in tiers}
+
+    base = target // 3
+    rem = target % 3
+    targets = {
+        "bright": min(available_counts.get("bright", 0), base + (1 if rem > 0 else 0)),
+        "medium": min(available_counts.get("medium", 0), base + (1 if rem > 1 else 0)),
+        "faint": min(available_counts.get("faint", 0), base),
+    }
+
+    curr_total = sum(targets.values())
+    shortfall = target - curr_total
+
+    while shortfall > 0:
+        allocated = False
+        for t in ["medium", "faint", "bright"]:
+            if targets[t] < available_counts.get(t, 0):
+                targets[t] += 1
+                shortfall -= 1
+                allocated = True
+                if shortfall == 0:
+                    break
+        if not allocated:
+            break
+
+    return targets
 
 
 def discover_detectors(
@@ -596,6 +637,24 @@ def run_single_detector(
         del l2_data
         gc.collect()
 
+    if cfg.pipeline.debug is not None:
+        debug_x = int(cfg.pipeline.debug)
+        tier_alloc = allocate_debug_stars_per_tier(
+            debug_x,
+            {t: len(stamps_by_tier.get(t, [])) for t in ["bright", "medium", "faint"]},
+        )
+        for tier in ["bright", "medium", "faint"]:
+            n_keep = tier_alloc[tier]
+            stamps_by_tier[tier].sort(
+                key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
+                reverse=True,
+            )
+            stamps_by_tier[tier] = stamps_by_tier[tier][:n_keep]
+        logger.info(
+            f"DEBUG MODE (--debug {debug_x}): Selected {sum(len(v) for v in stamps_by_tier.values())} "
+            f"stars across tiers: B={len(stamps_by_tier['bright'])}, M={len(stamps_by_tier['medium'])}, F={len(stamps_by_tier['faint'])}"
+        )
+
     # 13. 2D Composite ePSF Assembly with Multi-Tier Fallback
     logger.info(
         f"Synthesizing 2D composite ePSF canvas ({resolved_canvas_size}x{resolved_canvas_size}) with multi-tier fallback..."
@@ -658,8 +717,19 @@ def run_single_detector(
             pixel_scale=pixel_scale,
             dpi=getattr(cfg.reporting, "dpi", 300),
         )
+        if cfg.pipeline.debug is not None:
+            debug_dir = resolved_output_dir / "debug"
+            generate_all_debug_plots(
+                pooled_stamps=stamps_by_tier,
+                composite_epsf=epsf_model,
+                diagnostics=diagnostics,
+                output_dir=debug_dir,
+                sca_name=resolved_detector,
+                pixel_scale=pixel_scale,
+                growth_rate=getattr(cfg.profile, "growth_rate", 1.03),
+            )
     except Exception as e:
-        logger.warning(f"Default plot generation failed on {resolved_detector}: {e}", exc_info=True)
+        logger.warning(f"Plot generation failed on {resolved_detector}: {e}", exc_info=True)
 
     execution_time = time.time() - t0
     logger.info(
@@ -819,6 +889,24 @@ def run_pipeline(
         f"Faint={len(pooled_stamps['faint'])} (Total={total_pooled_count})"
     )
 
+    if cfg.pipeline.debug is not None:
+        debug_x = int(cfg.pipeline.debug)
+        tier_alloc = allocate_debug_stars_per_tier(
+            debug_x,
+            {t: len(pooled_stamps[t]) for t in ["bright", "medium", "faint"]},
+        )
+        for tier in ["bright", "medium", "faint"]:
+            n_keep = tier_alloc[tier]
+            pooled_stamps[tier].sort(
+                key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
+                reverse=True,
+            )
+            pooled_stamps[tier] = pooled_stamps[tier][:n_keep]
+        logger.info(
+            f"DEBUG MODE (--debug {debug_x}): Selected {sum(len(v) for v in pooled_stamps.values())} "
+            f"stars across tiers: B={len(pooled_stamps['bright'])}, M={len(pooled_stamps['medium'])}, F={len(pooled_stamps['faint'])}"
+        )
+
     # 4. Global Composite Canvas Assembly
     t_asm_start = time.perf_counter()
     composite_epsf, diagnostics = assemble_composite_extended_psf(
@@ -861,8 +949,19 @@ def run_pipeline(
             pixel_scale=0.11,
             dpi=getattr(cfg.reporting, "dpi", 300),
         )
+        if cfg.pipeline.debug is not None:
+            debug_dir = cfg.data.output_dir / "debug"
+            generate_all_debug_plots(
+                pooled_stamps=pooled_stamps,
+                composite_epsf=composite_epsf,
+                diagnostics=diagnostics,
+                output_dir=debug_dir,
+                sca_name="Composite",
+                pixel_scale=0.11,
+                growth_rate=getattr(cfg.profile, "growth_rate", 1.03),
+            )
     except Exception as e:
-        logger.warning(f"Default plot generation failed: {e}", exc_info=True)
+        logger.warning(f"Plot generation failed: {e}", exc_info=True)
 
     total_time = time.perf_counter() - t_start
     diagnostics.update({
@@ -1244,12 +1343,23 @@ def run_sca_batch_pipeline(
         for f in matching_files
     ]
 
+    debug_x = int(resolved_cfg.pipeline.debug) if resolved_cfg.pipeline.debug is not None else None
+
     if effective_workers <= 1:
         for task in tasks:
             det_name, stamps_dict, stats = _sca_file_worker_task(task)
             detector_summaries.append(stats)
             for tier in ["bright", "medium", "faint"]:
                 pooled_stamps[tier].extend(stamps_dict.get(tier, []))
+            if debug_x is not None:
+                needed = max(1, debug_x // 3)
+                if (
+                    len(pooled_stamps["bright"]) >= needed
+                    and len(pooled_stamps["medium"]) >= needed
+                    and len(pooled_stamps["faint"]) >= needed
+                ):
+                    logger.info(f"DEBUG MODE: Reached star threshold ({needed} per tier); stopping file ingestion.")
+                    break
     else:
         with ProcessPoolExecutor(max_workers=effective_workers) as executor:
             futures = [executor.submit(_sca_file_worker_task, t) for t in tasks]
@@ -1268,6 +1378,17 @@ def run_sca_batch_pipeline(
                         f"M={len(pooled_stamps['medium'])}, "
                         f"F={len(pooled_stamps['faint'])}"
                     )
+                if debug_x is not None:
+                    needed = max(1, debug_x // 3)
+                    if (
+                        len(pooled_stamps["bright"]) >= needed
+                        and len(pooled_stamps["medium"]) >= needed
+                        and len(pooled_stamps["faint"]) >= needed
+                    ):
+                        logger.info(f"DEBUG MODE: Reached star threshold ({needed} per tier); cancelling remaining worker tasks.")
+                        for f_rem in futures:
+                            f_rem.cancel()
+                        break
 
     total_pooled = sum(len(v) for v in pooled_stamps.values())
     if total_pooled == 0:
@@ -1275,21 +1396,38 @@ def run_sca_batch_pipeline(
             f"No valid stars extracted across {len(matching_files)} files for SCA {target_sca.upper()}."
         )
 
-    # 6. Reservoir Sampling / Tier Capacity Capping
-    caps = max_stamps_per_tier or {}
-    for tier in ["bright", "medium", "faint"]:
-        cap = caps.get(tier)
-        if cap is None and hasattr(resolved_cfg.tiers.max_stars_per_tier, tier):
-            cap = getattr(resolved_cfg.tiers.max_stars_per_tier, tier)
-
-        if cap and len(pooled_stamps[tier]) > cap:
-            # Keep highest SNR / cleanest stamps
+    # 6. Reservoir Sampling / Tier Capacity Capping (or Debug X Allocation)
+    if debug_x is not None:
+        tier_alloc = allocate_debug_stars_per_tier(
+            debug_x,
+            {t: len(pooled_stamps[t]) for t in ["bright", "medium", "faint"]},
+        )
+        for tier in ["bright", "medium", "faint"]:
+            n_keep = tier_alloc[tier]
             pooled_stamps[tier].sort(
                 key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
                 reverse=True,
             )
-            pooled_stamps[tier] = pooled_stamps[tier][:cap]
-            logger.info(f"Reservoir sampled '{tier}' tier to top {cap} highest SNR stamps.")
+            pooled_stamps[tier] = pooled_stamps[tier][:n_keep]
+        logger.info(
+            f"DEBUG MODE (--debug {debug_x}): Selected {sum(len(v) for v in pooled_stamps.values())} "
+            f"stars across tiers: B={len(pooled_stamps['bright'])}, M={len(pooled_stamps['medium'])}, F={len(pooled_stamps['faint'])}"
+        )
+    else:
+        caps = max_stamps_per_tier or {}
+        for tier in ["bright", "medium", "faint"]:
+            cap = caps.get(tier)
+            if cap is None and hasattr(resolved_cfg.tiers.max_stars_per_tier, tier):
+                cap = getattr(resolved_cfg.tiers.max_stars_per_tier, tier)
+
+            if cap and len(pooled_stamps[tier]) > cap:
+                # Keep highest SNR / cleanest stamps
+                pooled_stamps[tier].sort(
+                    key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
+                    reverse=True,
+                )
+                pooled_stamps[tier] = pooled_stamps[tier][:cap]
+                logger.info(f"Reservoir sampled '{tier}' tier to top {cap} highest SNR stamps.")
 
     logger.info(
         f"Final stamp pool for {target_sca.upper()}: "
@@ -1333,7 +1471,7 @@ def run_sca_batch_pipeline(
             pooled_stamps=pooled_stamps,
             diagnostics=diagnostics,
             pixel_scale=0.11,
-            growth_rate=getattr(cfg.profile, "growth_rate", 1.03),
+            growth_rate=getattr(resolved_cfg.profile, "growth_rate", 1.03),
         )
         plots_dir = resolved_cfg.data.output_dir / "plots"
         generate_diagnostic_plots(
@@ -1344,8 +1482,19 @@ def run_sca_batch_pipeline(
             pixel_scale=0.11,
             dpi=getattr(resolved_cfg.reporting, "dpi", 300),
         )
+        if resolved_cfg.pipeline.debug is not None:
+            debug_dir = resolved_cfg.data.output_dir / "debug"
+            generate_all_debug_plots(
+                pooled_stamps=pooled_stamps,
+                composite_epsf=composite_epsf,
+                diagnostics=diagnostics,
+                output_dir=debug_dir,
+                sca_name=target_sca,
+                pixel_scale=0.11,
+                growth_rate=getattr(resolved_cfg.profile, "growth_rate", 1.03),
+            )
     except Exception as e:
-        logger.warning(f"Default plot generation failed on {target_sca}: {e}", exc_info=True)
+        logger.warning(f"Plot generation failed on {target_sca}: {e}", exc_info=True)
 
     total_time = time.perf_counter() - t_start
     diagnostics.update({
@@ -1379,4 +1528,5 @@ __all__ = [
     "run_pipeline",
     "fast_scan_asdf_footprint",
     "run_sca_batch_pipeline",
+    "allocate_debug_stars_per_tier",
 ]

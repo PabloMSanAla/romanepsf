@@ -206,6 +206,13 @@ def cli(
     default=None,
     help="Number of parallel worker processes.",
 )
+@click.option(
+    "--debug",
+    "debug_stars",
+    type=int,
+    default=None,
+    help="Debug mode: process X stars across tiers and generate debug plots in output/debug/.",
+)
 @click.pass_context
 def run_command(
     ctx: click.Context,
@@ -220,6 +227,7 @@ def run_command(
     device: Optional[str],
     detectors: Optional[str],
     num_workers: Optional[int],
+    debug_stars: Optional[int] = None,
 ):
     """Execute complete end-to-end ePSF pipeline across all designated detectors or file list."""
     if sub_config is not None:
@@ -254,6 +262,8 @@ def run_command(
         ctx.obj["device"] = resolve_device(cfg.environment.device)
     if num_workers is not None:
         cfg.environment.num_workers = num_workers
+    if debug_stars is not None:
+        cfg.pipeline.debug = debug_stars
     if detectors is not None:
         if detectors.lower().strip() == "all":
             cfg.data.detectors = [f"wfi{i:02d}" for i in range(1, 19)]
@@ -378,6 +388,13 @@ def run_command(
     default=None,
     help="Number of parallel worker processes (e.g. 56).",
 )
+@click.option(
+    "--debug",
+    "debug_stars",
+    type=int,
+    default=None,
+    help="Debug mode: process X stars across tiers and generate debug plots in output/debug/.",
+)
 @click.pass_context
 def batch_command(
     ctx: click.Context,
@@ -390,6 +407,7 @@ def batch_command(
     canvas_size: Optional[int],
     device: Optional[str],
     num_workers: Optional[int],
+    debug_stars: Optional[int] = None,
 ):
     """Execute high-throughput batch pipeline synthesizing 1 composite ePSF model for a specific SCA."""
     if sub_config is not None:
@@ -418,6 +436,8 @@ def batch_command(
         ctx.obj["device"] = resolve_device(cfg.environment.device)
     if num_workers is not None:
         cfg.environment.num_workers = num_workers
+    if debug_stars is not None:
+        cfg.pipeline.debug = debug_stars
 
     try:
         cfg.validate()
@@ -455,6 +475,9 @@ def batch_command(
             import traceback
             traceback.print_exc()
         sys.exit(1)
+
+
+cli.add_command(batch_command, name="batch-run")
 
 
 @cli.command("single", help="Run single-detector validation (default: WFI01).")
