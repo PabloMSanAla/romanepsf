@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import time
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,6 +39,15 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 import torch
+
+# Suppress harmless ASDF package version warnings when reading newer extension schemas
+try:
+    from asdf.exceptions import AsdfPackageVersionWarning
+    warnings.filterwarnings("ignore", category=AsdfPackageVersionWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore", message=r".*was created with extension URI.*")
+warnings.filterwarnings("ignore", message=r".*AsdfPackageVersionWarning.*")
 
 from romanepsf import __version__
 from romanepsf.config import PipelineConfig, Config, load_config, resolve_device

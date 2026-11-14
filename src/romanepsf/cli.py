@@ -16,9 +16,19 @@ from __future__ import annotations
 import sys
 import os
 import logging
+import warnings
 from pathlib import Path
 from typing import Optional, List
 import click
+
+# Suppress harmless ASDF package version warnings when reading newer extension schemas
+try:
+    from asdf.exceptions import AsdfPackageVersionWarning
+    warnings.filterwarnings("ignore", category=AsdfPackageVersionWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore", message=r".*was created with extension URI.*")
+warnings.filterwarnings("ignore", message=r".*AsdfPackageVersionWarning.*")
 
 from romanepsf import __version__
 from romanepsf.config import load_config, Config, resolve_device

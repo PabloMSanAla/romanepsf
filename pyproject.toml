@@ -72,4 +72,6 @@ addopts = "-v --tb=short"
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
+    "ignore::asdf.exceptions.AsdfPackageVersionWarning",
+    "ignore:.*was created with extension URI.*",
 ]

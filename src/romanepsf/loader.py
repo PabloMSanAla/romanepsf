@@ -11,8 +11,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import logging
+import warnings
+
 import numpy as np
 import roman_datamodels as rdm
+
+# Suppress harmless ASDF package version warnings
+try:
+    from asdf.exceptions import AsdfPackageVersionWarning
+    warnings.filterwarnings("ignore", category=AsdfPackageVersionWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore", message=r".*was created with extension URI.*")
+warnings.filterwarnings("ignore", message=r".*AsdfPackageVersionWarning.*")
 
 logger = logging.getLogger("romanepsf.loader")
 

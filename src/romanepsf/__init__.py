@@ -2,6 +2,17 @@
 Roman Extended PSF (ePSF) Measurement Pipeline.
 """
 
+import warnings
+
+# Suppress harmless ASDF package version warning when ASDF file was saved with newer extension URI
+try:
+    from asdf.exceptions import AsdfPackageVersionWarning
+    warnings.filterwarnings("ignore", category=AsdfPackageVersionWarning)
+except ImportError:
+    pass
+warnings.filterwarnings("ignore", message=r".*was created with extension URI.*")
+warnings.filterwarnings("ignore", message=r".*AsdfPackageVersionWarning.*")
+
 __version__ = "0.1.0"
 
 from .config import (
