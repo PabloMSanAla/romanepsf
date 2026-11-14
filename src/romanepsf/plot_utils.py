@@ -299,16 +299,14 @@ def generate_diagnostic_plots(
         "bright": ("#ff9800", 0.35, 1.0),
     }
 
-    # Scale master curve to peak at 10^11 to match [10^-2, 10^11] dynamic range
-    max_1d = float(np.nanmax(f_composite)) if len(f_composite) > 0 else 1.0
-    scale_1d = (1e11 / max_1d) if (max_1d > 0 and max_1d < 1.0) else 1.0
-    f_comp_plot = f_composite * scale_1d
+    # Plot normalized profiles directly spanning [10^-11, 10^-2]
+    f_comp_plot = f_composite
 
     # Plot individual normalized star profiles in background
     for i in range(n_stars_total):
         t = str(star_tiers[i])
         col, alpha_val, lw = tier_colors.get(t, ("#888888", 0.15, 0.8))
-        f_vals = star_fluxes[i] * scale_1d
+        f_vals = star_fluxes[i]
         valid = np.isfinite(f_vals) & (f_vals > 0)
         if np.any(valid):
             ax1.plot(r_grid[valid], f_vals[valid], color=col, alpha=alpha_val, linewidth=lw)
@@ -329,7 +327,7 @@ def generate_diagnostic_plots(
     ax1.set_xscale("log")
     ax1.set_yscale("log")
     ax1.set_xlim(0.1, 520.0)
-    ax1.set_ylim(1e-2, 1e11)
+    ax1.set_ylim(1e-11, 1e-2)
 
     ax1.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=12, labelpad=8)
@@ -371,14 +369,11 @@ def generate_diagnostic_plots(
         -half_canvas * pixel_scale, half_canvas * pixel_scale,
     ]
 
-    vmin_2d = 1e-2
-    vmax_2d = 1e11
+    vmin_2d = 1e-11
+    vmax_2d = 1e-2
     norm_2d = LogNorm(vmin=vmin_2d, vmax=vmax_2d)
 
-    # Scale peak to 10^11 to match [10^-2, 10^11] dynamic range
-    max_2d = float(np.nanmax(composite_epsf))
-    scale_2d = (1e11 / max_2d) if (max_2d > 0 and max_2d < 1.0) else 1.0
-    scaled_epsf = composite_epsf * scale_2d
+    scaled_epsf = composite_epsf
 
     im2 = ax2.imshow(
         np.maximum(scaled_epsf, vmin_2d),

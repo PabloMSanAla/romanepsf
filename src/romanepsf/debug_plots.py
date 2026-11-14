@@ -334,13 +334,13 @@ def generate_debug_figure3_profile_normalization(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(0.1, 520.0)
-    ax.set_ylim(1e-2, 1e11)
+    ax.set_ylim(1e-11, 1e-2)
 
     ax.set_xlabel("Radius from Centroid (pixels)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_ylabel("Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_title(
         "Debug Figure 3: Radial Profile Normalization & Overlap Calibration\n"
-        "(Unnormalized Dotted vs. Normalized Solid Curves in Shaded Fitting Zones)",
+        "(Unnormalized Dotted vs. Normalized Solid Curves in Shaded Fitting Zones) [Scale: $10^{-11}$ to $10^{-2}$]",
         color="#58a6ff",
         fontsize=13,
         fontweight="bold",
@@ -366,7 +366,7 @@ def generate_debug_figure4_model_psf(
     pixel_scale: float = 0.11,
 ) -> Path:
     """
-    Figure 4: Model PSF 2D canvas with core zoom inset, scaled from 10^-2 to 10^11.
+    Figure 4: Model PSF 2D canvas with core zoom inset, scaled from 10^-11 to 10^-2.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -381,14 +381,11 @@ def generate_debug_figure4_model_psf(
         -half_canvas * pixel_scale, half_canvas * pixel_scale,
     ]
 
-    vmin_2d = 1e-2
-    vmax_2d = 1e11
+    vmin_2d = 1e-11
+    vmax_2d = 1e-2
     norm_2d = LogNorm(vmin=vmin_2d, vmax=vmax_2d)
 
-    # Scale peak to 10^11 so the model spans the full 10^-2 to 10^11 dynamic range
-    max_val = float(np.nanmax(composite_epsf))
-    scale_to_peak = (1e11 / max_val) if max_val > 0 else 1.0
-    scaled_epsf = composite_epsf * scale_to_peak
+    scaled_epsf = composite_epsf
 
     im = ax.imshow(
         np.maximum(scaled_epsf, vmin_2d),
@@ -401,7 +398,7 @@ def generate_debug_figure4_model_psf(
     ax.set_title(
         f"Debug Figure 4: Model PSF Canvas ({sca_name.upper()})\n"
         f"Dimension: {canvas_size}x{canvas_size} px ({canvas_size * pixel_scale:.1f}\" x {canvas_size * pixel_scale:.1f}\") "
-        f"[Scale: $10^{{-2}}$ to $10^{{11}}$]",
+        f"[Scale: $10^{{-11}}$ to $10^{{-2}}$]",
         color="#58a6ff",
         fontsize=12,
         fontweight="bold",
@@ -492,7 +489,7 @@ def generate_debug_figure5_final_profile(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(0.1, 520.0)
-    ax.set_ylim(1e-2, 1e11)
+    ax.set_ylim(1e-11, 1e-2)
 
     ax.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=11, labelpad=8)
@@ -501,7 +498,7 @@ def generate_debug_figure5_final_profile(
 
     ax.set_title(
         f"Debug Figure 5: Final Composite Profile & Contributing Stars ({sca_name.upper()})\n"
-        f"[Scale: $10^{{-2}}$ to $10^{{11}}$ | Total Normalized Stars: {len(star_profiles)}]",
+        f"[Scale: $10^{{-11}}$ to $10^{{-2}}$ | Total Normalized Stars: {len(star_profiles)}]",
         color="#58a6ff",
         fontsize=13,
         fontweight="bold",
@@ -535,8 +532,8 @@ def generate_all_debug_plots(
     1. debug_1_masking_procedure.png (4 panels: image, radial model, residual, image+mask in AB mag/arcsec^2)
     2. debug_2_apertures_and_profile.png (2 panels: masked image with concentric geometric annuli, radial profile in AB mag/arcsec^2)
     3. debug_3_profile_normalization.png (unnormalized vs normalized curves with shaded fitting regions relative to reference mean profile)
-    4. debug_4_model_psf.png (2D model PSF canvas + core zoom inset, scaled 10^-2 to 10^11)
-    5. debug_5_final_profile_normalized.png (composite curve + all contributing star profiles, scaled 10^-2 to 10^11)
+    4. debug_4_model_psf.png (2D model PSF canvas + core zoom inset, scaled 10^-11 to 10^-2)
+    5. debug_5_final_profile_normalized.png (composite curve + all contributing star profiles, scaled 10^-11 to 10^-2)
 
     Additionally generates per-star diagnostic figures for individual star inspection.
     """
@@ -554,10 +551,8 @@ def generate_all_debug_plots(
         growth_rate=growth_rate,
     )[:2]
 
-    # Scale master composite curve to peak at 10^11 to span 10^-2 to 10^11 dynamic range
-    max_prof = float(np.nanmax(prof_c)) if len(prof_c) > 0 else 1.0
-    scale_c = (1e11 / max_prof) if max_prof > 0 else 1.0
-    prof_c_scaled = prof_c * scale_c
+    # Master composite radial curve directly spans [10^-11, 10^-2]
+    prof_c_scaled = prof_c
 
     # Resolve overlap scale factors and annular normalization boundaries
     r_fm_min = float(diagnostics.get("r_fm_min", 25.0))
