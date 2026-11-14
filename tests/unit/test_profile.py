@@ -199,3 +199,80 @@ class TestScientificConstraintProfile:
         assert flux.ndim == 1
         # Original 2D image must not be mutated
         np.testing.assert_array_equal(img, img_copy)
+
+
+class TestMeasureAngularProfileTorch:
+    """Unit tests for measure_angular_profile_torch."""
+
+    def test_synthetic_spikes_detection(self):
+        """Verify that synthetic spike rays along cardinal angles produce clear peaks."""
+        sz = 101
+        center = (50.0, 50.0)
+        img = np.zeros((sz, sz), dtype=np.float32)
+
+        # Draw bright rays along horizontal (+x, theta=0) and vertical (+y, theta=90)
+        img[50, 55:95] = 10.0  # theta ~ 0 deg
+        img[55:95, 50] = 10.0  # theta ~ 90 deg
+
+        angles, medians = profile.measure_angular_profile_torch(
+            image=img,
+            center=center,
+            num_bins=360,
+            r_min=2.0,
+            device="cpu",
+        )
+
+        assert len(angles) == 360
+        assert len(medians) == 360
+        # Angles near 0 deg and 90 deg should have elevated flux
+        idx_0 = int(round(np.interp(0.0, angles, np.arange(360))))
+        idx_90 = int(round(np.interp(90.0, angles, np.arange(360))))
+        idx_45 = int(round(np.interp(45.0, angles, np.arange(360))))
+
+        assert medians[idx_0] > medians[idx_45]
+        assert medians[idx_90] > medians[idx_45]
+
+    def test_companion_and_dq_mask_exclusion(self):
+        """Verify that companion stars and DQ flags are properly excluded from angular bins."""
+        sz = 101
+        center = (50.0, 50.0)
+        img = np.zeros((sz, sz), dtype=np.float32)
+
+        gy, gx = np.ogrid[:sz, :sz]
+        dy = gy - center[1]
+        dx = gx - center[0]
+        theta = np.remainder(np.rad2deg(np.arctan2(dy, dx)), 360.0)
+        r = np.hypot(dx, dy)
+
+        # Inject feature along theta in [45, 46) deg (bin 45)
+        ray_45 = (theta >= 45.0) & (theta < 46.0) & (r >= 3.0) & (r <= 35.0)
+        img[ray_45] = 50.0
+
+        # Without mask, theta=45 has strong positive signal
+        _, med_unmasked = profile.measure_angular_profile_torch(
+            img, center, num_bins=360, r_min=3.0, r_max=35.0, device="cpu"
+        )
+        idx_45 = 45
+        assert med_unmasked[idx_45] > 10.0
+
+        # With companion mask covering the ray
+        comp_mask = ray_45.copy()
+        _, med_comp = profile.measure_angular_profile_torch(
+            img, center, comp_mask=comp_mask, num_bins=360, r_min=3.0, r_max=35.0, device="cpu"
+        )
+        assert np.isnan(med_comp[idx_45]) or np.isclose(med_comp[idx_45], 0.0, atol=1e-3)
+
+        # With DQ mask covering the ray
+        dq = ray_45.astype(np.uint32)
+        _, med_dq = profile.measure_angular_profile_torch(
+            img, center, dq_mask=dq, num_bins=360, r_min=3.0, r_max=35.0, device="cpu"
+        )
+        assert np.isnan(med_dq[idx_45]) or np.isclose(med_dq[idx_45], 0.0, atol=1e-3)
+
+    def test_all_masked_or_nan_returns_nans(self):
+        """Verify all-NaN image returns all NaNs without crashing."""
+        img = np.full((51, 51), np.nan, dtype=np.float32)
+        angles, medians = profile.measure_angular_profile_torch(img, (25.0, 25.0), num_bins=360, device="cpu")
+        assert len(angles) == 360
+        assert np.all(np.isnan(medians))
+

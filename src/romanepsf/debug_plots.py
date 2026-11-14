@@ -733,12 +733,14 @@ def generate_debug_figure_spike_process(
     corrected_mask: Optional[np.ndarray] = None,
     base_spike_angles: Optional[Sequence[float]] = None,
     refined_spike_angles: Optional[Sequence[float]] = None,
+    comp_mask: Optional[np.ndarray] = None,
 ) -> Path:
     """
     Generate 3-panel spike process diagnostic figure when running with --debug X:
     1. Calibrated Image + Theoretical Spike Mask (the starting point before empirical refinement).
     2. Residual Image + Corrected Spike Mask (the empirical refined mask with morphological dilation).
-    3. Plot of Intensity vs Angular Distribution (azimuthal profile of annular flux across theta in [0, 360] deg),
+    3. Plot of Intensity vs Angular Distribution (full-image azimuthal profile across theta in [0, 360) deg),
+       excluding data quality flags and neighbor Gaia companion stars,
        annotated with theoretical and corrected spike ray directions.
     """
     output_path = Path(output_path)
@@ -886,33 +888,33 @@ def generate_debug_figure_spike_process(
     cbar.ax.invert_yaxis()
 
     # Panel 3: Intensity vs Angular Distribution (split into 0->180 top and 180->360 bottom)
-    r_inner = max(core_rad, 15.0)
-    r_outer = min(0.85 * min(cx, cy, nx - 1 - cx, ny - 1 - cy), 90.0)
-    if r_outer <= r_inner + 5.0:
-        r_inner = max(core_rad, 5.0)
-        r_outer = max(r_inner + 8.0, min(cx, 30.0))
+    from romanepsf.profile import measure_angular_profile_torch
 
-    gy, gx = np.ogrid[:ny, :nx]
-    r_map = np.hypot(gx - cx, gy - cy)
-    theta_map = np.degrees(np.arctan2(gy - cy, gx - cx)) % 360.0
-    ann_mask = (r_map >= r_inner) & (r_map <= r_outer) & np.isfinite(residual)
-    if dq_mask is not None:
-        ann_mask &= (~dq_mask.astype(bool))
+    comps = info.get("gaia_companions", [])
+    if comp_mask is None:
+        comp_mask = info.get("comp_mask", None)
 
-    bin_edges = np.linspace(0.0, 360.0, 361)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    bin_idx = np.digitize(theta_map[ann_mask], bin_edges) - 1
+    bin_centers, median_res_flx = measure_angular_profile_torch(
+        image=residual,
+        center=(cx, cy),
+        dq_mask=dq_mask,
+        comp_mask=comp_mask,
+        companions=comps,
+        core_rad=core_rad,
+        r_min=1.0,
+        r_max=None,
+        num_bins=360,
+    )
 
-    median_res_flx = np.zeros(360, dtype=np.float32)
-    median_raw_flx = np.zeros(360, dtype=np.float32)
-    for b in range(360):
-        in_bin = (bin_idx == b)
-        if np.any(in_bin):
-            median_res_flx[b] = float(np.median(residual[ann_mask][in_bin]))
-            median_raw_flx[b] = float(np.median(stamp[ann_mask][in_bin]))
+    valid_res = np.isfinite(median_res_flx)
+    if np.any(valid_res):
+        y_max = max(float(np.nanmax(median_res_flx)), 0.1) * 1.15
+        y_min = min(float(np.nanmin(median_res_flx)), -0.05)
+    else:
+        y_max = 1.0
+        y_min = -0.1
 
-    y_max = max(float(np.nanmax(median_res_flx)), 0.1) * 1.15
-    y_min = min(float(np.nanmin(median_res_flx)), -0.05)
+    flux_unit = "MJy/sr" if is_calibrated else "DN/s"
 
     # Panel 3a: Top Panel [0° to 180°]
     ax2_top.set_facecolor("#161b22")
@@ -937,8 +939,8 @@ def generate_debug_figure_spike_process(
     ax2_top.set_xlim(0.0, 180.0)
     ax2_top.set_xticks(np.arange(0, 181, 30))
     ax2_top.set_ylim(y_min, y_max)
-    ax2_top.set_ylabel("Intensity (MJy/sr)", color="#e6edf3", fontsize=9.5)
-    ax2_top.set_title(r"3a. Azimuthal Intensity: $0^\circ \to 180^\circ$" + f" (Annulus ${r_inner:.0f}-{r_outer:.0f}$ px)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_top.set_ylabel(f"Intensity ({flux_unit})", color="#e6edf3", fontsize=9.5)
+    ax2_top.set_title(r"3a. Full-Image Azimuthal Intensity: $0^\circ \to 180^\circ$ (Excl. DQ & Gaia Stars)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
     ax2_top.tick_params(colors="#8b949e", labelsize=8.5)
     for s in ax2_top.spines.values():
         s.set_color("#30363d")
@@ -973,8 +975,8 @@ def generate_debug_figure_spike_process(
     ax2_bot.set_xticks(np.arange(180, 361, 30))
     ax2_bot.set_ylim(y_min, y_max)
     ax2_bot.set_xlabel(r"Azimuthal Angle $\theta$ (degrees)", color="#e6edf3", fontsize=9.5)
-    ax2_bot.set_ylabel("Intensity (MJy/sr)", color="#e6edf3", fontsize=9.5)
-    ax2_bot.set_title(r"3b. Azimuthal Intensity: $180^\circ \to 360^\circ$ (Symmetric Counterparts $\theta + 180^\circ$)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_bot.set_ylabel(f"Intensity ({flux_unit})", color="#e6edf3", fontsize=9.5)
+    ax2_bot.set_title(r"3b. Full-Image Azimuthal Intensity: $180^\circ \to 360^\circ$ (Symmetric Counterparts $\theta + 180^\circ$)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
     ax2_bot.tick_params(colors="#8b949e", labelsize=8.5)
     for s in ax2_bot.spines.values():
         s.set_color("#30363d")

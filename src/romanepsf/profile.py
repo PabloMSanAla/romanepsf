@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Any
 import numpy as np
 import torch
 
@@ -369,9 +369,145 @@ def get_psf_extension_moffat(
     return float(extension.item()) if extension.ndim == 0 else extension
 
 
+def measure_angular_profile_torch(
+    image: np.ndarray,
+    center: Tuple[float, float],
+    dq_mask: Optional[np.ndarray] = None,
+    comp_mask: Optional[np.ndarray] = None,
+    companions: Optional[Sequence[Dict[str, Any]]] = None,
+    core_rad: float = 6.0,
+    r_min: float = 1.0,
+    r_max: Optional[float] = None,
+    num_bins: int = 360,
+    device: Union[str, torch.device] = "cpu",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Measure full-image azimuthal (angular) intensity profile theta in [0, 360) deg using PyTorch.
+
+    Vectorized implementation:
+    1. Generates 2D meshgrid of polar coordinates (r, theta) on the computing device.
+    2. Excludes non-finite values, central core singularity (r < r_min), data quality flags (dq_mask),
+       and other Gaia companion stars (comp_mask or companions list).
+    3. Digitize angular distribution into equally spaced theta bins using torch.bucketize.
+    4. Computes median flux within each bin without per-pixel Python loops.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2D image array (e.g. residual map or stamp).
+    center : tuple of float
+        (cx, cy) coordinates of the primary star centroid.
+    dq_mask : np.ndarray, optional
+        Data quality flag bitmask or boolean mask. Non-zero/True pixels are excluded.
+    comp_mask : np.ndarray, optional
+        Boolean mask of neighbor companion star apertures to exclude.
+    companions : list of dict, optional
+        List of companion star dicts with 'x', 'y', and 'radius_px' (used if comp_mask is None).
+    core_rad : float, default 6.0
+        Core protection radius; companion exclusion masks apply strictly outside this radius.
+    r_min : float, default 1.0
+        Inner radius cutoff to avoid the centroid coordinate singularity.
+    r_max : float, optional
+        Outer radius cutoff. If None, considers all valid pixels across the entire image.
+    num_bins : int, default 360
+        Number of equally spaced angular bins covering [0, 360) degrees.
+    device : str or torch.device, default 'cpu'
+        Target computing device ('cpu', 'mps', 'cuda', or 'auto').
+
+    Returns
+    -------
+    bin_centers : np.ndarray
+        Array of bin center angles in degrees in [0, 360).
+    medians : np.ndarray
+        Median intensity in each angular bin (NaN if bin contains no valid pixels).
+    """
+    if isinstance(device, str):
+        dev = resolve_device(device)
+    else:
+        dev = device
+
+    raw_data = np.asarray(image, dtype=np.float32)
+    if raw_data.ndim != 2:
+        raise ValueError(f"Image data must be a 2D array, got shape {raw_data.shape}")
+
+    # Ensure native byte-order
+    if raw_data.dtype.byteorder not in ("=", "|"):
+        raw_data = raw_data.astype(np.float32)
+
+    ny, nx = raw_data.shape
+    cx, cy = float(center[0]), float(center[1])
+
+    data_t = torch.as_tensor(raw_data, dtype=torch.float32, device=dev)
+
+    gy, gx = torch.meshgrid(
+        torch.arange(ny, device=dev, dtype=torch.float32),
+        torch.arange(nx, device=dev, dtype=torch.float32),
+        indexing="ij",
+    )
+    dy = gy - cy
+    dx = gx - cx
+    theta = torch.remainder(torch.rad2deg(torch.atan2(dy, dx)), 360.0)
+    r = torch.hypot(dx, dy)
+
+    valid = torch.isfinite(data_t) & (r >= float(r_min))
+    if r_max is not None:
+        valid &= (r <= float(r_max))
+
+    if dq_mask is not None:
+        dq_t = torch.as_tensor(dq_mask > 0, dtype=torch.bool, device=dev)
+        valid &= (~dq_t)
+
+    if comp_mask is not None:
+        c_mask_t = torch.as_tensor(comp_mask > 0, dtype=torch.bool, device=dev)
+        valid &= (~c_mask_t)
+    elif companions:
+        c_mask_t = torch.zeros((ny, nx), dtype=torch.bool, device=dev)
+        for comp in companions:
+            cx_c = float(comp.get("x", 0.0))
+            cy_c = float(comp.get("y", 0.0))
+            r_c = float(comp.get("radius_px", 3.0))
+            dist_comp = torch.hypot(gx - cx_c, gy - cy_c)
+            c_mask_t |= (dist_comp <= r_c)
+        c_mask_t &= (r > float(core_rad))
+        valid &= (~c_mask_t)
+
+    bin_edges = torch.linspace(0.0, 360.0, num_bins + 1, device=dev)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    th_v = theta[valid]
+    val_v = data_t[valid]
+
+    if th_v.numel() == 0:
+        return bin_centers.cpu().numpy(), np.full(num_bins, np.nan, dtype=np.float32)
+
+    bin_scale = float(num_bins) / 360.0
+    bin_idx = torch.clamp(
+        torch.floor(th_v * bin_scale).to(torch.long),
+        0,
+        num_bins - 1,
+    )
+
+    sort_order = torch.argsort(bin_idx)
+    bin_sorted = bin_idx[sort_order]
+    val_sorted = val_v[sort_order]
+
+    counts = torch.bincount(bin_sorted, minlength=num_bins)
+    offsets = torch.zeros(num_bins + 1, dtype=torch.long, device=dev)
+    offsets[1:] = torch.cumsum(counts, dim=0)
+
+    medians = torch.full((num_bins,), float("nan"), dtype=torch.float32, device=dev)
+    for b in range(num_bins):
+        cnt = int(counts[b].item())
+        if cnt > 0:
+            medians[b] = torch.median(val_sorted[offsets[b] : offsets[b + 1]])
+
+    return bin_centers.cpu().numpy(), medians.cpu().numpy()
+
+
 __all__ = [
     "get_geometric_radial_bins",
     "create_ellipse_meshgrid_torch",
     "elliptical_profile",
     "get_psf_extension_moffat",
+    "measure_angular_profile_torch",
 ]
