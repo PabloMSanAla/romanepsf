@@ -535,6 +535,7 @@ def process_star_stamps(
                         bandpass=bp_id,
                         var_poisson=raw_vp,
                         return_spike_details=True,
+                        mag=mag,
                     )
                 else:
                     res_tuple = mask_contaminants_with_spikes_protected(
@@ -551,6 +552,7 @@ def process_star_stamps(
                         bandpass=bp_id,
                         var_poisson=raw_vp,
                         return_spike_details=True,
+                        mag=mag,
                     )
                 if len(res_tuple) == 4:
                     mask, _, res_map, spike_diag = res_tuple

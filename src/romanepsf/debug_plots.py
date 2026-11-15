@@ -750,6 +750,7 @@ def generate_debug_figure_spike_process(
     tier = str(info.get("tier", "unknown")).upper()
     mag = float(info.get("mag", 0.0))
     dq_mask = info.get("dq_mask", None)
+    pixel_scale = float(info.get("pixel_scale", 0.11))
 
     ny, nx = stamp.shape
     if center_xy is not None:
@@ -774,13 +775,19 @@ def generate_debug_figure_spike_process(
         corrected_mask = spike_details.get("corrected_spike_mask", None)
 
     # Fallback calculation if spike_details not provided
-    from romanepsf.profile import measure_angular_profile_torch
+    from romanepsf.profile import measure_angular_profile_torch, get_psf_extension_moffat
     from romanepsf.masking import (
         get_theoretical_spike_angles,
         detect_spike_peaks_from_profile,
         create_geometric_spike_mask,
         detect_morphological_spikes,
     )
+    r_ext_px = spike_details.get("profile_r_max_px", None)
+    if r_ext_px is None and np.isfinite(mag):
+        r_ext_px = float(get_psf_extension_moffat(mag, depth=28.0) / pixel_scale)
+    elif r_ext_px is not None:
+        r_ext_px = float(r_ext_px)
+
     if primary_spike_angles is None or len(primary_spike_angles) == 0:
         b_c, p_flx = measure_angular_profile_torch(
             image=residual,
@@ -789,6 +796,7 @@ def generate_debug_figure_spike_process(
             comp_mask=comp_mask,
             companions=info.get("gaia_companions", []),
             core_rad=core_rad,
+            r_max=r_ext_px,
             num_bins=360,
         )
         primary_spike_angles, secondary_spike_angles = detect_spike_peaks_from_profile(
@@ -850,6 +858,8 @@ def generate_debug_figure_spike_process(
         ax0.imshow(overlay_theo, origin="lower")
 
     max_ray_len = min(nx, ny) * 0.48
+    if r_ext_px is not None:
+        max_ray_len = min(max_ray_len, r_ext_px)
     r_start = max(core_rad, 4.0)
     for ang in primary_spike_angles:
         rad = np.radians(ang)
@@ -862,6 +872,8 @@ def generate_debug_figure_spike_process(
             alpha=0.85,
         )
     ax0.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
+    if r_ext_px is not None:
+        ax0.add_patch(Circle((cx, cy), r_ext_px, fill=False, edgecolor="#00e5ff", linestyle="--", linewidth=1.2, alpha=0.8))
     ax0.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
     ax0.set_title("1. Calibrated Image + Primary Spike Mask\n(Detected 12 Largest Peaks on Azimuthal Profile)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
     ax0.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
@@ -874,7 +886,9 @@ def generate_debug_figure_spike_process(
         Line2D([], [], color="#58a6ff", linestyle="--", linewidth=1.2, label=f"Primary Rays ({len(primary_spike_angles)})"),
         Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"),
     ]
-    ax0.legend(handles=leg0, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+    if r_ext_px is not None:
+        leg0.append(Line2D([], [], color="#00e5ff", linestyle="--", linewidth=1.2, label=f"Moffat Ext ({r_ext_px:.1f} px)"))
+    ax0.legend(handles=leg0, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     # Panel 2: Residual + Corrected Spike Mask
     ax1.set_facecolor("#161b22")
@@ -905,6 +919,8 @@ def generate_debug_figure_spike_process(
             alpha=0.90,
         )
     ax1.add_patch(Circle((cx, cy), core_rad, fill=False, edgecolor="#e3b341", linestyle=":", linewidth=1.2))
+    if r_ext_px is not None:
+        ax1.add_patch(Circle((cx, cy), r_ext_px, fill=False, edgecolor="#00e5ff", linestyle="--", linewidth=1.2, alpha=0.8))
     ax1.plot(cx, cy, "+", color="#ffffff", markersize=6, markeredgewidth=1.2)
     ax1.set_title("2. Residual Image + Corrected Spike Mask\n(12 Primary + Secondary Peaks & Morphological Spikes)", color="#58a6ff", fontsize=11.5, fontweight="bold", pad=8)
     ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
@@ -918,7 +934,9 @@ def generate_debug_figure_spike_process(
     if len(secondary_spike_angles) > 0:
         leg1.append(Line2D([], [], color="#ff7b72", linestyle="-", linewidth=1.4, label=f"Secondary Rays ({len(secondary_spike_angles)})"))
     leg1.append(Line2D([], [], color="#e3b341", linestyle=":", linewidth=1.2, label=f"Core (r <= {core_rad:.1f} px)"))
-    ax1.legend(handles=leg1, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.5)
+    if r_ext_px is not None:
+        leg1.append(Line2D([], [], color="#00e5ff", linestyle="--", linewidth=1.2, label=f"Moffat Ext ({r_ext_px:.1f} px)"))
+    ax1.legend(handles=leg1, loc="upper right", facecolor="#161b22", edgecolor="#30363d", labelcolor="#e6edf3", fontsize=8.0)
 
     # Add colorbar for Panels 1 & 2
     cbar = fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
@@ -931,17 +949,20 @@ def generate_debug_figure_spike_process(
     if comp_mask is None:
         comp_mask = info.get("comp_mask", None)
 
-    bin_centers, median_res_flx = measure_angular_profile_torch(
-        image=residual,
-        center=(cx, cy),
-        dq_mask=dq_mask,
-        comp_mask=comp_mask,
-        companions=comps,
-        core_rad=core_rad,
-        r_min=1.0,
-        r_max=None,
-        num_bins=360,
-    )
+    bin_centers = spike_details.get("angular_profile_theta", None)
+    median_res_flx = spike_details.get("angular_profile_flux", None)
+    if bin_centers is None or median_res_flx is None:
+        bin_centers, median_res_flx = measure_angular_profile_torch(
+            image=residual,
+            center=(cx, cy),
+            dq_mask=dq_mask,
+            comp_mask=comp_mask,
+            companions=comps,
+            core_rad=core_rad,
+            r_min=1.0,
+            r_max=r_ext_px,
+            num_bins=360,
+        )
 
     valid_res = np.isfinite(median_res_flx)
     if np.any(valid_res):
@@ -973,11 +994,12 @@ def generate_debug_figure_spike_process(
             ax2_top.axvline(ang, color="#ff7b72", linestyle="-", linewidth=1.4, alpha=0.90, zorder=3, label=lbl)
             first_sec_top = False
 
+    ext_label = f" (r <= {r_ext_px:.1f} px)" if r_ext_px is not None else ""
     ax2_top.set_xlim(0.0, 180.0)
     ax2_top.set_xticks(np.arange(0, 181, 30))
     ax2_top.set_ylim(y_min, y_max)
     ax2_top.set_ylabel(f"Intensity ({flux_unit})", color="#e6edf3", fontsize=9.5)
-    ax2_top.set_title(r"3a. Full-Image Azimuthal Intensity: $0^\circ \to 180^\circ$ (12 Largest Peaks & Secondary Peaks)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_top.set_title(rf"3a. Azimuthal Intensity{ext_label}: $0^\circ \to 180^\circ$ (12 Largest Peaks & Secondary Peaks)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
     ax2_top.tick_params(colors="#8b949e", labelsize=8.5)
     for s in ax2_top.spines.values():
         s.set_color("#30363d")
@@ -1013,7 +1035,7 @@ def generate_debug_figure_spike_process(
     ax2_bot.set_ylim(y_min, y_max)
     ax2_bot.set_xlabel(r"Azimuthal Angle $\theta$ (degrees)", color="#e6edf3", fontsize=9.5)
     ax2_bot.set_ylabel(f"Intensity ({flux_unit})", color="#e6edf3", fontsize=9.5)
-    ax2_bot.set_title(r"3b. Full-Image Azimuthal Intensity: $180^\circ \to 360^\circ$ (Symmetric Counterparts $\theta + 180^\circ$)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
+    ax2_bot.set_title(rf"3b. Azimuthal Intensity{ext_label}: $180^\circ \to 360^\circ$ (Symmetric Counterparts $\theta + 180^\circ$)", color="#58a6ff", fontsize=11, fontweight="bold", pad=6)
     ax2_bot.tick_params(colors="#8b949e", labelsize=8.5)
     for s in ax2_bot.spines.values():
         s.set_color("#30363d")

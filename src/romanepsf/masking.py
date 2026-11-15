@@ -321,6 +321,7 @@ def create_geometric_spike_mask(
     radial_min: float = 3.0,
     spike_width_px: float = 4.0,
     width_growth_rate: float = 0.025,
+    radial_max: Optional[float] = None,
 ) -> np.ndarray:
     """
     Create a 2D boolean mask indicating theoretical diffraction spike corridors.
@@ -373,7 +374,10 @@ def create_geometric_spike_mask(
         perp_dist = np.abs(-np.sin(ang_rad) * dx + np.cos(ang_rad) * dy)
 
         is_spike = (diff <= angular_half_width_deg) & (perp_dist <= effective_width)
-        spike_mask |= (is_spike & (r >= radial_min))
+        in_range = (r >= radial_min)
+        if radial_max is not None:
+            in_range &= (r <= float(radial_max))
+        spike_mask |= (is_spike & in_range)
 
     return spike_mask
 
@@ -2213,6 +2217,7 @@ def mask_contaminants_with_spikes_protected(
     n_iterations: int = 2,
     contaminant_detector: Optional[str] = None,
     return_spike_details: bool = False,
+    mag: Optional[float] = None,
 ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
@@ -2418,9 +2423,38 @@ def mask_contaminants_with_spikes_protected(
     }
 
     def _build_spike_and_core_protection(res_map: np.ndarray) -> np.ndarray:
-        from romanepsf.profile import measure_angular_profile_torch
+        from romanepsf.profile import measure_angular_profile_torch, get_psf_extension_moffat
 
-        # 1. Measure azimuthal intensity profile vs theta across the full image
+        # Determine profile radial extension matching get_psf_extension_moffat
+        nonlocal mag
+        if mag is None and isinstance(companion_stars, pd.DataFrame) and target_center_xy is not None:
+            for col in ["mag_lambda", "mag", "phot_g_mean_mag"]:
+                if col in companion_stars.columns and "x" in companion_stars.columns and "y" in companion_stars.columns:
+                    dists = np.hypot(companion_stars["x"] - target_center_xy[0], companion_stars["y"] - target_center_xy[1])
+                    if len(dists) > 0 and np.nanmin(dists) < 3.0:
+                        mag = float(companion_stars.loc[np.nanargmin(dists), col])
+                        break
+
+        if mag is None and tier is not None:
+            tier_str = str(tier).lower().strip()
+            if tier_str == "bright":
+                mag = 10.5
+            elif tier_str == "medium":
+                mag = 12.0
+            elif tier_str == "faint":
+                mag = 14.0
+
+        profile_depth = float(
+            getattr(spikes_cfg, "profile_depth", getattr(spikes_cfg, "depth", companion_depth))
+        )
+        if mag is not None and np.isfinite(mag):
+            ext_arcsec = float(get_psf_extension_moffat(mag, depth=profile_depth))
+            spike_profile_r_max = max(ext_arcsec / pixel_scale, core_protection_radius_px + 2.0)
+        else:
+            ext_arcsec = None
+            spike_profile_r_max = None
+
+        # 1. Measure azimuthal intensity profile vs theta out to Moffat PSF extension
         b_cents, prof = measure_angular_profile_torch(
             image=res_map,
             center=(cx, cy),
@@ -2428,6 +2462,7 @@ def mask_contaminants_with_spikes_protected(
             comp_mask=comp_mask,
             companions=companion_stars if isinstance(companion_stars, list) else None,
             core_rad=core_protection_radius_px,
+            r_max=spike_profile_r_max,
             num_bins=360,
         )
 
@@ -2456,24 +2491,26 @@ def mask_contaminants_with_spikes_protected(
             else:
                 all_detected_angles = primary_angles
 
-        # 3. Create primary spike mask (12 largest peaks)
+        # 3. Create primary spike mask (12 largest peaks) bounded by Moffat extension
         primary_geom_mask = create_geometric_spike_mask(
             (ny, nx),
             (cx, cy),
             primary_angles,
             angular_half_width_deg=angular_half_width,
             radial_min=max(core_protection_radius_px, 1.0),
+            radial_max=spike_profile_r_max,
             spike_width_px=spike_width,
             width_growth_rate=effective_growth_rate,
         )
 
-        # 4. Create full geometric spike mask (12 largest + secondary peaks)
+        # 4. Create full geometric spike mask (12 largest + secondary peaks) bounded by Moffat extension
         geom_mask = create_geometric_spike_mask(
             (ny, nx),
             (cx, cy),
             all_detected_angles,
             angular_half_width_deg=angular_half_width,
             radial_min=max(core_protection_radius_px, 1.0),
+            radial_max=spike_profile_r_max,
             spike_width_px=spike_width,
             width_growth_rate=effective_growth_rate,
         )
@@ -2486,6 +2523,8 @@ def mask_contaminants_with_spikes_protected(
             min_length_px=morph_length,
             dilation_iterations=morph_dil,
         )
+        if spike_profile_r_max is not None:
+            morph_mask &= (r <= spike_profile_r_max)
         corrected_mask = geom_mask | morph_mask
 
         spike_diagnostic_details.update({
@@ -2502,6 +2541,8 @@ def mask_contaminants_with_spikes_protected(
             "net_rotation_deg": net_rotation,
             "center": (cx, cy),
             "core_protection_radius_px": core_protection_radius_px,
+            "psf_extension_arcsec": ext_arcsec,
+            "profile_r_max_px": spike_profile_r_max,
         })
         return corrected_mask | (r <= core_protection_radius_px)
 

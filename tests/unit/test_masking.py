@@ -889,6 +889,46 @@ class TestDetectSpikePeaksFromProfile:
         assert len(details["primary_spike_angles"]) > 0
         assert "corrected_spike_mask" in details
         assert np.any(details["corrected_spike_mask"])
+        assert "profile_r_max_px" in details
+        assert details["profile_r_max_px"] is not None
+
+    def test_spike_profile_extension_matches_moffat(self):
+        """Verify profile measurement and spike mask extensions strictly match get_psf_extension_moffat."""
+        from romanepsf.profile import get_psf_extension_moffat
+        sz = 201
+        cx, cy = 100.0, 100.0
+        stamp = np.ones((sz, sz), dtype=np.float32)
+
+        star_mag = 11.5
+        expected_ext_arcsec = get_psf_extension_moffat(star_mag, depth=28.0)
+        expected_ext_px = expected_ext_arcsec / 0.11
+
+        mask, prot, res, details = mask_contaminants_with_spikes_protected(
+            stamp,
+            tier="medium",
+            method="radial_profile",
+            return_spike_details=True,
+            mag=star_mag,
+            companion_depth=28.0,
+            pixel_scale=0.11,
+        )
+
+        assert np.isclose(details["psf_extension_arcsec"], expected_ext_arcsec, atol=1e-3)
+        assert np.isclose(details["profile_r_max_px"], expected_ext_px, atol=1e-2)
+
+        # Test create_geometric_spike_mask with explicit radial_max
+        angles = np.array([0.0, 90.0, 180.0, 270.0])
+        r_max_test = 25.0
+        mask_bounded = create_geometric_spike_mask(
+            (sz, sz), (cx, cy), angles, radial_min=3.0, radial_max=r_max_test
+        )
+        gy, gx = np.ogrid[:sz, :sz]
+        r = np.hypot(gx - cx, gy - cy)
+        # Any pixel farther than r_max_test must be False in mask_bounded
+        assert not np.any(mask_bounded & (r > r_max_test))
+        # Pixels on spikes within [radial_min, r_max_test] should be True
+        assert np.any(mask_bounded & (r <= r_max_test))
+
 
 
 

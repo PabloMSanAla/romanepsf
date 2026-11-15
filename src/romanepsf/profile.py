@@ -561,6 +561,13 @@ def save_spike_polar_profiles_parquet(
             sec_angles = spike_det.get("secondary_spike_angles", [])
             all_angles = spike_det.get("refined_spike_angles", [])
 
+            r_ext_px = spike_det.get("profile_r_max_px", None)
+            if r_ext_px is None and np.isfinite(mag):
+                ext_arc = float(get_psf_extension_moffat(mag, depth=28.0))
+                r_ext_px = ext_arc / 0.11
+            elif r_ext_px is not None:
+                r_ext_px = float(r_ext_px)
+
             if theta is None or flux is None:
                 # If spike_details were not populated, compute profile on the fly
                 stamp_data = getattr(stamp, "data", None)
@@ -569,6 +576,7 @@ def save_spike_polar_profiles_parquet(
                         th_calc, flx_calc = measure_angular_profile_torch(
                             data=stamp_data,
                             center=(cx, cy),
+                            r_max=r_ext_px,
                             num_bins=360,
                         )
                         theta = th_calc
@@ -587,6 +595,8 @@ def save_spike_polar_profiles_parquet(
                 "mag": mag,
                 "center_x": cx,
                 "center_y": cy,
+                "profile_r_max_px": float(r_ext_px) if r_ext_px is not None else np.nan,
+                "psf_extension_arcsec": float(r_ext_px * 0.11) if r_ext_px is not None else np.nan,
                 "n_primary_spikes": int(len(prim_angles)),
                 "n_secondary_spikes": int(len(sec_angles)),
                 "primary_spike_angles": [float(a) for a in prim_angles],
