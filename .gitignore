@@ -37,6 +37,9 @@ Thumbs.db
 *.fits.gz
 *.zarr/
 *.log
+*.parquet
+*.npz
+output/debug/
 output/**/*.fits
 output/**/*.zarr
 output/run_all/*.fits
@@ -44,7 +47,11 @@ output/run_all/*.zarr
 output/single_*/*.fits
 output/single_*/*.zarr
 output/*.pdf
+output/**/*.pdf
 output/*.png
+output/**/*.png
+output/**/*.parquet
+output/**/*.npz
 
 # Cache directory (Gaia query cache can be regenerated or cached locally)
 cache/

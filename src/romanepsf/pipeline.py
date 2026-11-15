@@ -234,6 +234,9 @@ def process_single_detector_stamps(
         det_name = l2_data.detector.lower()
         t_load = time.perf_counter() - t0
 
+        # Run NoiseChisel once for this detector
+        l2_data.measure_sky_noisechisel(device=getattr(getattr(cfg, "environment", None), "device", "auto"))
+
         t_proj_start = time.perf_counter()
         ra_c, dec_c, rad, ra_min, ra_max, dec_min, dec_max = get_detector_sky_bounds(l2_data, margin_deg=0.02)
         cand = catalog_df[
@@ -563,6 +566,7 @@ def run_single_detector(
     # 6. Lazy Load and Calibrate L2 ASDF Image
     logger.info(f"Loading Level 2 ASDF image: {resolved_asdf_path}")
     l2_data: RomanL2Data = load_l2_image(resolved_asdf_path, calibrate=True)
+    l2_data.measure_sky_noisechisel(device=getattr(getattr(cfg, "environment", None), "device", "auto"))
 
     try:
         pa_aperture = float(l2_data.pa_aperture)
@@ -1103,6 +1107,9 @@ def _sca_file_worker_task(
                 "time_s": time.perf_counter() - t0,
                 "total": 0, "bright": 0, "medium": 0, "faint": 0,
             }
+
+        # Run NoiseChisel once for this detector
+        l2_data.measure_sky_noisechisel(device=getattr(getattr(cfg, "environment", None), "device", "auto"))
 
         ra_c, dec_c, rad, ra_min, ra_max, dec_min, dec_max = get_detector_sky_bounds(l2_data, margin_deg=0.02)
 

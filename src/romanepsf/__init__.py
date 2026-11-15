@@ -32,6 +32,9 @@ from .loader import (
     get_effective_mask,
     load_l2_image,
 )
+from .background import (
+    estimate_detector_sky_noisechisel,
+)
 from .catalog import (
     assign_stellar_tiers,
     filter_isolated_stars,
@@ -140,6 +143,7 @@ __all__ = [
     "extract_cutout",
     "estimate_stamp_background",
     "subtract_stamp_background",
+    "estimate_detector_sky_noisechisel",
     "recenter_and_align_stamp",
     "process_star_stamps",
     "ROMAN_PRIMARY_SPIKE_ANGLES_DEG",

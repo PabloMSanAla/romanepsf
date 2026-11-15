@@ -71,6 +71,10 @@ class RomanL2Data:
     meta: Dict[str, Any]        # Complete metadata dictionary
     is_calibrated: bool = True  # True if data is in surface brightness units (MJy/sr)
     var_poisson: Optional[np.ndarray] = None  # Poisson variance array from Level 2 ASDF
+    sky_bkg: Optional[np.ndarray] = None      # Deprecated: None to save memory (no big array)
+    sky_std: Optional[np.ndarray] = None      # Deprecated: None to save memory (no big array)
+    sky_bkg_val: Optional[float] = None       # Robust median scalar sky background
+    sky_std_val: Optional[Union[float, int]] = None       # Robust median scalar sky noise std
 
     def __post_init__(self) -> None:
         if self.data is not None:
@@ -94,6 +98,60 @@ class RomanL2Data:
     def get_effective_mask(self, flags: Optional[Sequence[str]] = None, bitmask: Optional[int] = None) -> np.ndarray:
         """Return combined mask of DQ flags and non-finite (NaN/Inf) pixels."""
         return get_effective_mask(self.data, self.dq, flags=flags, bitmask=bitmask)
+
+    def measure_sky_noisechisel(
+        self,
+        device: Optional[str] = "auto",
+        overwrite: bool = False,
+        verbose: bool = False,
+        subtract_sky: bool = True,
+        **kwargs: Any,
+    ) -> Tuple[float, float]:
+        """
+        Measure sky background and sky noise standard deviation using NoiseChisel
+        once for this detector, optionally subtracts sky from data, and returns scalar values.
+
+        Parameters
+        ----------
+        device : str, default 'auto'
+            Compute device ('auto', 'cpu', 'cuda').
+        overwrite : bool, default False
+            If True, recomputes even if already measured.
+        verbose : bool, default False
+            If True, prints NoiseChisel step timing diagnostics.
+        subtract_sky : bool, default True
+            If True, subtracts the measured 2D sky from self.data.
+        **kwargs : Any
+            Additional options passed to NoiseChisel.
+
+        Returns
+        -------
+        Tuple[float, float]
+            (sky_bkg_val, sky_std_val)
+        """
+        if self.sky_std_val is not None and not overwrite:
+            return self.sky_bkg_val, self.sky_std_val
+
+        from romanepsf.background import estimate_detector_sky_noisechisel
+
+        dq_mask = self.get_effective_mask()
+        sky_map, std_map, sky_val, std_val = estimate_detector_sky_noisechisel(
+            self.data,
+            dq_mask=dq_mask,
+            device=device,
+            verbose=verbose,
+            **kwargs,
+        )
+        if subtract_sky:
+            self.data = (self.data - sky_map).astype(np.float32)
+
+        self.sky_bkg_val = float(sky_val)
+        self.sky_std_val = float(std_val)
+        self.sky_bkg = None
+        self.sky_std = None
+        del sky_map, std_map
+
+        return self.sky_bkg_val, self.sky_std_val
 
 
 def get_dq_mask(
@@ -186,9 +244,15 @@ def load_l2_image(
     asdf_path: Union[str, Path],
     calibrate: bool = True,
     validate_shape: bool = True,
+    subtract_sky: bool = True,
+    device: Optional[str] = "auto",
 ) -> RomanL2Data:
     """
     Load and calibrate a Roman Level 2 ASDF image.
+
+    Runs NoiseChisel to measure the smooth sky background and sky noise std once across
+    the detector, subtracts the sky background from the data array, and stores only
+    the scalar values (sky_bkg_val and sky_std_val) to avoid storing large arrays.
 
     Parameters
     ----------
@@ -199,11 +263,17 @@ def load_l2_image(
         factor (conversion_megajanskys) to obtain calibrated surface brightness (MJy/sr).
     validate_shape : bool, default True
         If True, validates that active array shape is (4088, 4088).
+    subtract_sky : bool, default True
+        If True and calibrate is True, runs NoiseChisel, subtracts the 2D sky from
+        data, and populates scalar sky_bkg_val and sky_std_val.
+    device : str, default 'auto'
+        Execution device for NoiseChisel ('auto', 'cpu', 'cuda').
 
     Returns
     -------
     RomanL2Data
-        Dataclass containing data arrays, WCS, and calibrated metadata.
+        Dataclass containing data array (sky-subtracted), WCS, calibrated metadata,
+        and scalar sky_bkg_val and sky_std_val.
 
     Raises
     ------
@@ -310,6 +380,33 @@ def load_l2_image(
             cal_err = err.copy()
             cal_var_poisson = var_poisson.copy() if var_poisson is not None else None
 
+        sky_bkg_val: Optional[float] = None
+        sky_std_val: Optional[float] = None
+
+        # Run NoiseChisel and subtract sky directly from data, returning only scalar values
+        if subtract_sky and calibrate:
+            try:
+                from romanepsf.background import estimate_detector_sky_noisechisel
+                dq_effective = get_effective_mask(cal_data, dq)
+                sky_map, std_map, s_val, n_val = estimate_detector_sky_noisechisel(
+                    cal_data, dq_mask=dq_effective, device=device
+                )
+                cal_data = (cal_data - sky_map).astype(np.float32)
+                sky_bkg_val = float(s_val)
+                sky_std_val = float(n_val)
+                del sky_map, std_map
+                logger.info(
+                    f"Subtracted NoiseChisel detector sky background ({sky_bkg_val:.5f} MJy/sr), "
+                    f"sky std: {sky_std_val:.5f} [device={device}]"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"NoiseChisel execution during load_l2_image failed: {exc}. "
+                    "Skipping sky subtraction."
+                )
+                sky_bkg_val = 0.0
+                sky_std_val = 1.0
+
         # Compile metadata dictionary
         meta_dict: Dict[str, Any] = {
             "detector": detector,
@@ -323,6 +420,8 @@ def load_l2_image(
             "pixel_area": pixel_area,
             "zp_ab": zp_ab,
             "pixel_scale": pixel_scale,
+            "sky_bkg_val": sky_bkg_val,
+            "sky_std_val": sky_std_val,
         }
 
     return RomanL2Data(
@@ -341,4 +440,8 @@ def load_l2_image(
         meta=meta_dict,
         is_calibrated=calibrate,
         var_poisson=cal_var_poisson,
+        sky_bkg=None,
+        sky_std=None,
+        sky_bkg_val=sky_bkg_val,
+        sky_std_val=sky_std_val,
     )

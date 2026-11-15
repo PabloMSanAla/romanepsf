@@ -434,6 +434,24 @@ def process_star_stamps(
     dq_hard_bad = get_dq_mask(l2_data.dq, ["DO_NOT_USE", "DROPOUT"])
     dq_saturated = get_dq_mask(l2_data.dq, ["SATURATED"])
 
+    # Ensure NoiseChisel detector sky background and noise have been measured once for this detector
+    if l2_data is not None and getattr(l2_data, "sky_std_val", None) is None:
+        try:
+            if hasattr(l2_data, "measure_sky_noisechisel"):
+                l2_data.measure_sky_noisechisel()
+            else:
+                from romanepsf.background import estimate_detector_sky_noisechisel
+                s_map, n_map, s_val, n_val = estimate_detector_sky_noisechisel(
+                    l2_data.data,
+                    dq_mask=l2_data.get_effective_mask() if hasattr(l2_data, "get_effective_mask") else None
+                )
+                l2_data.data = (l2_data.data - s_map).astype(np.float32)
+                l2_data.sky_bkg_val = float(s_val)
+                l2_data.sky_std_val = float(n_val)
+                del s_map, n_map
+        except Exception as e:
+            logger.warning(f"Could not run NoiseChisel on detector ({e}); falling back to local stamp background.")
+
     for tier in ["bright", "medium", "faint"]:
         if "tier" in catalog_df.columns:
             sub_df = catalog_df[catalog_df["tier"].str.lower() == tier].copy()
@@ -505,13 +523,21 @@ def process_star_stamps(
 
             dq_mask_bool |= sat_bool
 
-            # 4. Background estimation & optional subtraction
-            if subtract_background:
-                bkg_val, bkg_rms = estimate_stamp_background(raw_cutout, mask=dq_mask_bool, method=bkg_method)
-                flux_cutout = subtract_stamp_background(raw_cutout, bkg_val)
-            else:
-                bkg_val, bkg_rms = 0.0, 0.0
+            # 4. Background estimation & optional subtraction (NoiseChisel detector sky)
+            if l2_data is not None and getattr(l2_data, "sky_std_val", None) is not None:
+                bkg_val = float(l2_data.sky_bkg_val) if l2_data.sky_bkg_val is not None else 0.0
+                bkg_rms = float(l2_data.sky_std_val)
+                # Science array was already sky-subtracted at detector level
                 flux_cutout = raw_cutout.copy()
+                sky_std_scalar = bkg_rms
+            else:
+                if subtract_background:
+                    bkg_val, bkg_rms = estimate_stamp_background(raw_cutout, mask=dq_mask_bool, method=bkg_method)
+                    flux_cutout = subtract_stamp_background(raw_cutout, bkg_val)
+                else:
+                    bkg_val, bkg_rms = 0.0, 1.0
+                    flux_cutout = raw_cutout.copy()
+                sky_std_scalar = bkg_rms
 
             # 5. Apply dual-prior spike protection & contaminant masking
             comps_table = companion_stars if companion_stars is not None else catalog_df
@@ -536,6 +562,7 @@ def process_star_stamps(
                         var_poisson=raw_vp,
                         return_spike_details=True,
                         mag=mag,
+                        sky_std=sky_std_scalar,
                     )
                 else:
                     res_tuple = mask_contaminants_with_spikes_protected(
@@ -553,6 +580,7 @@ def process_star_stamps(
                         var_poisson=raw_vp,
                         return_spike_details=True,
                         mag=mag,
+                        sky_std=sky_std_scalar,
                     )
                 if len(res_tuple) == 4:
                     mask, _, res_map, spike_diag = res_tuple

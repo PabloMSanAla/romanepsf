@@ -226,6 +226,8 @@ def detect_spike_peaks_from_profile(
     min_prominence_sigma: float = 1.5,
     secondary_threshold_sigma: float = 2.5,
     min_relative_secondary_height: float = 0.05,
+    reference_angles: Optional[np.ndarray] = None,
+    max_reference_deviation_deg: float = 5.0,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Empirically detect diffraction spike angles by finding peaks on the azimuthal intensity profile.
@@ -275,6 +277,10 @@ def detect_spike_peaks_from_profile(
         if mad_val <= 0.0:
             mad_val = 0.01
 
+    # Require significant profile peaks above background noise to identify empirical spikes
+    if np.max(clean) - med_val < 5.0 * mad_val:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
     step = float(bin_centers[1] - bin_centers[0]) if len(bin_centers) > 1 else 1.0
     dist_bins = max(int(round(min_distance_deg / step)), 1)
     pad_len = dist_bins * 3
@@ -289,6 +295,38 @@ def detect_spike_peaks_from_profile(
 
     if len(p_idx) == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    # Filter peaks for 180-degree symmetry (characteristic of optical diffraction spikes)
+    candidate_angles = bin_centers[p_idx]
+    sym_mask = np.zeros(len(p_idx), dtype=bool)
+    for i, p_ang in enumerate(candidate_angles):
+        opp_ang = (p_ang + 180.0) % 360.0
+        ang_diffs = np.abs((candidate_angles - opp_ang + 180.0) % 360.0 - 180.0)
+        closest_idx = int(np.argmin(ang_diffs))
+        if ang_diffs[closest_idx] <= 6.0:
+            h_curr = max(float(p_height[i] - med_val), 0.0)
+            h_opp = max(float(p_height[closest_idx] - med_val), 0.0)
+            if max(h_curr, h_opp) > 0 and (min(h_curr, h_opp) / max(h_curr, h_opp)) >= 0.15:
+                sym_mask[i] = True
+
+    if np.any(sym_mask):
+        p_idx = p_idx[sym_mask]
+        p_height = clean[p_idx]
+    else:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    # Optional reference geometry filtering to eliminate non-strut sources
+    if reference_angles is not None and len(reference_angles) > 0:
+        ref_arr = np.asarray(reference_angles, dtype=float) % 360.0
+        ref_mask = np.zeros(len(p_idx), dtype=bool)
+        for i, p_ang in enumerate(bin_centers[p_idx]):
+            min_ref_d = np.min(np.abs((p_ang - ref_arr + 180.0) % 360.0 - 180.0))
+            if min_ref_d <= max_reference_deviation_deg:
+                ref_mask[i] = True
+        p_idx = p_idx[ref_mask]
+        p_height = p_height[ref_mask]
+        if len(p_idx) == 0:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
     sort_order = np.argsort(p_height)[::-1]
     sorted_p_idx = p_idx[sort_order]
@@ -1996,17 +2034,15 @@ def _detect_contaminants_erosion_dilation(
     residual: np.ndarray,
     protected_area: np.ndarray,
     dq_mask: Optional[np.ndarray] = None,
-    detection_sigma: float = 1.5,
+    detection_sigma: float = 1.3,
+    sky_std: Optional[Union[float, np.ndarray]] = None,
 ) -> np.ndarray:
     """
-    Detect non-stellar contaminants using sigma-clipped thresholding followed by
+    Detect non-stellar contaminants using sigma thresholding followed by
     morphological opening (1x1 erosion) and dilation (3x3), strictly excluding protected areas.
 
-    Formula:
-        _, median, std = sigma_clipped_stats(residual)
-        mask = residual > median + 1.5 * std
-        mask = cv2.dilate(cv2.erode(mask, (1, 1)), (3, 3))
-        mask[protected_spikes > 0] = 0
+    When sky_std is provided (e.g. from NoiseChisel), the detection threshold is
+    computed as res_med + detection_sigma * sky_std.
     """
     clean_area = (~protected_area) & np.isfinite(residual)
     if dq_mask is not None:
@@ -2020,7 +2056,17 @@ def _detect_contaminants_erosion_dilation(
         res_med = 0.0
         res_std = float(np.nanstd(residual)) if np.any(np.isfinite(residual)) else 1.0
 
-    threshold_val = res_med + max(detection_sigma * res_std, 0.1)
+    if sky_std is not None:
+        if isinstance(sky_std, np.ndarray):
+            noise_scale = float(np.nanmedian(sky_std)) if sky_std.size > 0 else res_std
+        else:
+            noise_scale = float(sky_std)
+        if noise_scale <= 0.0 or not np.isfinite(noise_scale):
+            noise_scale = res_std
+    else:
+        noise_scale = res_std
+
+    threshold_val = res_med + detection_sigma * noise_scale
     contam_raw = (residual > threshold_val).astype(np.uint8)
 
     # Morphological erosion (1x1) then dilation (3x3)
@@ -2218,6 +2264,7 @@ def mask_contaminants_with_spikes_protected(
     contaminant_detector: Optional[str] = None,
     return_spike_details: bool = False,
     mag: Optional[float] = None,
+    sky_std: Optional[Union[float, np.ndarray]] = None,
 ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]]:
     """
     Mask non-stellar contaminants in stamp while strictly protecting Roman diffraction spikes and core.
@@ -2344,19 +2391,74 @@ def mask_contaminants_with_spikes_protected(
     grid_y, grid_x = np.ogrid[:ny, :nx]
     r = np.sqrt((grid_x - cx)**2 + (grid_y - cy)**2)
 
+    # Pre-compute circular aperture masks for neighbor Gaia stars
+    comp_mask = None
+    if companion_stars is not None:
+        comp_mask = mask_gaia_companion_stars(
+            (ny, nx),
+            target_center_xy if target_center_xy is not None else (cx, cy),
+            companion_stars,
+            pixel_scale=pixel_scale,
+            depth=companion_depth,
+            core_exclusion_radius_px=core_protection_radius_px,
+        )
+
+    # Resolve contaminant detector ('erosion_dilation' or 'mto2')
+    method_lower = str(method).lower().strip()
+    if contaminant_detector is None:
+        det_choice = getattr(spikes_cfg, "contaminant_detector", "erosion_dilation")
+        contam_mode = str(det_choice).lower().strip()
+    else:
+        contam_mode = str(contaminant_detector).lower().strip()
+
+    def _detect_contams(res_or_stamp: np.ndarray, prot_area: np.ndarray) -> np.ndarray:
+        if contam_mode == "mto2" or method_lower == "mto2":
+            mto2_cfg = getattr(spikes_cfg, "mto2", None)
+            s_sig = float(getattr(mto2_cfg, "s_sigma", 1.6)) if mto2_cfg else 1.6
+            alp = float(getattr(mto2_cfg, "alpha", 1e-6)) if mto2_cfg else 1e-6
+            mf = float(getattr(mto2_cfg, "move_factor", 0.1)) if mto2_cfg else 0.1
+            ar = float(getattr(mto2_cfg, "area_ratio", 0.90)) if mto2_cfg else 0.90
+            dil = int(getattr(mto2_cfg, "dilation_px", 2)) if mto2_cfg else 2
+            try:
+                return _detect_contaminants_mto2(
+                    res_or_stamp,
+                    (cx, cy),
+                    core_protection_radius_px,
+                    prot_area,
+                    dq_mask=dq_mask,
+                    s_sigma=s_sig,
+                    alpha=alp,
+                    move_factor=mf,
+                    area_ratio=ar,
+                    dilation_px=dil,
+                )
+            except ImportError:
+                logger.debug("MTO2 unavailable (higra missing); falling back to erosion_dilation.")
+        return _detect_contaminants_erosion_dilation(
+            res_or_stamp,
+            prot_area,
+            dq_mask=dq_mask,
+            detection_sigma=detection_sigma,
+            sky_std=sky_std,
+        )
+
     is_faint = (tier is not None and str(tier).lower().strip() == "faint")
 
     if is_faint:
-        # Faint stars: omit Moffat fitting, omit diffraction spikes, omit contaminant masking.
-        # Direct pass-through for subsequent centering, resampling, normalization, and stacking.
         residual = np.where(np.isfinite(stamp), stamp, 0.0).astype(np.float32)
         protected_stellar_area = (r <= core_protection_radius_px)
-        final_mask = np.zeros(stamp.shape, dtype=bool)
+        contams = _detect_contams(residual, protected_stellar_area)
+        final_mask = contams.copy()
+        if comp_mask is not None:
+            final_mask |= (comp_mask & (~protected_stellar_area))
         if dq_mask is not None:
             final_mask |= dq_mask
         final_mask |= (~np.isfinite(stamp))
+        final_mask[protected_stellar_area] = False
         if return_spike_details:
             faint_details = {
+                "primary_spike_angles": np.array([], dtype=float),
+                "secondary_spike_angles": np.array([], dtype=float),
                 "base_spike_angles": np.array([], dtype=float),
                 "refined_spike_angles": np.array([], dtype=float),
                 "theoretical_spike_mask": np.zeros(stamp.shape, dtype=bool),
@@ -2366,8 +2468,9 @@ def mask_contaminants_with_spikes_protected(
                 "net_rotation_deg": float(pa_offset_deg or 0.0),
                 "center": (cx, cy),
                 "core_protection_radius_px": core_protection_radius_px,
+                "angular_profile_theta": np.linspace(0.5, 359.5, 360),
+                "angular_profile_flux": np.full(360, np.nan),
             }
-        if return_spike_details:
             return final_mask, protected_stellar_area, residual, faint_details
         return final_mask, protected_stellar_area, residual
 
@@ -2480,6 +2583,8 @@ def mask_contaminants_with_spikes_protected(
             min_prominence_sigma=min_prom_sig,
             secondary_threshold_sigma=sec_thresh_sig,
             min_relative_secondary_height=min_rel_h,
+            reference_angles=get_theoretical_spike_angles(net_rotation, order="both"),
+            max_reference_deviation_deg=6.0,
         )
 
         if len(primary_angles) == 0:
@@ -2525,14 +2630,14 @@ def mask_contaminants_with_spikes_protected(
         )
         if spike_profile_r_max is not None:
             morph_mask &= (r <= spike_profile_r_max)
-        corrected_mask = geom_mask | morph_mask
+        corrected_mask = geom_mask | morph_mask | theoretical_spike_mask
 
         spike_diagnostic_details.update({
             "primary_spike_angles": primary_angles,
             "secondary_spike_angles": secondary_angles,
             "base_spike_angles": primary_angles,
             "refined_spike_angles": all_detected_angles,
-            "theoretical_spike_mask": primary_geom_mask,
+            "theoretical_spike_mask": theoretical_spike_mask,
             "corrected_spike_mask": corrected_mask,
             "morphological_spike_mask": morph_mask,
             "geometric_spike_mask": geom_mask,
@@ -2546,44 +2651,6 @@ def mask_contaminants_with_spikes_protected(
         })
         return corrected_mask | (r <= core_protection_radius_px)
 
-    # Resolve contaminant detector ('erosion_dilation' or 'mto2')
-    if contaminant_detector is None:
-        det_choice = getattr(spikes_cfg, "contaminant_detector", "erosion_dilation")
-        contam_mode = str(det_choice).lower().strip()
-    else:
-        contam_mode = str(contaminant_detector).lower().strip()
-
-    def _detect_contams(res_or_stamp: np.ndarray, prot_area: np.ndarray) -> np.ndarray:
-        if contam_mode == "mto2" or method_lower == "mto2":
-            mto2_cfg = getattr(spikes_cfg, "mto2", None)
-            s_sig = float(getattr(mto2_cfg, "s_sigma", 1.6)) if mto2_cfg else 1.6
-            alp = float(getattr(mto2_cfg, "alpha", 1e-6)) if mto2_cfg else 1e-6
-            mf = float(getattr(mto2_cfg, "move_factor", 0.1)) if mto2_cfg else 0.1
-            ar = float(getattr(mto2_cfg, "area_ratio", 0.90)) if mto2_cfg else 0.90
-            dil = int(getattr(mto2_cfg, "dilation_px", 2)) if mto2_cfg else 2
-            try:
-                return _detect_contaminants_mto2(
-                    res_or_stamp,
-                    (cx, cy),
-                    core_protection_radius_px,
-                    prot_area,
-                    dq_mask=dq_mask,
-                    s_sigma=s_sig,
-                    alpha=alp,
-                    move_factor=mf,
-                    area_ratio=ar,
-                    dilation_px=dil,
-                )
-            except ImportError:
-                logger.debug("MTO2 unavailable (higra missing); falling back to erosion_dilation.")
-        return _detect_contaminants_erosion_dilation(
-            res_or_stamp,
-            prot_area,
-            dq_mask=dq_mask,
-            detection_sigma=detection_sigma,
-        )
-
-    method_lower = str(method).lower().strip()
     if method_lower in ("radial_profile", "radial", "profile", "default"):
         # 1. Construct 2D radial profile model from sigma-clipped annuli
         growth_val = effective_growth_rate if (effective_growth_rate is not None and effective_growth_rate > 1.0) else 1.03
@@ -2600,14 +2667,22 @@ def mask_contaminants_with_spikes_protected(
         protected_stellar_area = _build_spike_and_core_protection(residual)
         core_region = (r_map_2d <= core_protection_radius_px)
 
-        # 2. Contaminant detection via 1.3-sigma thresholding above background/local residual scatter
+        # 2. Contaminant detection via thresholding above background/local residual scatter
         det_sig = float(detection_sigma) if detection_sigma is not None else 1.3
-        from astropy.stats import mad_std
-        outer_finite = (r_map_2d > (nx // 3)) & np.isfinite(residual) & (~protected_stellar_area)
-        bkg_sigma = float(mad_std(residual[outer_finite], ignore_nan=True)) if np.any(outer_finite) else 0.05
-        effective_sigma = np.maximum(std_2d, bkg_sigma)
+        if sky_std is not None:
+            if isinstance(sky_std, np.ndarray):
+                effective_sigma = float(np.nanmedian(sky_std)) if sky_std.size > 0 else 0.05
+            else:
+                effective_sigma = float(sky_std)
+            if effective_sigma <= 0.0 or not np.isfinite(effective_sigma):
+                effective_sigma = 0.05
+        else:
+            from astropy.stats import mad_std
+            outer_finite = (r_map_2d > (nx // 3)) & np.isfinite(residual) & (~protected_stellar_area)
+            bkg_sigma = float(mad_std(residual[outer_finite], ignore_nan=True)) if np.any(outer_finite) else 0.05
+            effective_sigma = np.maximum(std_2d, bkg_sigma)
 
-        threshold_map = np.maximum(det_sig * effective_sigma, 0.05)
+        threshold_map = det_sig * effective_sigma
         contam_raw = (residual > threshold_map) & (~protected_stellar_area) & (~core_region)
         if dq_mask is not None:
             contam_raw &= (~dq_mask)

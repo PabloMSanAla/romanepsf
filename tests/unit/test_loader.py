@@ -70,10 +70,15 @@ def test_load_l2_image_mock(monkeypatch):
     assert l2.err.shape == (4088, 4088)
     assert l2.conversion_factor == pytest.approx(0.238965, rel=1e-5)
 
-    # Photometric calibration: 10.0 DN/s * 0.238965 = 2.38965 MJy/sr
-    assert np.allclose(l2.data, 10.0 * 0.238965)
+    # Photometric calibration and sky subtraction
     assert np.allclose(l2.raw_data, 10.0)
+    assert l2.sky_bkg_val == pytest.approx(10.0 * 0.238965, rel=1e-5)
+    assert np.allclose(l2.data, 0.0)
     assert np.allclose(l2.err, 0.1 * 0.238965)
+
+    # Without sky subtraction
+    l2_unsub = load_l2_image("dummy_wfi01.asdf", calibrate=True, subtract_sky=False)
+    assert np.allclose(l2_unsub.data, 10.0 * 0.238965)
 
 
 def test_load_l2_image_uncalibrated(monkeypatch):
