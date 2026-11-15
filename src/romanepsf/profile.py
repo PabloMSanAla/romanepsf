@@ -13,12 +13,16 @@ full 2D spatial structure and 2D diffraction spikes.
 from __future__ import annotations
 
 import time
+import logging
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Sequence, Tuple, Union, Any
 import numpy as np
 import torch
 
 from romanepsf.config import resolve_device
+
+logger = logging.getLogger("romanepsf.profile")
 
 
 def get_geometric_radial_bins(
@@ -504,10 +508,107 @@ def measure_angular_profile_torch(
     return bin_centers.cpu().numpy(), medians.cpu().numpy()
 
 
+def save_spike_polar_profiles_parquet(
+    pooled_stamps: Dict[str, Sequence[Any]],
+    output_parquet_path: Union[str, Path],
+    sca_name: Union[int, str] = "wfi01",
+) -> Path:
+    """
+    Extract and save polar profiles (intensity vs theta) and detected spike angles
+    for all stars in a run into a Parquet table.
+
+    Parameters
+    ----------
+    pooled_stamps : dict
+        Dictionary mapping tier names ('bright', 'medium', 'faint') to lists of StellarStamp objects.
+    output_parquet_path : str or Path
+        Target destination path for the .parquet table.
+    sca_name : int or str, default 'wfi01'
+        SCA detector identifier (e.g. 1, 18, 'wfi01').
+
+    Returns
+    -------
+    Path
+        Path to the saved Parquet table.
+    """
+    import pandas as pd
+    from romanepsf.config import normalize_sca_id
+
+    sca_str = normalize_sca_id(sca_name)
+    out_path = Path(output_parquet_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    records: List[Dict[str, Any]] = []
+
+    for tier_name in ["bright", "medium", "faint"]:
+        stamps = pooled_stamps.get(tier_name, [])
+        for stamp in stamps:
+            sid = getattr(stamp, "source_id", None)
+            mag = float(getattr(stamp, "mag", np.nan))
+            dbg = getattr(stamp, "debug_info", None) or {}
+            spike_det = dbg.get("spike_details") or {}
+
+            # Center coordinates
+            center_xy = dbg.get("center_stamp", getattr(stamp, "center_original", (np.nan, np.nan)))
+            cx, cy = (float(center_xy[0]), float(center_xy[1])) if center_xy is not None else (np.nan, np.nan)
+
+            # Extract polar profile
+            theta = spike_det.get("angular_profile_theta")
+            flux = spike_det.get("angular_profile_flux")
+
+            # Detected spike angles
+            prim_angles = spike_det.get("primary_spike_angles", [])
+            sec_angles = spike_det.get("secondary_spike_angles", [])
+            all_angles = spike_det.get("refined_spike_angles", [])
+
+            if theta is None or flux is None:
+                # If spike_details were not populated, compute profile on the fly
+                stamp_data = getattr(stamp, "data", None)
+                if stamp_data is not None and getattr(stamp_data, "size", 0) > 0:
+                    try:
+                        th_calc, flx_calc = measure_angular_profile_torch(
+                            data=stamp_data,
+                            center=(cx, cy),
+                            num_bins=360,
+                        )
+                        theta = th_calc
+                        flux = flx_calc
+                    except Exception:
+                        theta = np.linspace(0.5, 359.5, 360)
+                        flux = np.full(360, np.nan)
+                else:
+                    theta = np.linspace(0.5, 359.5, 360)
+                    flux = np.full(360, np.nan)
+
+            rec = {
+                "source_id": str(sid) if sid is not None else "",
+                "sca": sca_str,
+                "tier": str(tier_name),
+                "mag": mag,
+                "center_x": cx,
+                "center_y": cy,
+                "n_primary_spikes": int(len(prim_angles)),
+                "n_secondary_spikes": int(len(sec_angles)),
+                "primary_spike_angles": [float(a) for a in prim_angles],
+                "secondary_spike_angles": [float(a) for a in sec_angles],
+                "all_spike_angles": [float(a) for a in all_angles],
+                "theta_deg": [float(t) for t in theta],
+                "polar_flux": [float(f) for f in flux],
+            }
+            records.append(rec)
+
+    df = pd.DataFrame(records)
+    df.to_parquet(out_path, index=False)
+    logger.info(f"Saved {len(df)} star polar profiles for {sca_str} to Parquet: {out_path}")
+    return out_path
+
+
 __all__ = [
     "get_geometric_radial_bins",
     "create_ellipse_meshgrid_torch",
     "elliptical_profile",
     "get_psf_extension_moffat",
     "measure_angular_profile_torch",
+    "save_spike_polar_profiles_parquet",
 ]
+

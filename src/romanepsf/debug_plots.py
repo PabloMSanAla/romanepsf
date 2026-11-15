@@ -1057,6 +1057,10 @@ def generate_all_debug_plots(
     Additionally generates per-star diagnostic figures for individual star inspection.
     """
     from romanepsf.assembly import measure_radial_profile_1d, get_geometric_radial_bins
+    from romanepsf.config import normalize_sca_id
+    import shutil
+
+    sca_str = normalize_sca_id(sca_name)
 
     out_p = Path(output_dir)
     debug_dir = out_p if out_p.name == "debug" else (out_p / "debug")
@@ -1169,7 +1173,7 @@ def generate_all_debug_plots(
         star_profiles_list.append(sp_dict)
 
         # Generate Figure 1 for star
-        fig1_star_path = debug_dir / f"debug_1_masking_procedure_{tier_name}_{sid}.png"
+        fig1_star_path = debug_dir / f"debug_1_{sca_str}_masking_procedure_{tier_name}_{sid}.png"
         generate_debug_figure1_masking_procedure(
             stamp=stamp_img,
             radial_model=rad_mod,
@@ -1180,9 +1184,12 @@ def generate_all_debug_plots(
             star_info=star_meta,
             is_calibrated=is_cal,
         )
+        fig1_star_legacy = debug_dir / f"debug_1_masking_procedure_{tier_name}_{sid}.png"
+        if fig1_star_legacy != fig1_star_path:
+            shutil.copyfile(fig1_star_path, fig1_star_legacy)
 
         # Generate Figure 2 for star
-        fig2_star_path = debug_dir / f"debug_2_apertures_and_profile_{tier_name}_{sid}.png"
+        fig2_star_path = debug_dir / f"debug_2_{sca_str}_apertures_and_profile_{tier_name}_{sid}.png"
         generate_debug_figure2_apertures_and_profile(
             stamp=stamp_img,
             mask=mask,
@@ -1195,18 +1202,24 @@ def generate_all_debug_plots(
             is_calibrated=is_cal,
             center_xy=center_xy,
         )
+        fig2_star_legacy = debug_dir / f"debug_2_apertures_and_profile_{tier_name}_{sid}.png"
+        if fig2_star_legacy != fig2_star_path:
+            shutil.copyfile(fig2_star_path, fig2_star_legacy)
 
         # Generate Figure 3 per star
-        fig3_star_path = debug_dir / f"debug_3_profile_normalization_{tier_name}_{sid}.png"
+        fig3_star_path = debug_dir / f"debug_3_{sca_str}_profile_normalization_{tier_name}_{sid}.png"
         generate_debug_figure3_profile_normalization(
             star_profiles=[sp_dict],
             mean_reference_profile=(r_c, prof_c_scaled),
             norm_ranges={tier_name: (fit_r_min, fit_r_max)},
             output_path=fig3_star_path,
         )
+        fig3_star_legacy = debug_dir / f"debug_3_profile_normalization_{tier_name}_{sid}.png"
+        if fig3_star_legacy != fig3_star_path:
+            shutil.copyfile(fig3_star_path, fig3_star_legacy)
 
         # Generate Spike Process Diagnostic Figure per star
-        fig_spike_star_path = debug_dir / f"debug_spike_process_{tier_name}_{sid}.png"
+        fig_spike_star_path = debug_dir / f"debug_spike_process_{sca_str}_{tier_name}_{sid}.png"
         generate_debug_figure_spike_process(
             stamp=stamp_img,
             residual=res_map,
@@ -1216,10 +1229,13 @@ def generate_all_debug_plots(
             is_calibrated=is_cal,
             center_xy=center_xy,
         )
+        fig_spike_star_legacy = debug_dir / f"debug_spike_process_{tier_name}_{sid}.png"
+        if fig_spike_star_legacy != fig_spike_star_path:
+            shutil.copyfile(fig_spike_star_path, fig_spike_star_legacy)
 
         # Canonical / representative assignment
         if idx == representative_star_idx:
-            fig1_canon = debug_dir / "debug_1_masking_procedure.png"
+            fig1_canon = debug_dir / f"debug_1_{sca_str}_masking_procedure.png"
             generate_debug_figure1_masking_procedure(
                 stamp=stamp_img,
                 radial_model=rad_mod,
@@ -1230,9 +1246,12 @@ def generate_all_debug_plots(
                 star_info=star_meta,
                 is_calibrated=is_cal,
             )
+            fig1_legacy = debug_dir / "debug_1_masking_procedure.png"
+            if fig1_legacy != fig1_canon:
+                shutil.copyfile(fig1_canon, fig1_legacy)
             generated_files["debug_1_masking_procedure"] = fig1_canon
 
-            fig2_canon = debug_dir / "debug_2_apertures_and_profile.png"
+            fig2_canon = debug_dir / f"debug_2_{sca_str}_apertures_and_profile.png"
             generate_debug_figure2_apertures_and_profile(
                 stamp=stamp_img,
                 mask=mask,
@@ -1245,9 +1264,12 @@ def generate_all_debug_plots(
                 is_calibrated=is_cal,
                 center_xy=center_xy,
             )
+            fig2_legacy = debug_dir / "debug_2_apertures_and_profile.png"
+            if fig2_legacy != fig2_canon:
+                shutil.copyfile(fig2_canon, fig2_legacy)
             generated_files["debug_2_apertures_and_profile"] = fig2_canon
 
-            fig_spike_canon = debug_dir / "debug_spike_process.png"
+            fig_spike_canon = debug_dir / f"debug_spike_process_{sca_str}.png"
             generate_debug_figure_spike_process(
                 stamp=stamp_img,
                 residual=res_map,
@@ -1257,9 +1279,12 @@ def generate_all_debug_plots(
                 is_calibrated=is_cal,
                 center_xy=center_xy,
             )
+            fig_spike_legacy = debug_dir / "debug_spike_process.png"
+            if fig_spike_legacy != fig_spike_canon:
+                shutil.copyfile(fig_spike_canon, fig_spike_legacy)
             generated_files["debug_spike_process"] = fig_spike_canon
 
-            fig6_canon = debug_dir / "debug_6_spike_process.png"
+            fig6_canon = debug_dir / f"debug_6_{sca_str}_spike_process.png"
             generate_debug_figure_spike_process(
                 stamp=stamp_img,
                 residual=res_map,
@@ -1269,38 +1294,50 @@ def generate_all_debug_plots(
                 is_calibrated=is_cal,
                 center_xy=center_xy,
             )
+            fig6_legacy = debug_dir / "debug_6_spike_process.png"
+            if fig6_legacy != fig6_canon:
+                shutil.copyfile(fig6_canon, fig6_legacy)
             generated_files["debug_6_spike_process"] = fig6_canon
 
     # Figure 3: Multi-Star Composite Normalization Summary
-    fig3_path = debug_dir / "debug_3_profile_normalization.png"
+    fig3_path = debug_dir / f"debug_3_{sca_str}_profile_normalization.png"
     generate_debug_figure3_profile_normalization(
         star_profiles=star_profiles_list,
         mean_reference_profile=(r_c, prof_c_scaled),
         norm_ranges=norm_ranges,
         output_path=fig3_path,
     )
+    fig3_legacy = debug_dir / "debug_3_profile_normalization.png"
+    if fig3_legacy != fig3_path:
+        shutil.copyfile(fig3_path, fig3_legacy)
     generated_files["debug_3_profile_normalization"] = fig3_path
 
     # Figure 4: Model PSF Canvas (scaled 10^-2 to 10^11)
-    fig4_path = debug_dir / "debug_4_model_psf.png"
+    fig4_path = debug_dir / f"debug_4_{sca_str}_model_psf.png"
     generate_debug_figure4_model_psf(
         composite_epsf=composite_epsf,
         output_path=fig4_path,
-        sca_name=sca_name,
+        sca_name=sca_str,
         pixel_scale=pixel_scale,
     )
+    fig4_legacy = debug_dir / "debug_4_model_psf.png"
+    if fig4_legacy != fig4_path:
+        shutil.copyfile(fig4_path, fig4_legacy)
     generated_files["debug_4_model_psf"] = fig4_path
 
     # Figure 5: Final Composite Profile with All Normalized Stars (scaled 10^-2 to 10^11)
-    fig5_path = debug_dir / "debug_5_final_profile_normalized.png"
+    fig5_path = debug_dir / f"debug_5_{sca_str}_final_profile_normalized.png"
     generate_debug_figure5_final_profile(
         r_composite=r_c,
         f_composite=prof_c_scaled,
         star_profiles=star_profiles_list,
         output_path=fig5_path,
-        sca_name=sca_name,
+        sca_name=sca_str,
         pixel_scale=pixel_scale,
     )
+    fig5_legacy = debug_dir / "debug_5_final_profile_normalized.png"
+    if fig5_legacy != fig5_path:
+        shutil.copyfile(fig5_path, fig5_legacy)
     generated_files["debug_5_final_profile_normalized"] = fig5_path
 
     logger.info(

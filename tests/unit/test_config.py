@@ -179,3 +179,35 @@ def test_path_attribute_conversion():
     assert isinstance(cfg.data.detectors_dir, Path)
     assert isinstance(cfg.data.catalog_path, Path)
     assert isinstance(cfg.reporting.report_path, Path)
+
+
+def test_normalize_sca_id():
+    """Verify SCA normalization handles integers (1-18) and strings to standard 'wfi01'-'wfi18'."""
+    from romanepsf.config import normalize_sca_id
+
+    # Integers 1-18
+    assert normalize_sca_id(1) == "wfi01"
+    assert normalize_sca_id(9) == "wfi09"
+    assert normalize_sca_id(18) == "wfi18"
+
+    # String variations
+    assert normalize_sca_id("1") == "wfi01"
+    assert normalize_sca_id("01") == "wfi01"
+    assert normalize_sca_id("wfi01") == "wfi01"
+    assert normalize_sca_id("WFI18") == "wfi18"
+    assert normalize_sca_id("sca02") == "wfi02"
+
+    # None and empty string
+    assert normalize_sca_id(None, default="wfi01") == "wfi01"
+    assert normalize_sca_id("", default="wfi05") == "wfi05"
+
+    # Out of range
+    with pytest.raises(ValueError, match="Roman WFI detectors are numbered 1 through 18"):
+        normalize_sca_id(0)
+
+    with pytest.raises(ValueError, match="Roman WFI detectors are numbered 1 through 18"):
+        normalize_sca_id(19)
+
+    with pytest.raises(ValueError, match="Invalid SCA identifier"):
+        normalize_sca_id("invalid")
+

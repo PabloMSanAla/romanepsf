@@ -276,3 +276,57 @@ class TestMeasureAngularProfileTorch:
         assert len(angles) == 360
         assert np.all(np.isnan(medians))
 
+
+class TestSaveSpikePolarProfilesParquet:
+    """Unit tests for saving and loading spike polar profiles in Parquet format."""
+
+    def test_save_and_load_parquet(self, tmp_path):
+        import pandas as pd
+        from romanepsf.stamps import StellarStamp
+
+        sz = 41
+        img = np.ones((sz, sz), dtype=np.float32)
+        mask = np.zeros((sz, sz), dtype=bool)
+
+        stamp = StellarStamp(
+            source_id="12345",
+            tier="bright",
+            mag=10.5,
+            data=img,
+            mask=mask,
+            center_original=(20.0, 20.0),
+            size=sz,
+            debug_info={
+                "center_stamp": (20.0, 20.0),
+                "spike_details": {
+                    "angular_profile_theta": np.linspace(0.5, 359.5, 360),
+                    "angular_profile_flux": np.ones(360, dtype=np.float32) * 5.0,
+                    "primary_spike_angles": [15.0, 45.0, 75.0],
+                    "secondary_spike_angles": [105.0],
+                    "refined_spike_angles": [15.0, 45.0, 75.0, 105.0],
+                },
+            },
+        )
+
+        stamps = {"bright": [stamp], "medium": [], "faint": []}
+        out_parquet = tmp_path / "roman_epsf_wfi01_polar_profiles.parquet"
+
+        saved_path = profile.save_spike_polar_profiles_parquet(
+            pooled_stamps=stamps,
+            output_parquet_path=out_parquet,
+            sca_name=1,  # Passing integer 1
+        )
+
+        assert saved_path.is_file()
+        df = pd.read_parquet(saved_path)
+        assert len(df) == 1
+        assert df["source_id"].iloc[0] == "12345"
+        assert df["sca"].iloc[0] == "wfi01"
+        assert df["tier"].iloc[0] == "bright"
+        assert np.isclose(df["mag"].iloc[0], 10.5)
+        assert df["n_primary_spikes"].iloc[0] == 3
+        assert df["n_secondary_spikes"].iloc[0] == 1
+        assert len(df["theta_deg"].iloc[0]) == 360
+        assert len(df["polar_flux"].iloc[0]) == 360
+
+

@@ -163,3 +163,41 @@ def test_cli_run_full_options(tmp_path):
         assert cfg_passed.environment.device == "cpu"
         assert cfg_passed.data.detectors == ["wfi01", "wfi02"]
         assert cfg_passed.environment.num_workers == 2
+
+
+def test_cli_sca_flag_integer_parsing(tmp_path: Path):
+    """Verify --sca flag accepts integers (1-18) and strings, and rejects invalid numbers."""
+    runner = CliRunner()
+    file_list = tmp_path / "files.txt"
+    file_list.write_text("dummy.asdf\n")
+
+    with patch("romanepsf.pipeline.run_sca_batch_pipeline") as mock_batch:
+        mock_output = MagicMock()
+        mock_output.fits_path = Path("out.fits")
+        mock_batch.return_value = mock_output
+
+        # Integer 1
+        res1 = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "1"])
+        assert res1.exit_code == 0
+        assert mock_batch.call_args.kwargs["sca_id"] == "wfi01"
+
+        # Integer 18
+        res18 = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "18"])
+        assert res18.exit_code == 0
+        assert mock_batch.call_args.kwargs["sca_id"] == "wfi18"
+
+        # String 'wfi05'
+        res_str = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "wfi05"])
+        assert res_str.exit_code == 0
+        assert mock_batch.call_args.kwargs["sca_id"] == "wfi05"
+
+        # Invalid: 0
+        res0 = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "0"])
+        assert res0.exit_code != 0
+        assert "Roman WFI detectors are numbered 1 through 18" in res0.output
+
+        # Invalid: 19
+        res19 = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "19"])
+        assert res19.exit_code != 0
+        assert "Roman WFI detectors are numbered 1 through 18" in res19.output
+

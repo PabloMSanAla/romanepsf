@@ -1299,11 +1299,12 @@ def run_sca_batch_pipeline(
     logger.info(f"Loaded {len(raw_files)} total input file path(s).")
 
     # 3. Detect or Filter Target SCA
-    target_sca = sca_id.lower().strip() if sca_id else None
+    from romanepsf.config import normalize_sca_id
+    target_sca = normalize_sca_id(sca_id) if sca_id else None
     if target_sca is None:
         # Auto-detect from first file
         det_found, _ = fast_scan_asdf_footprint(raw_files[0])
-        target_sca = det_found
+        target_sca = normalize_sca_id(det_found)
         logger.info(f"Auto-detected target SCA: {target_sca.upper()} from {raw_files[0].name}")
 
     # Filter files belonging to target_sca
@@ -1541,6 +1542,19 @@ def run_sca_batch_pipeline(
             )
     except Exception as e:
         logger.warning(f"Plot generation failed on {target_sca}: {e}", exc_info=True)
+
+    # 10. Persist Polar Profiles Data (.parquet) containing all spike polar profiles
+    parquet_path = resolved_cfg.data.output_dir / f"roman_epsf_{target_sca}_polar_profiles.parquet"
+    try:
+        from romanepsf.profile import save_spike_polar_profiles_parquet
+        save_spike_polar_profiles_parquet(
+            pooled_stamps=pooled_stamps,
+            output_parquet_path=parquet_path,
+            sca_name=target_sca,
+        )
+        diagnostics["polar_profiles_parquet"] = parquet_path
+    except Exception as e:
+        logger.warning(f"Spike polar profiles table generation failed on {target_sca}: {e}", exc_info=True)
 
     total_time = time.perf_counter() - t_start
     diagnostics.update({

@@ -163,7 +163,17 @@ def test_generate_all_debug_plots_end_to_end(tmp_path):
     assert (debug_dir / "debug_4_model_psf.png").is_file()
     assert (debug_dir / "debug_5_final_profile_normalized.png").is_file()
 
+    # Check that SCA-named debug figures exist
+    assert (debug_dir / "debug_1_wfi01_masking_procedure.png").is_file()
+    assert (debug_dir / "debug_2_wfi01_apertures_and_profile.png").is_file()
+    assert (debug_dir / "debug_3_wfi01_profile_normalization.png").is_file()
+    assert (debug_dir / "debug_4_wfi01_model_psf.png").is_file()
+    assert (debug_dir / "debug_5_wfi01_final_profile_normalized.png").is_file()
+    assert (debug_dir / "debug_6_wfi01_spike_process.png").is_file()
+    assert (debug_dir / "debug_spike_process_wfi01.png").is_file()
+
     # Check that individual star figures exist
     assert (debug_dir / "debug_1_masking_procedure_bright_101.png").is_file()
     assert (debug_dir / "debug_2_apertures_and_profile_bright_101.png").is_file()
     assert (debug_dir / "debug_3_profile_normalization_bright_101.png").is_file()
+    assert (debug_dir / "debug_1_wfi01_masking_procedure_bright_101.png").is_file()

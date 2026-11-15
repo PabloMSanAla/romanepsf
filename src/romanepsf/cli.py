@@ -31,7 +31,22 @@ warnings.filterwarnings("ignore", message=r".*was created with extension URI.*")
 warnings.filterwarnings("ignore", message=r".*AsdfPackageVersionWarning.*")
 
 from romanepsf import __version__
-from romanepsf.config import load_config, Config, resolve_device
+from romanepsf.config import load_config, Config, resolve_device, normalize_sca_id
+
+
+class SCAParamType(click.ParamType):
+    name = "INTEGER (1-18)"
+
+    def convert(self, value, param, ctx):
+        if value is None:
+            return None
+        try:
+            return normalize_sca_id(value)
+        except ValueError as e:
+            self.fail(str(e), param, ctx)
+
+
+SCA_PARAM = SCAParamType()
 
 
 def setup_logging(level_name: str = "INFO", verbose: bool = False) -> logging.Logger:
@@ -142,9 +157,9 @@ def cli(
 @click.option(
     "--sca",
     "-s",
-    type=str,
+    type=SCA_PARAM,
     default=None,
-    help="Target Sensor Chip Assembly (e.g. 'wfi01') when processing file list.",
+    help="Target Sensor Chip Assembly number (1-18, e.g. 1 or 'wfi01').",
 )
 @click.option(
     "--input-dir",
@@ -281,7 +296,7 @@ def run_command(
 
     # If file list is specified, run the high-throughput batch SCA pipeline
     if cfg.data.file_list is not None:
-        target_sca = cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")
+        target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01"))
         logger.info(
             f"Executing High-Throughput Batch SCA Pipeline for {target_sca.upper()} "
             f"using file list: {cfg.data.file_list}"
@@ -336,9 +351,9 @@ def run_command(
 @click.option(
     "--sca",
     "-s",
-    type=str,
+    type=SCA_PARAM,
     default=None,
-    help="Target Sensor Chip Assembly (e.g. 'wfi01'). Default: auto-detect from files.",
+    help="Target Sensor Chip Assembly number (1-18, e.g. 1 or 'wfi01'). Default: auto-detect from files.",
 )
 @click.option(
     "--config",
@@ -446,7 +461,7 @@ def batch_command(
         click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
 
-    target_sca = cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")
+    target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01"))
     logger.info(
         f"Starting Batch SCA Pipeline for {target_sca.upper()} "
         f"across file list: {file_list} with {cfg.environment.num_workers} workers"

@@ -60,6 +60,54 @@ def resolve_device(device_str: str = "auto") -> torch.device:
         )
 
 
+def normalize_sca_id(sca: Union[int, str, None], default: str = "wfi01") -> str:
+    """
+    Normalize SCA identifier into standard lowercase 'wfiXX' format (e.g. 'wfi01' through 'wfi18').
+
+    Parameters
+    ----------
+    sca : Union[int, str, None]
+        Detector SCA number (1-18) as integer, or string (e.g. 1, '1', '01', 'wfi01', 'WFI01', 'sca01').
+    default : str, default 'wfi01'
+        Default fallback if sca is None or empty.
+
+    Returns
+    -------
+    str
+        Standardized identifier, e.g. 'wfi01', 'wfi02', ..., 'wfi18'.
+
+    Raises
+    ------
+    ValueError
+        If sca is not within range 1 to 18.
+    """
+    if sca is None or (isinstance(sca, str) and not sca.strip()):
+        sca = default
+
+    if isinstance(sca, (int, float)):
+        num = int(sca)
+    elif isinstance(sca, str):
+        s = sca.strip().lower()
+        if s.startswith("wfi"):
+            s = s[3:]
+        elif s.startswith("sca"):
+            s = s[3:]
+        try:
+            num = int(s)
+        except ValueError:
+            raise ValueError(f"Invalid SCA identifier '{sca}'. Expected integer 1-18 or 'wfi01'-'wfi18'.")
+    else:
+        try:
+            num = int(sca)
+        except Exception:
+            raise ValueError(f"Invalid SCA identifier type {type(sca)}. Expected int or str.")
+
+    if num < 1 or num > 18:
+        raise ValueError(f"Invalid SCA number {num}. Roman WFI detectors are numbered 1 through 18.")
+
+    return f"wfi{num:02d}"
+
+
 @dataclass
 class PipelineSection:
     name: str = "romanepsf"
@@ -104,8 +152,12 @@ class DataSection:
             self.gaia_cache_dir = Path(self.gaia_cache_dir)
         if isinstance(self.file_list, str):
             self.file_list = Path(self.file_list)
+        if self.sca is not None:
+            self.sca = normalize_sca_id(self.sca)
         if isinstance(self.detectors, str):
-            self.detectors = [self.detectors]
+            self.detectors = [normalize_sca_id(d.strip()) for d in self.detectors.split(",") if d.strip()]
+        elif isinstance(self.detectors, (list, tuple)):
+            self.detectors = [normalize_sca_id(d) for d in self.detectors]
 
 
 @dataclass

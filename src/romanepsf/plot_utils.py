@@ -258,6 +258,8 @@ def generate_diagnostic_plots(
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    from romanepsf.config import normalize_sca_id
+    sca_str = normalize_sca_id(sca_name)
 
     # 1. Load profiles data
     if isinstance(profiles_data_or_path, (str, Path)):
@@ -350,8 +352,12 @@ def generate_diagnostic_plots(
     for text in leg.get_texts():
         text.set_color("#e6edf3")
 
-    plot1_path = out_dir / "plot1_psf_radial_profiles.png"
+    plot1_path = out_dir / f"plot1_{sca_str}_psf_radial_profiles.png"
     fig1.savefig(str(plot1_path), dpi=dpi, bbox_inches="tight", facecolor=fig1.get_facecolor(), edgecolor="none")
+    plot1_canon = out_dir / "plot1_psf_radial_profiles.png"
+    if plot1_canon != plot1_path:
+        import shutil
+        shutil.copyfile(plot1_path, plot1_canon)
     plt.close(fig1)
     logger.info(f"Generated Plot 1: {plot1_path}")
 
@@ -447,8 +453,12 @@ def generate_diagnostic_plots(
         bbox=dict(boxstyle="round,pad=0.5", facecolor="#161b22", edgecolor="#30363d", alpha=0.9),
     )
 
-    plot2_path = out_dir / "plot2_entire_composite_psf.png"
+    plot2_path = out_dir / f"plot2_{sca_str}_entire_composite_psf.png"
     fig2.savefig(str(plot2_path), dpi=dpi, bbox_inches="tight", facecolor=fig2.get_facecolor(), edgecolor="none")
+    plot2_canon = out_dir / "plot2_entire_composite_psf.png"
+    if plot2_canon != plot2_path:
+        import shutil
+        shutil.copyfile(plot2_path, plot2_canon)
     plt.close(fig2)
     logger.info(f"Generated Plot 2: {plot2_path}")
 
