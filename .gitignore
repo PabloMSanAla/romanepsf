@@ -39,19 +39,11 @@ Thumbs.db
 *.log
 *.parquet
 *.npz
-output/debug/
-output/**/*.fits
-output/**/*.zarr
-output/run_all/*.fits
-output/run_all/*.zarr
-output/single_*/*.fits
-output/single_*/*.zarr
-output/*.pdf
-output/**/*.pdf
-output/*.png
-output/**/*.png
-output/**/*.parquet
-output/**/*.npz
+
+# Output and nexus staging directories
+output/
+output_*/
+nexus/
 
 # Cache directory (Gaia query cache can be regenerated or cached locally)
 cache/
