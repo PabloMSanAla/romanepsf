@@ -236,6 +236,10 @@ def save_radial_profiles_data(
         star_ids=star_ids_arr,
         k_fm=float(diag.get("k_fm", -1.0) or -1.0),
         k_mb=float(diag.get("k_mb", -1.0) or -1.0),
+        blend_fm_start=float(diag.get("blend_fm_start", 10.0) or 10.0),
+        blend_fm_end=float(diag.get("blend_fm_end", 18.0) or 18.0),
+        blend_mb_start=float(diag.get("blend_mb_start", 30.0) or 30.0),
+        blend_mb_end=float(diag.get("blend_mb_end", 48.0) or 48.0),
         pixel_scale=float(pixel_scale),
     )
     logger.info(
@@ -272,6 +276,10 @@ def generate_diagnostic_plots(
         star_ids = npz["star_ids"]
         k_fm = float(npz.get("k_fm", -1.0))
         k_mb = float(npz.get("k_mb", -1.0))
+        blend_fm_start = float(npz.get("blend_fm_start", 10.0))
+        blend_fm_end = float(npz.get("blend_fm_end", 18.0))
+        blend_mb_start = float(npz.get("blend_mb_start", 30.0))
+        blend_mb_end = float(npz.get("blend_mb_end", 48.0))
     else:
         d = profiles_data_or_path
         r_composite = d["r_composite"]
@@ -282,6 +290,10 @@ def generate_diagnostic_plots(
         star_ids = d.get("star_ids", np.arange(len(star_tiers)))
         k_fm = float(d.get("k_fm", -1.0))
         k_mb = float(d.get("k_mb", -1.0))
+        blend_fm_start = float(d.get("blend_fm_start", 10.0))
+        blend_fm_end = float(d.get("blend_fm_end", 18.0))
+        blend_mb_start = float(d.get("blend_mb_start", 30.0))
+        blend_mb_end = float(d.get("blend_mb_end", 48.0))
 
     n_stars_total = len(star_tiers)
     n_faint = int(np.sum(star_tiers == "faint"))
@@ -319,8 +331,24 @@ def generate_diagnostic_plots(
     ax1.plot([], [], color="#ff9800", alpha=0.85, linewidth=1.4, label=f"Bright Stars ({n_bright} stars, r ≥ 10 px)")
 
     # Transition blending zones
-    ax1.axvspan(10.0, 18.0, color="#00e5ff", alpha=0.12, label="Faint-Medium Blend ($10-18$ px / $1.1-2.0''$)")
-    ax1.axvspan(30.0, 48.0, color="#ffd600", alpha=0.12, label="Medium-Bright Blend ($30-48$ px / $3.3-5.3''$)")
+    fm_sec_start = blend_fm_start * pixel_scale
+    fm_sec_end = blend_fm_end * pixel_scale
+    mb_sec_start = blend_mb_start * pixel_scale
+    mb_sec_end = blend_mb_end * pixel_scale
+    ax1.axvspan(
+        blend_fm_start,
+        blend_fm_end,
+        color="#00e5ff",
+        alpha=0.12,
+        label=f"Faint-Medium Blend (${blend_fm_start:.0f}-{blend_fm_end:.0f}$ px / ${fm_sec_start:.1f}-{fm_sec_end:.1f}''$)",
+    )
+    ax1.axvspan(
+        blend_mb_start,
+        blend_mb_end,
+        color="#ffd600",
+        alpha=0.12,
+        label=f"Medium-Bright Blend (${blend_mb_start:.0f}-{blend_mb_end:.0f}$ px / ${mb_sec_start:.1f}-{mb_sec_end:.1f}''$)",
+    )
 
     # Foreground: Final Composite ePSF profile
     ax1.plot(r_composite, f_comp_plot, color="#ffffff", linewidth=3.0, label="Final Composite ePSF (Multi-Tier Blend)")

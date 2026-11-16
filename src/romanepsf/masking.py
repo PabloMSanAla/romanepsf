@@ -2447,8 +2447,9 @@ def mask_contaminants_with_spikes_protected(
     if is_faint:
         residual = np.where(np.isfinite(stamp), stamp, 0.0).astype(np.float32)
         protected_stellar_area = (r <= core_protection_radius_px)
-        contams = _detect_contams(residual, protected_stellar_area)
-        final_mask = contams.copy()
+        # Faint stars should not have residual contaminant thresholding masking;
+        # only quality flags, non-finites, and Gaia companions outside the core are masked.
+        final_mask = np.zeros(stamp.shape, dtype=bool)
         if comp_mask is not None:
             final_mask |= (comp_mask & (~protected_stellar_area))
         if dq_mask is not None:
