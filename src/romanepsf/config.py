@@ -165,7 +165,7 @@ class CatalogSection:
     mag_col: str = "mag_lambda"
     use_cached_gaia: bool = True
     query_gaia_fallback: bool = True
-    isolation_safety_factor: float = 1.3
+    isolation_safety_factor: float = 1.0
     min_dist_arcsec: float = 2.0
     edge_margin_px: int = 50
     centroid_box_fraction: float = 0.30

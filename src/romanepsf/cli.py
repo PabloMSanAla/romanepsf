@@ -672,6 +672,7 @@ def catalog_command(
             df=refined_df,
             pixel_scale=l2_data.pixel_scale,
             safety_factor=cfg.catalog.isolation_safety_factor,
+            cfg=cfg,
         )
         tiered_df = assign_stellar_tiers(
             df=isolated_df,

@@ -223,6 +223,68 @@ def test_filter_isolated_stars_isolated_pair():
     assert len(isolated) == 2
 
 
+def test_filter_isolated_stars_relaxed_medium_and_bright():
+    """Verify medium and bright stars permit companions unless a brighter companion is within half cutout width."""
+    # Medium star (mag 12.0, cutout 201 px -> half-width 100.5 px)
+    # with a fainter companion at 40 px: medium star must be KEPT.
+    df_medium_fainter = pd.DataFrame({
+        "source_id": [1, 2],
+        "x": [1000.0, 1040.0],
+        "y": [1000.0, 1000.0],
+        "mag_lambda": [12.0, 14.5],  # 1 is medium, 2 is faint
+    })
+    iso_med = filter_isolated_stars(df_medium_fainter, pixel_scale=0.11, mag_col="mag_lambda")
+    # Medium star (source_id=1) is kept; faint star (source_id=2) at 40 px is within faint cutout (40.5 px) of brighter star so rejected
+    assert 1 in iso_med["source_id"].values
+
+    # Medium star (mag 12.5) with a brighter companion (mag 11.5) at 60 px (within 100.5 px):
+    # Brighter star kept, fainter medium star rejected.
+    df_medium_brighter = pd.DataFrame({
+        "source_id": [1, 2],
+        "x": [1000.0, 1060.0],
+        "y": [1000.0, 1000.0],
+        "mag_lambda": [11.5, 12.5],
+    })
+    iso_med_b = filter_isolated_stars(df_medium_brighter, pixel_scale=0.11, mag_col="mag_lambda")
+    assert len(iso_med_b) == 1
+    assert iso_med_b["source_id"].iloc[0] == 1
+
+    # Medium star (mag 12.5) with a brighter companion (mag 11.5) at 150 px (> 100.5 px):
+    # Both medium stars kept!
+    df_medium_distant = pd.DataFrame({
+        "source_id": [1, 2],
+        "x": [1000.0, 1150.0],
+        "y": [1000.0, 1000.0],
+        "mag_lambda": [11.5, 12.5],
+    })
+    iso_med_d = filter_isolated_stars(df_medium_distant, pixel_scale=0.11, mag_col="mag_lambda")
+    assert len(iso_med_d) == 2
+
+
+def test_filter_isolated_stars_faint_tier_min_dist():
+    """Verify faint stars enforce min_dist_arcsec=2.0 (18.18 px)."""
+    # Two faint stars closer than 2.0 arcsec (15 px ~ 1.65 arcsec): brighter kept, fainter rejected
+    df_faint_close = pd.DataFrame({
+        "source_id": [1, 2],
+        "x": [500.0, 515.0],
+        "y": [500.0, 500.0],
+        "mag_lambda": [14.0, 14.5],
+    })
+    iso_close = filter_isolated_stars(df_faint_close, pixel_scale=0.11, min_dist_arcsec=2.0, mag_col="mag_lambda")
+    assert len(iso_close) == 1
+    assert iso_close["source_id"].iloc[0] == 1
+
+    # Two faint stars farther than 2.0 arcsec (25 px ~ 2.75 arcsec): both kept!
+    df_faint_far = pd.DataFrame({
+        "source_id": [1, 2],
+        "x": [500.0, 525.0],
+        "y": [500.0, 500.0],
+        "mag_lambda": [14.0, 14.5],
+    })
+    iso_far = filter_isolated_stars(df_faint_far, pixel_scale=0.11, min_dist_arcsec=2.0, mag_col="mag_lambda")
+    assert len(iso_far) == 2
+
+
 def test_assign_stellar_tiers():
     """Verify tier assignment matches project boundaries (<11.0, 11.0-13.0, >=13.0)."""
     df = pd.DataFrame({

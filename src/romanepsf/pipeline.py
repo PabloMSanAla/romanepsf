@@ -296,6 +296,7 @@ def process_single_detector_stamps(
             isolation_safety_factor=cfg.catalog.isolation_safety_factor,
             min_dist_arcsec=cfg.catalog.min_dist_arcsec,
             mag_col=cfg.catalog.mag_col,
+            cfg=cfg,
         )
         if isolated.empty:
             return det_name, empty_stamps, {
@@ -636,6 +637,7 @@ def run_single_detector(
             isolation_safety_factor=cfg.catalog.isolation_safety_factor,
             min_dist_arcsec=cfg.catalog.min_dist_arcsec,
             mag_col=cfg.catalog.mag_col,
+            cfg=cfg,
         )
         if isolated_df.empty:
             raise RuntimeError(
@@ -1168,6 +1170,7 @@ def _sca_file_worker_task(
             isolation_safety_factor=cfg.catalog.isolation_safety_factor,
             min_dist_arcsec=cfg.catalog.min_dist_arcsec,
             mag_col=cfg.catalog.mag_col,
+            cfg=cfg,
         )
         if isolated.empty:
             return det_name, empty_stamps, {

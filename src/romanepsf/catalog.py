@@ -671,18 +671,30 @@ def refine_stellar_centroids(
 def filter_isolated_stars(
     df: pd.DataFrame,
     pixel_scale: float = 0.11,
-    isolation_safety_factor: float = 1.3,
+    isolation_safety_factor: float = 1.0,
     safety_factor: Optional[float] = None,
     min_dist_arcsec: float = 2.0,
     mag_col: str = "mag_lambda",
     depth: float = 28.0,
+    bright_limit: float = 11.0,
+    faint_limit: float = 13.0,
+    faint_size: int = 81,
+    medium_size: int = 201,
+    bright_max: int = 1001,
+    cfg: Optional[Any] = None,
 ) -> pd.DataFrame:
     """
-    Reject stars contaminated by nearby neighbors based on analytic Moffat PSF extension.
+    Filter stars based on tier-aware companion isolation.
 
-    Sorts stars by ascending magnitude (brightest first) and enforces:
-        dist_px >= max(safety_factor * (ext_i + ext_j), min_dist_arcsec / pixel_scale)
-    When two stars violate clearance, the brighter star is preserved and the fainter is rejected.
+    Isolation strategy:
+    - Faint stars (mag >= faint_limit):
+        Strict isolation with min_dist_arcsec (default 2.0 arcsec). Blended faint pairs
+        preserve the brighter star and reject the fainter star. Also rejected if a brighter
+        medium/bright star falls within half the width of the faint star's cutout.
+    - Medium and Bright stars (mag < faint_limit):
+        Relaxed isolation: companions are permitted (they are masked during stamp processing),
+        but stars that have brighter companions within a distance of half the width of their
+        postage stamp cutout are rejected.
 
     Parameters
     ----------
@@ -690,16 +702,28 @@ def filter_isolated_stars(
         Catalog with 'x', 'y', and magnitude column.
     pixel_scale : float, default 0.11
         Pixel scale in arcsec/pixel.
-    isolation_safety_factor : float, default 1.3
-        Multiplier applied to combined Moffat extension radii.
+    isolation_safety_factor : float, default 1.0
+        Multiplier applied to cutout half-width clearance radius.
     safety_factor : float, optional
         Alias for isolation_safety_factor.
     min_dist_arcsec : float, default 2.0
-        Hard minimum distance between any two stars in arcseconds.
+        Hard minimum clearance distance for faint stars in arcseconds.
     mag_col : str, default "mag_lambda"
-        Magnitude column used to compute PSF extension.
+        Magnitude column used to compute tiers and stamp dimensions.
     depth : float, default 28.0
-        Surface brightness depth in mag/arcsec^2.
+        Surface brightness depth (kept for backward-compatibility).
+    bright_limit : float, default 11.0
+        Magnitude threshold separating bright and medium tiers.
+    faint_limit : float, default 13.0
+        Magnitude threshold separating medium and faint tiers.
+    faint_size : int, default 81
+        Cutout dimension for faint stars.
+    medium_size : int, default 201
+        Cutout dimension for medium stars.
+    bright_max : int, default 1001
+        Maximum cutout dimension for bright stars.
+    cfg : Optional[Any], default None
+        Pipeline configuration object to extract parameters from if provided.
 
     Returns
     -------
@@ -709,12 +733,37 @@ def filter_isolated_stars(
     if safety_factor is not None:
         isolation_safety_factor = safety_factor
 
+    if cfg is not None:
+        cat_sec = getattr(cfg, "catalog", None)
+        if cat_sec is not None:
+            min_dist_arcsec = getattr(cat_sec, "min_dist_arcsec", min_dist_arcsec)
+            mag_col = getattr(cat_sec, "mag_col", mag_col)
+            cfg_iso = getattr(cat_sec, "isolation_safety_factor", None)
+            if cfg_iso is not None:
+                isolation_safety_factor = cfg_iso
+        tiers_sec = getattr(cfg, "tiers", None)
+        if tiers_sec is not None:
+            bright_limit = getattr(tiers_sec, "bright_limit", bright_limit)
+            faint_limit = getattr(tiers_sec, "faint_limit", faint_limit)
+        stamps_sec = getattr(cfg, "stamps", None)
+        if stamps_sec is not None:
+            sizes = getattr(stamps_sec, "sizes", None)
+            if sizes is not None:
+                faint_size = getattr(sizes, "faint", faint_size)
+                medium_size = getattr(sizes, "medium", medium_size)
+                bright_max = getattr(sizes, "bright_max", bright_max)
+
     if len(df) <= 1:
         return df.copy().reset_index(drop=True)
 
     effective_mag_col = mag_col if mag_col in df.columns else "phot_g_mean_mag"
     if effective_mag_col not in df.columns:
         return df.copy().reset_index(drop=True)
+
+    # Legacy default 1.3 in configs corresponds to nominal 1.0 (exact half-width of cutout)
+    factor = isolation_safety_factor
+    if factor == 1.3:
+        factor = 1.0
 
     # Sort brightest first (ascending magnitude). Break ties with source_id for determinism.
     sort_cols = [effective_mag_col]
@@ -723,73 +772,82 @@ def filter_isolated_stars(
     df_sorted = df.sort_values(by=sort_cols).reset_index(drop=True)
 
     coords = df_sorted[["x", "y"]].to_numpy(dtype=float)
-    mags = df_sorted[effective_mag_col].to_numpy(dtype=float)
-
-    # Calculate Moffat extent in arcseconds and pixels
-    extensions_arcsec = get_psf_extension_moffat(mags, depth=depth)
-    extensions_px = np.asarray(extensions_arcsec, dtype=float) / pixel_scale
+    mags = pd.to_numeric(df_sorted[effective_mag_col], errors="coerce").to_numpy(dtype=float)
 
     n = len(df_sorted)
     is_kept = np.ones(n, dtype=bool)
+
+    from romanepsf.stamps import get_adaptive_stamp_size
+
+    is_bright = np.isfinite(mags) & (mags < bright_limit)
+    is_medium = np.isfinite(mags) & (mags >= bright_limit) & (mags < faint_limit)
+    is_faint = ~is_bright & ~is_medium
+
+    half_widths = np.zeros(n, dtype=float)
+    for idx in range(n):
+        m = mags[idx]
+        if is_bright[idx]:
+            sz = get_adaptive_stamp_size(
+                mag=m,
+                tier="bright",
+                max_size=bright_max,
+                pixel_scale=pixel_scale,
+                faint_size=faint_size,
+                medium_size=medium_size,
+            )
+        elif is_medium[idx]:
+            sz = medium_size
+        else:
+            sz = faint_size
+        half_widths[idx] = (float(sz) / 2.0) * factor
+
     min_clearance_px = min_dist_arcsec / pixel_scale
 
-    if n > 20:
-        from scipy.spatial import cKDTree
+    from scipy.spatial import cKDTree
 
-        tree = cKDTree(coords)
-        max_clearance = float(
-            max(np.max(extensions_px) * 2.0 * isolation_safety_factor, min_clearance_px)
-        )
+    tree = cKDTree(coords)
+    max_radius = float(max(np.max(half_widths), min_clearance_px))
 
-        for i in range(n):
-            if not is_kept[i]:
+    for i in range(n):
+        if not is_kept[i]:
+            continue
+
+        cand_indices = tree.query_ball_point(coords[i], r=max_radius)
+        cand_indices = [idx for idx in cand_indices if idx != i]
+        if not cand_indices:
+            continue
+
+        cand_arr = np.array(cand_indices, dtype=int)
+        dx = coords[cand_arr, 0] - coords[i, 0]
+        dy = coords[cand_arr, 1] - coords[i, 1]
+        dist_px = np.hypot(dx, dy)
+
+        if is_bright[i] or is_medium[i]:
+            # Reject if star i has a brighter companion within half the width of star i's cutout
+            brighter_in_cutout = cand_arr[(cand_arr < i) & (dist_px <= half_widths[i])]
+            if len(brighter_in_cutout) > 0:
+                is_kept[i] = False
                 continue
 
-            cand_indices = tree.query_ball_point(coords[i], r=max_clearance)
-            cand_indices = [idx for idx in cand_indices if idx != i and is_kept[idx]]
-
-            if not cand_indices:
+            # Faint companions cannot have a neighbor within min_dist_arcsec
+            faint_too_close = cand_arr[(cand_arr > i) & is_faint[cand_arr] & (dist_px < min_clearance_px)]
+            if len(faint_too_close) > 0:
+                is_kept[faint_too_close] = False
+        else:
+            # Faint tier:
+            # 1. Reject if any brighter medium/bright star falls within half the width of star i's cutout
+            brighter_mb = cand_arr[(cand_arr < i) & (~is_faint[cand_arr]) & (dist_px <= half_widths[i])]
+            if len(brighter_mb) > 0:
+                is_kept[i] = False
                 continue
 
-            cand_arr = np.array(cand_indices, dtype=int)
-            dx = coords[cand_arr, 0] - coords[i, 0]
-            dy = coords[cand_arr, 1] - coords[i, 1]
-            dist_px = np.hypot(dx, dy)
-
-            req_clearance = np.maximum(
-                isolation_safety_factor * (extensions_px[i] + extensions_px[cand_arr]),
-                min_clearance_px,
-            )
-
-            violators = cand_arr[dist_px < req_clearance]
+            # 2. Strict pairwise clearance of min_dist_arcsec
+            violators = cand_arr[(dist_px < min_clearance_px) & is_kept[cand_arr]]
             if len(violators) > 0:
                 if np.any(violators < i):
                     is_kept[i] = False
+                    continue
                 else:
-                    is_kept[violators] = False
-    else:
-        for i in range(n):
-            if not is_kept[i]:
-                continue
-
-            dx = coords[:, 0] - coords[i, 0]
-            dy = coords[:, 1] - coords[i, 1]
-            dist_px = np.hypot(dx, dy)
-            dist_px[i] = np.inf  # Ignore self
-
-            required_clearance = np.maximum(
-                isolation_safety_factor * (extensions_px[i] + extensions_px),
-                min_clearance_px,
-            )
-
-            # Check only against currently active/kept stars
-            violators = np.where((dist_px < required_clearance) & is_kept)[0]
-            if len(violators) > 0:
-                # If any brighter star (index < i) violates clearance, star i must be rejected
-                if np.any(violators < i):
-                    is_kept[i] = False
-                else:
-                    # Violators are fainter (index > i); reject them to protect primary star i
                     is_kept[violators] = False
 
     return df_sorted[is_kept].copy().reset_index(drop=True)
