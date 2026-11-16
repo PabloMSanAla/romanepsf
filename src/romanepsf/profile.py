@@ -503,7 +503,7 @@ def measure_angular_profile_torch(
     for b in range(num_bins):
         cnt = int(counts[b].item())
         if cnt > 0:
-            medians[b] = torch.median(val_sorted[offsets[b] : offsets[b + 1]])
+            medians[b] = torch.nanmedian(val_sorted[offsets[b] : offsets[b + 1]])
 
     return bin_centers.cpu().numpy(), medians.cpu().numpy()
 
