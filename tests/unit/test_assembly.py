@@ -401,3 +401,45 @@ class TestAssembleCompositeExtendedPSF:
         c = 250
         # Verify no 25x flux surge across transition: flux at r=48 must be strictly less than at r=30
         assert epsf[c, c + 48] < epsf[c, c + 30], "Flux surge detected across [30, 48] px"
+
+    def test_overlap_annulus_resolve_radii_depth_mode(self):
+        """Verify dynamic calculation of normalization and blending radii from depths."""
+        from romanepsf.config import OverlapAnnulusConfig
+
+        cfg_fm = OverlapAnnulusConfig(
+            mode="depth",
+            norm_depth=(20.0, 23.0),
+            blend_depth=(25.0, 27.0),
+        )
+        r_min, r_max, b_start, b_end = cfg_fm.resolve_radii(mag=19.0, pixel_scale=0.11, max_stamp_radius=25.5)
+        assert 2.0 < r_min < 4.0
+        assert 6.0 < r_max < 8.0
+        assert 12.0 < b_start < 14.0
+        assert 22.0 < b_end <= 25.5
+
+        cfg_mb = OverlapAnnulusConfig(
+            mode="depth",
+            norm_depth=(20.0, 23.0),
+            blend_depth=(25.0, 27.0),
+        )
+        r_min, r_max, b_start, b_end = cfg_mb.resolve_radii(mag=11.0, pixel_scale=0.11, max_stamp_radius=410.5)
+        assert 30.0 < r_min < 35.0
+        assert 78.0 < r_max < 83.0
+        assert 140.0 < b_start < 155.0
+        assert 260.0 < b_end < 280.0
+
+    def test_overlap_annulus_safety_clamping(self):
+        """Verify safety clamping prevents radii from exceeding inner stamp size."""
+        from romanepsf.config import OverlapAnnulusConfig
+
+        cfg_small = OverlapAnnulusConfig(
+            mode="depth",
+            norm_depth=(25.0, 28.0),
+            blend_depth=(28.0, 30.0),
+        )
+        # Even with extreme depths, clamped within max_stamp_radius * 0.95
+        r_min, r_max, b_start, b_end = cfg_small.resolve_radii(mag=11.0, pixel_scale=0.11, max_stamp_radius=50.0)
+        assert b_end <= 50.0 * 0.95
+        assert b_start < b_end
+        assert r_max <= b_end
+        assert r_min < r_max

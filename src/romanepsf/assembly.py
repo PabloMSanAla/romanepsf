@@ -175,6 +175,18 @@ def measure_radial_profile_1d(
         device=device,
         sigma=3.0,
     )
+
+    # Linearly interpolate over unpopulated discrete bins (e.g., between integer pixels)
+    nan_mask = np.isnan(flux)
+    if np.any(nan_mask) and not np.all(nan_mask):
+        valid_idx = np.where(~nan_mask)[0]
+        flux = np.interp(rad_centers, rad_centers[valid_idx], flux[valid_idx])
+        if flux_err is not None:
+            nan_err = np.isnan(flux_err)
+            if np.any(nan_err) and not np.all(nan_err):
+                v_err = np.where(~nan_err)[0]
+                flux_err = np.interp(rad_centers, rad_centers[v_err], flux_err[v_err])
+
     return rad_centers, flux, flux_err
 
 
@@ -419,6 +431,8 @@ def assemble_composite_extended_psf(
     blend_mb_start, blend_mb_end = 30.0, 48.0
     normalize_flux = True
     default_canvas_size = 1025
+    fm = None
+    mb = None
 
     if cfg is not None:
         if hasattr(cfg, "canvas_size"):
@@ -500,6 +514,34 @@ def assemble_composite_extended_psf(
         if has_b
         else (None, None)
     )
+
+    # Resolve normalization and blending radii (from depths or explicit pixels)
+    faint_mag = float(getattr(cfg, "faint_limit", 19.0)) if cfg is not None else 19.0
+    bright_mag = float(getattr(cfg, "bright_limit", 11.0)) if cfg is not None else 11.0
+    pixel_scale = float(getattr(cfg, "pixel_scale", 0.11)) if cfg is not None else 0.11
+
+    max_faint_r = (psf_faint.shape[0] / 2.0) if psf_faint is not None else None
+    max_medium_r = (psf_medium.shape[0] / 2.0) if psf_medium is not None else None
+
+    if hasattr(fm, "resolve_radii"):
+        r_fm_min, r_fm_max, blend_fm_start, blend_fm_end = fm.resolve_radii(
+            mag=faint_mag, pixel_scale=pixel_scale, max_stamp_radius=max_faint_r
+        )
+    elif isinstance(fm, dict) and ("norm_depth" in fm or "blend_depth" in fm):
+        from romanepsf.config import OverlapAnnulusConfig
+        r_fm_min, r_fm_max, blend_fm_start, blend_fm_end = OverlapAnnulusConfig(**fm).resolve_radii(
+            mag=faint_mag, pixel_scale=pixel_scale, max_stamp_radius=max_faint_r
+        )
+
+    if hasattr(mb, "resolve_radii"):
+        r_mb_min, r_mb_max, blend_mb_start, blend_mb_end = mb.resolve_radii(
+            mag=bright_mag, pixel_scale=pixel_scale, max_stamp_radius=max_medium_r
+        )
+    elif isinstance(mb, dict) and ("norm_depth" in mb or "blend_depth" in mb):
+        from romanepsf.config import OverlapAnnulusConfig
+        r_mb_min, r_mb_max, blend_mb_start, blend_mb_end = OverlapAnnulusConfig(**mb).resolve_radii(
+            mag=bright_mag, pixel_scale=pixel_scale, max_stamp_radius=max_medium_r
+        )
 
     # Determine final canvas target dimension
     max_avail_sz = max([p.shape[0] for p in [psf_faint, psf_medium, psf_bright] if p is not None])
@@ -607,6 +649,10 @@ def assemble_composite_extended_psf(
         "r_fm_max": r_fm_max,
         "r_mb_min": r_mb_min,
         "r_mb_max": r_mb_max,
+        "norm_depth_fm": getattr(fm, "norm_depth", None) if fm else None,
+        "blend_depth_fm": getattr(fm, "blend_depth", None) if fm else None,
+        "norm_depth_mb": getattr(mb, "norm_depth", None) if mb else None,
+        "blend_depth_mb": getattr(mb, "blend_depth", None) if mb else None,
         "psf_faint": psf_faint,
         "psf_medium": psf_medium,
         "psf_bright": psf_bright,

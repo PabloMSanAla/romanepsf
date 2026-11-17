@@ -165,7 +165,7 @@ class CatalogSection:
     mag_col: str = "mag_lambda"
     use_cached_gaia: bool = True
     query_gaia_fallback: bool = True
-    isolation_safety_factor: float = 1.0
+    isolation_safety_factor: float = 1.3
     min_dist_arcsec: float = 2.0
     edge_margin_px: int = 50
     centroid_box_fraction: float = 0.30
@@ -273,21 +273,99 @@ class ProfileSection:
 
 @dataclass
 class OverlapAnnulusConfig:
-    r_min: float
-    r_max: float
+    r_min: float = 8.0
+    r_max: float = 16.0
     blend_start: float = 10.0
     blend_end: float = 18.0
+    mode: str = "auto"  # 'auto', 'depth', 'pixel'
+    norm_depth: Optional[Union[List[float], Tuple[float, float]]] = None
+    blend_depth: Optional[Union[List[float], Tuple[float, float]]] = None
+
+    def __post_init__(self):
+        if self.norm_depth is not None:
+            self.norm_depth = tuple(float(x) for x in self.norm_depth)
+        if self.blend_depth is not None:
+            self.blend_depth = tuple(float(x) for x in self.blend_depth)
+
+    def resolve_radii(
+        self,
+        mag: float,
+        pixel_scale: float = 0.11,
+        max_stamp_radius: Optional[float] = None,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Resolve (r_min, r_max, blend_start, blend_end) pixel radii.
+        If mode is 'depth' or ('auto' with norm_depth specified),
+        derives pixel radii dynamically using get_psf_extension_moffat at the given magnitude.
+        Otherwise falls back to explicit pixel radii.
+        """
+        use_depth = (
+            str(self.mode).lower() in ("depth", "auto")
+            and self.norm_depth is not None
+        )
+        if use_depth:
+            from romanepsf.profile import get_psf_extension_moffat
+
+            d_norm = self.norm_depth
+            r_min_arc = float(get_psf_extension_moffat(mag, depth=float(d_norm[0])))
+            r_max_arc = float(get_psf_extension_moffat(mag, depth=float(d_norm[1])))
+            r_min_calc = r_min_arc / pixel_scale
+            r_max_calc = r_max_arc / pixel_scale
+
+            if self.blend_depth is not None:
+                d_blend = self.blend_depth
+                b_start_arc = float(get_psf_extension_moffat(mag, depth=float(d_blend[0])))
+                b_end_arc = float(get_psf_extension_moffat(mag, depth=float(d_blend[1])))
+                b_start_calc = b_start_arc / pixel_scale
+                b_end_calc = b_end_arc / pixel_scale
+            else:
+                b_start_calc = float(self.blend_start) if self.blend_start is not None else r_min_calc
+                b_end_calc = float(self.blend_end) if self.blend_end is not None else r_max_calc
+
+            if r_max_calc <= r_min_calc:
+                r_max_calc = r_min_calc + 1.0
+            if b_end_calc <= b_start_calc:
+                b_end_calc = b_start_calc + 1.0
+
+            # Safety clamping to stay inside the inner stamp footprint
+            if max_stamp_radius is not None and max_stamp_radius > 2.0:
+                cap = float(max_stamp_radius) * 0.95
+                b_end_calc = min(b_end_calc, cap)
+                b_start_calc = min(b_start_calc, b_end_calc - 1.0)
+                r_max_calc = min(r_max_calc, b_end_calc)
+                r_min_calc = min(r_min_calc, r_max_calc - 1.0)
+
+            return float(r_min_calc), float(r_max_calc), float(b_start_calc), float(b_end_calc)
+
+        # Fallback to pixel radii
+        r_min = float(self.r_min) if self.r_min is not None else 8.0
+        r_max = float(self.r_max) if self.r_max is not None else 16.0
+        b_start = float(self.blend_start) if self.blend_start is not None else 10.0
+        b_end = float(self.blend_end) if self.blend_end is not None else 18.0
+        return r_min, r_max, b_start, b_end
 
 
 @dataclass
 class AssemblySection:
     canvas_size: int = 1025
     stack_sigma_clip: float = 3.0
-    overlap_fm: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(8.0, 16.0, 10.0, 18.0))
-    overlap_mb: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(22.0, 45.0, 30.0, 48.0))
+    overlap_fm: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(
+        r_min=8.0, r_max=16.0, blend_start=10.0, blend_end=18.0,
+        mode="auto", norm_depth=(20.0, 23.0), blend_depth=(25.0, 27.0)
+    ))
+    overlap_mb: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(
+        r_min=22.0, r_max=45.0, blend_start=30.0, blend_end=48.0,
+        mode="auto", norm_depth=(20.0, 23.0), blend_depth=(25.0, 27.0)
+    ))
     normalize_flux: bool = True
     oversampling_faint: int = 4
     oversampling_medium: int = 4
+    bright_limit: float = 11.0
+    faint_limit: float = 13.0
+    pixel_scale: float = 0.11
+    faint_size: int = 81
+    medium_size: int = 201
+    bright_max: int = 1001
 
     def __post_init__(self):
         if isinstance(self.overlap_fm, dict):
@@ -363,6 +441,17 @@ class PipelineConfig:
             self.validation = ValidationSection(**self.validation)
         if isinstance(self.reporting, dict):
             self.reporting = ReportingSection(**self.reporting)
+
+        # Propagate tier limits and stamp footprints to assembly section
+        if hasattr(self, "tiers") and hasattr(self, "assembly"):
+            self.assembly.bright_limit = getattr(self.tiers, "bright_limit", self.assembly.bright_limit)
+            self.assembly.faint_limit = getattr(self.tiers, "faint_limit", self.assembly.faint_limit)
+        if hasattr(self, "stamps") and hasattr(self, "assembly"):
+            sizes = getattr(self.stamps, "sizes", None)
+            if sizes is not None:
+                self.assembly.faint_size = getattr(sizes, "faint", self.assembly.faint_size)
+                self.assembly.medium_size = getattr(sizes, "medium", self.assembly.medium_size)
+                self.assembly.bright_max = getattr(sizes, "bright_max", self.assembly.bright_max)
 
     def validate(self) -> None:
         """Validate logical relationships and parameter constraints."""
