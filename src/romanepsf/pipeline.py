@@ -1091,6 +1091,15 @@ def _sca_file_worker_task(
     Multiprocessing worker task for single L2 ASDF stamp extraction.
     Ensures prompt deallocation of full image arrays to keep worker RSS << 4 GB.
     """
+    # Prevent CPU thread oversubscription during parallel execution:
+    # 1 thread per worker process prevents N_workers x N_cores thread contention
+    try:
+        import torch
+        if torch.get_num_threads() > 1:
+            torch.set_num_threads(1)
+    except Exception:
+        pass
+
     asdf_path_str, target_sca, hpx_cache_dir, master_catalog_path, cfg, max_stars_per_file = task_args
     asdf_path = Path(asdf_path_str)
     t0 = time.perf_counter()
