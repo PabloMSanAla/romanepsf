@@ -46,7 +46,7 @@ def compute_subpixel_composite_radial_profile(
     ny, nx = epsf_model.shape
     cy, cx = (ny - 1.0) / 2.0, (nx - 1.0) / 2.0
 
-    # 1. Subpixel core evaluation (r from 0.10 to sub_r_max px)
+    # 1. Subpixel core evaluation (r from 0.10 to sub_r_max px) using bilinear interpolation (order=1)
     sub_sz = int(2 * sub_r_max * oversample + 1)
     u_ref = np.linspace(-sub_r_max, sub_r_max, sub_sz)
     uu_ref, vv_ref = np.meshgrid(u_ref, u_ref)
@@ -54,7 +54,7 @@ def compute_subpixel_composite_radial_profile(
 
     x_samp = cx + uu_ref
     y_samp = cy + vv_ref
-    epsf_sub = map_coordinates(epsf_model, [y_samp, x_samp], order=3, mode="constant", cval=0.0)
+    epsf_sub = map_coordinates(epsf_model, [y_samp, x_samp], order=1, mode="constant", cval=0.0)
 
     r_core_bins = get_geometric_radial_bins(r_min=0.10, r_max=sub_r_max, growth_rate=growth_rate)
     r_core_centers = np.sqrt(r_core_bins[:-1] * r_core_bins[1:])
@@ -134,7 +134,7 @@ def extract_stamp_1d_radial_profile(
         clean_data = np.where(valid, stamp_data, 0.0)
         x_samp = cx + uu_sub
         y_samp = cy + vv_sub
-        stamp_sub = map_coordinates(clean_data, [y_samp, x_samp], order=3, mode="constant", cval=0.0)
+        stamp_sub = map_coordinates(clean_data, [y_samp, x_samp], order=1, mode="constant", cval=0.0)
 
         if stamp_mask is not None:
             mask_sub = map_coordinates(stamp_mask.astype(float), [y_samp, x_samp], order=0, mode="constant", cval=1.0) > 0.5
