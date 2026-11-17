@@ -363,6 +363,8 @@ def process_star_stamps(
     spikes_cfg: Optional[Any] = None,
     stamps_cfg: Optional[Any] = None,
     max_bright_size: int = 1001,
+    faint_size: int = 81,
+    medium_size: int = 201,
     max_stars_per_tier: Optional[Dict[str, int]] = None,
     subtract_background: bool = True,
     bkg_method: str = "annulus",
@@ -414,10 +416,18 @@ def process_star_stamps(
         spikes_cfg = None
 
     if isinstance(stamps_cfg, dict):
-        max_stars_per_tier = stamps_cfg
-        stamps_cfg = None
+        if "sizes" in stamps_cfg:
+            sz_dict = stamps_cfg["sizes"]
+            max_bright_size = sz_dict.get("bright_max", max_bright_size)
+            faint_size = sz_dict.get("faint", faint_size)
+            medium_size = sz_dict.get("medium", medium_size)
+        else:
+            max_stars_per_tier = stamps_cfg
+            stamps_cfg = None
     elif stamps_cfg is not None and hasattr(stamps_cfg, "sizes"):
         max_bright_size = getattr(stamps_cfg.sizes, "bright_max", max_bright_size)
+        faint_size = getattr(stamps_cfg.sizes, "faint", faint_size)
+        medium_size = getattr(stamps_cfg.sizes, "medium", medium_size)
         faint_core_protect_finite = getattr(stamps_cfg, "faint_core_protect_finite", faint_core_protect_finite)
 
     if max_stars_per_tier is None:
@@ -495,7 +505,14 @@ def process_star_stamps(
                 xg_det, yg_det = cx, cy
 
             # 1. Determine adaptive size
-            sz = get_adaptive_stamp_size(mag, tier, max_size=max_bright_size, pixel_scale=pixel_scale)
+            sz = get_adaptive_stamp_size(
+                mag=mag,
+                tier=tier,
+                max_size=max_bright_size,
+                pixel_scale=pixel_scale,
+                faint_size=faint_size,
+                medium_size=medium_size,
+            )
 
             # 2. Extract raw cutouts
             raw_cutout, (ix, iy) = extract_cutout(l2_data.data, (cx, cy), sz, fill_value=np.nan)

@@ -409,3 +409,25 @@ class TestProcessStarStampsIntegration:
         empty_df = pd.DataFrame()
         stamps_dict = stamps_module.process_star_stamps(synthetic_l2_data, empty_df)
         assert stamps_dict == {"bright": [], "medium": [], "faint": []}
+
+    def test_process_star_stamps_custom_sizes_config(self, stamps_module, synthetic_l2_data):
+        """Verify process_star_stamps honors custom faint and medium stamp dimensions from config."""
+        from romanepsf.config import StampsSection, StampSizes
+
+        stamps_cfg = StampsSection(
+            sizes=StampSizes(bright_max=2451, medium=821, faint=51)
+        )
+        df = pd.DataFrame({
+            "source_id": [1, 2],
+            "mag_lambda": [12.0, 19.5],
+            "x": [250.0, 250.0],
+            "y": [250.0, 250.0],
+            "tier": ["medium", "faint"],
+        })
+        stamps_dict = stamps_module.process_star_stamps(
+            synthetic_l2_data, df, stamps_cfg=stamps_cfg
+        )
+        assert len(stamps_dict["medium"]) == 1
+        assert len(stamps_dict["faint"]) == 1
+        assert stamps_dict["medium"][0].size == 821
+        assert stamps_dict["faint"][0].size == 51

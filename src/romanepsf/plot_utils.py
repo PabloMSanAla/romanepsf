@@ -326,9 +326,9 @@ def generate_diagnostic_plots(
             ax1.plot(r_grid[valid], f_vals[valid], color=col, alpha=alpha_val, linewidth=lw)
 
     # Legend proxy handles
-    ax1.plot([], [], color="#4caf50", alpha=0.75, linewidth=1.4, label=f"Faint Stars ({n_faint} stars, r < 24 px)")
-    ax1.plot([], [], color="#2196f3", alpha=0.75, linewidth=1.4, label=f"Medium Stars ({n_med} stars, r < 80 px)")
-    ax1.plot([], [], color="#ff9800", alpha=0.85, linewidth=1.4, label=f"Bright Stars ({n_bright} stars, r ≥ 10 px)")
+    ax1.plot([], [], color="#4caf50", alpha=0.75, linewidth=1.4, label=f"Faint Stars ({n_faint} stars)")
+    ax1.plot([], [], color="#2196f3", alpha=0.75, linewidth=1.4, label=f"Medium Stars ({n_med} stars)")
+    ax1.plot([], [], color="#ff9800", alpha=0.85, linewidth=1.4, label=f"Bright Stars ({n_bright} stars)")
 
     # Transition blending zones
     fm_sec_start = blend_fm_start * pixel_scale
