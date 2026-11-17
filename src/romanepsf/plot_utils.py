@@ -108,13 +108,11 @@ def extract_stamp_1d_radial_profile(
     """
     Extract 1D radial profile from a 2D postage stamp array on valid unmasked pixels.
     Supports logarithmic/geometric binning growing at growth_rate (default 1.03x).
+    Subpixel spline interpolation is performed for r < 3.0 px to capture continuous
+    core surface brightness down to 0.10 px even on native 1x detector pixel stamps.
     """
     ny, nx = stamp_data.shape
     cy, cx = (ny - 1.0) / 2.0, (nx - 1.0) / 2.0
-    grid_y, grid_x = np.ogrid[:ny, :nx]
-    r_px = np.hypot(grid_x - cx, grid_y - cy)
-    r_native = r_px / float(oversample)
-
     valid = np.isfinite(stamp_data) & (stamp_data > 0)
     if stamp_mask is not None:
         valid &= (~stamp_mask)
@@ -122,11 +120,46 @@ def extract_stamp_1d_radial_profile(
     if not np.any(valid):
         return np.array([]), np.array([])
 
-    r_val = r_native[valid]
-    f_val = stamp_data[valid]
+    ovs = max(1, int(oversample))
+
+    # For stamps without hardware oversampling (ovs <= 1), evaluate subpixel core via spline interpolation
+    if ovs <= 1:
+        sub_r_max = min(3.5, float(min(nx, ny) - 1) / 2.0)
+        sub_ovs = 10
+        sub_sz = int(2 * sub_r_max * sub_ovs + 1)
+        u_sub = np.linspace(-sub_r_max, sub_r_max, sub_sz)
+        uu_sub, vv_sub = np.meshgrid(u_sub, u_sub)
+        r_sub = np.hypot(uu_sub, vv_sub)
+
+        clean_data = np.where(valid, stamp_data, 0.0)
+        x_samp = cx + uu_sub
+        y_samp = cy + vv_sub
+        stamp_sub = map_coordinates(clean_data, [y_samp, x_samp], order=3, mode="constant", cval=0.0)
+
+        if stamp_mask is not None:
+            mask_sub = map_coordinates(stamp_mask.astype(float), [y_samp, x_samp], order=0, mode="constant", cval=1.0) > 0.5
+        else:
+            mask_sub = np.zeros_like(stamp_sub, dtype=bool)
+
+        valid_sub = (stamp_sub > 0) & (~mask_sub)
+        r_val_core = r_sub[valid_sub]
+        f_val_core = stamp_sub[valid_sub]
+
+        # Native pixel grid outside subpixel core (r >= sub_r_max)
+        grid_y, grid_x = np.ogrid[:ny, :nx]
+        r_native = np.hypot(grid_x - cx, grid_y - cy)
+        outer_mask = valid & (r_native >= sub_r_max)
+        r_val = np.concatenate([r_val_core, r_native[outer_mask]])
+        f_val = np.concatenate([f_val_core, stamp_data[outer_mask]])
+    else:
+        grid_y, grid_x = np.ogrid[:ny, :nx]
+        r_px = np.hypot(grid_x - cx, grid_y - cy)
+        r_native = r_px / float(ovs)
+        r_val = r_native[valid]
+        f_val = stamp_data[valid]
 
     if r_bins is None:
-        max_r = min(float(nx) / (2.0 * oversample), 500.0)
+        max_r = min(float(nx) / (2.0 * ovs), 500.0)
         r_bins = get_geometric_radial_bins(r_min=0.10, r_max=max(max_r, 1.0), growth_rate=growth_rate)
 
     r_centers = np.sqrt(r_bins[:-1] * r_bins[1:])
