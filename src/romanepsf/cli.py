@@ -462,6 +462,8 @@ def batch_command(
         sys.exit(1)
 
     target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01"))
+    cfg.data.sca = target_sca
+    cfg.data.detectors = [target_sca]
     logger.info(
         f"Starting Batch SCA Pipeline for {target_sca.upper()} "
         f"across file list: {file_list} with {cfg.environment.num_workers} workers"
