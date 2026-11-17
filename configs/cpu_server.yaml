@@ -39,7 +39,7 @@ catalog:
 
 tiers:
   bright_limit: 11.0
-  faint_limit: 13.0
+  faint_limit: 19.0
   max_stars_per_tier:
     bright: 200                # Reservoir capacity for bright stars (extended wings & spikes)
     medium: 1000               # Reservoir capacity for medium stars (transition zone)
@@ -47,9 +47,9 @@ tiers:
 
 stamps:
   sizes:
-    bright_max: 1001           # Adaptive bright stamp dimension
-    medium: 201                # Medium stamp dimension
-    faint: 81                  # Faint stamp dimension
+    bright_max: 2451           # Adaptive bright stamp dimension
+    medium: 821                # Medium stamp dimension
+    faint: 51                  # Faint stamp dimension
   subpixel_interpolation_order: 3
   dq_flags_to_mask: ["DO_NOT_USE", "SATURATED", "DROPOUT"]
   faint_core_protect_finite: true
@@ -91,12 +91,18 @@ assembly:
   oversampling_faint: 4        # 4x oversampling for faint core
   oversampling_medium: 4       # 4x oversampling for medium transition
   overlap_fm:
-    r_min: 8.0
+    mode: "auto"               # Options: 'auto', 'depth', 'pixel'
+    norm_depth: [20.0, 23.0]   # Surface brightness range (mag/arcsec^2) for flux scale normalization
+    blend_depth: [25.0, 27.0]  # Surface brightness range (mag/arcsec^2) for annular blending
+    r_min: 8.0                 # Fallback pixel radius if mode is 'pixel'
     r_max: 16.0
     blend_start: 10.0
     blend_end: 18.0
   overlap_mb:
-    r_min: 22.0
+    mode: "auto"               # Options: 'auto', 'depth', 'pixel'
+    norm_depth: [20.0, 23.0]   # Surface brightness range (mag/arcsec^2) for flux scale normalization
+    blend_depth: [25.0, 27.0]  # Surface brightness range (mag/arcsec^2) for annular blending
+    r_min: 22.0                # Fallback pixel radius if mode is 'pixel'
     r_max: 45.0
     blend_start: 30.0
     blend_end: 48.0

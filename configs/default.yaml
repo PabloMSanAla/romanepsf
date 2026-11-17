@@ -35,7 +35,7 @@ catalog:
 
 tiers:
   bright_limit: 11.0          # F146 < 11.0: Extended Wings & 6-fold Diffraction Spikes
-  faint_limit: 13.0           # 11.0 <= F146 < 13.0: Transition Overlap; F146 >= 13.0: Unsaturated Core
+  faint_limit: 19.0           # 11.0 <= F146 < 19.0: Transition Overlap; F146 >= 19.0: Unsaturated Core
   max_stars_per_tier:
     bright: 20
     medium: 50
@@ -43,9 +43,9 @@ tiers:
 
 stamps:
   sizes:
-    bright_max: 1001          # Maximum adaptive bright cutout ceiling (odd integer)
-    medium: 201               # Medium star cutout size (odd integer)
-    faint: 81                 # Faint star cutout size (odd integer)
+    bright_max: 2451          # Maximum adaptive bright cutout ceiling (odd integer)
+    medium: 821               # Medium star cutout size (odd integer)
+    faint: 51                 # Faint star cutout size (odd integer)
   subpixel_interpolation_order: 3
   dq_flags_to_mask: ["DO_NOT_USE", "SATURATED", "DROPOUT"]
   faint_core_protect_finite: true
@@ -87,12 +87,18 @@ assembly:
   oversampling_faint: 4       # Subpixel oversampling around 4x for faint tier core
   oversampling_medium: 4      # Subpixel oversampling around 4x for medium tier transition
   overlap_fm:
-    r_min: 8.0
+    mode: "auto"              # Options: 'auto', 'depth', 'pixel'
+    norm_depth: [20.0, 23.0]  # Surface brightness range (mag/arcsec^2) for flux scale normalization
+    blend_depth: [25.0, 27.0] # Surface brightness range (mag/arcsec^2) for annular blending
+    r_min: 8.0                # Pixel fallback
     r_max: 16.0
     blend_start: 10.0
     blend_end: 18.0
   overlap_mb:
-    r_min: 22.0
+    mode: "auto"              # Options: 'auto', 'depth', 'pixel'
+    norm_depth: [20.0, 23.0]  # Surface brightness range (mag/arcsec^2) for flux scale normalization
+    blend_depth: [25.0, 27.0] # Surface brightness range (mag/arcsec^2) for annular blending
+    r_min: 22.0               # Pixel fallback
     r_max: 45.0
     blend_start: 30.0
     blend_end: 48.0
