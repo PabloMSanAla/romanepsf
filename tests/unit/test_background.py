@@ -141,7 +141,7 @@ class TestNoisechiselBackground:
         final_mask, prot_area, residual = mask_contaminants_with_spikes_protected(
             cutout,
             dq_mask=dq,
-            tier="faint",
+            tier="medium",
             mag=16.0,
             sky_std=noise_std,
             detection_sigma=3.0,
@@ -153,10 +153,46 @@ class TestNoisechiselBackground:
         final_mask2, prot_area2, residual2 = mask_contaminants_with_spikes_protected(
             cutout,
             dq_mask=dq,
-            tier="faint",
+            tier="medium",
             mag=16.0,
             sky_std=10.0,
             detection_sigma=3.0,
             engine="photutils",
         )
         assert final_mask2[25, 25] == False
+
+    def test_noisechisel_retry_on_not_enough_valid_tiles(self):
+        """Test that NoiseChisel retries with interpnumngb=5 when not enough valid tiles."""
+        from unittest.mock import MagicMock, patch
+
+        arr = np.full((150, 150), 2.5, dtype=np.float32)
+
+        call_args_list = []
+
+        def fake_nc_init(*args, **kwargs):
+            mock_runner = MagicMock()
+            ngb = kwargs.get("interpnumngb", 15)
+            call_args_list.append(ngb)
+
+            if ngb == 15:
+                # First run with default 15 fails with user error
+                mock_runner.side_effect = ValueError("not enough valid tiles for the neighbour search")
+            else:
+                # Retry with ngb=5 succeeds
+                mock_res = MagicMock()
+                mock_res.numpy.return_value = {
+                    "sky": np.full((150, 150), 2.5, dtype=np.float32),
+                    "std": np.full((150, 150), 0.1, dtype=np.float32),
+                }
+                mock_res.med_std = 0.1
+                mock_runner.return_value = mock_res
+            return mock_runner
+
+        with patch("noisechisel_torch.NoiseChisel", side_effect=fake_nc_init):
+            sky_map, std_map, sky_val, std_val = estimate_detector_sky_noisechisel(
+                arr, interpnumngb=15, device="cpu"
+            )
+
+        assert call_args_list == [15, 5]
+        assert np.isclose(sky_val, 2.5)
+        assert np.isclose(std_val, 0.1)

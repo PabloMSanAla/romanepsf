@@ -108,14 +108,45 @@ def estimate_detector_sky_noisechisel(
     try:
         import noisechisel_torch as nc
 
-        runner = nc.NoiseChisel(
-            device=target_device,
-            tilesize=tilesize,
-            interpnumngb=interpnumngb,
-            verbose=verbose,
-            **kwargs,
-        )
-        res = runner(work_img)
+        def _run_noisechisel(ngb: int):
+            nc_runner = nc.NoiseChisel(
+                device=target_device,
+                tilesize=tilesize,
+                interpnumngb=ngb,
+                verbose=verbose,
+                **kwargs,
+            )
+            return nc_runner(work_img)
+
+        try:
+            res = _run_noisechisel(interpnumngb)
+        except ValueError as exc:
+            err_msg = str(exc).lower()
+            if "not enough valid tiles" in err_msg and interpnumngb > 5:
+                logger.warning(
+                    f"NoiseChisel failed with interpnumngb={interpnumngb} ('{exc}'). "
+                    "Retrying with reduced interpnumngb=5..."
+                )
+                try:
+                    res = _run_noisechisel(5)
+                except ValueError as exc_retry:
+                    if "not enough valid tiles" in str(exc_retry).lower():
+                        logger.warning(
+                            f"NoiseChisel failed with interpnumngb=5 ('{exc_retry}'). "
+                            "Retrying with reduced interpnumngb=3..."
+                        )
+                        res = _run_noisechisel(3)
+                    else:
+                        raise
+            elif "not enough valid tiles" in err_msg and interpnumngb > 3:
+                logger.warning(
+                    f"NoiseChisel failed with interpnumngb={interpnumngb} ('{exc}'). "
+                    "Retrying with reduced interpnumngb=3..."
+                )
+                res = _run_noisechisel(3)
+            else:
+                raise
+
         res_dict = res.numpy()
 
         sky_map = np.asarray(res_dict["sky"], dtype=np.float32)
