@@ -25,7 +25,7 @@ def test_cli_help():
 
 
 @pytest.mark.parametrize("subcmd", [
-    "run", "single", "catalog", "stamps", "assemble", "validate", "report"
+    "run", "single", "catalog", "stamps", "assemble", "validate", "report", "batch", "prefetch-gaia", "prefetch"
 ])
 def test_subcommand_help(subcmd: str):
     """Verify each subcommand provides clean help information."""
@@ -200,4 +200,81 @@ def test_cli_sca_flag_integer_parsing(tmp_path: Path):
         res19 = runner.invoke(cli, ["batch-run", "--file-list", str(file_list), "--sca", "19"])
         assert res19.exit_code != 0
         assert "Roman WFI detectors are numbered 1 through 18" in res19.output
+
+
+def test_cli_prefetch_only_batch(tmp_path):
+    """Verify 'batch --prefetch-only' calls prefetch_gaia_for_files and does not synthesize PSF."""
+    runner = CliRunner()
+    file_list = tmp_path / "files.txt"
+    file_list.write_text("file1.asdf\n")
+
+    mock_summary = {
+        "total_files": 1,
+        "scanned_files": 1,
+        "unique_tiles": 4,
+        "cached_tiles": 3,
+        "missing_tiles": 1,
+        "downloaded_tiles": 1,
+        "cache_dir": tmp_path / "gaia",
+    }
+
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch, \
+         patch("romanepsf.pipeline.run_sca_batch_pipeline") as mock_batch:
+
+        res = runner.invoke(cli, ["batch", "--file-list", str(file_list), "--sca", "1", "--prefetch-only"])
+        assert res.exit_code == 0
+        assert "Gaia prefetch complete: 1 downloaded, 3 already cached, 4 total required tiles" in res.output
+        mock_prefetch.assert_called_once()
+        mock_batch.assert_not_called()
+
+
+def test_cli_prefetch_only_run(tmp_path):
+    """Verify 'run --file-list ... --prefetch-only' calls prefetch_gaia_for_files and exits early."""
+    runner = CliRunner()
+    file_list = tmp_path / "files.txt"
+    file_list.write_text("file1.asdf\n")
+
+    mock_summary = {
+        "total_files": 1,
+        "scanned_files": 1,
+        "unique_tiles": 2,
+        "cached_tiles": 2,
+        "missing_tiles": 0,
+        "downloaded_tiles": 0,
+        "cache_dir": tmp_path / "gaia",
+    }
+
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch, \
+         patch("romanepsf.pipeline.run_sca_batch_pipeline") as mock_batch, \
+         patch("romanepsf.pipeline.run_pipeline") as mock_run:
+
+        res = runner.invoke(cli, ["run", "--file-list", str(file_list), "--sca", "2", "--prefetch-gaia-only"])
+        assert res.exit_code == 0
+        assert "Gaia prefetch complete: 0 downloaded, 2 already cached, 2 total required tiles" in res.output
+        mock_prefetch.assert_called_once()
+        mock_batch.assert_not_called()
+        mock_run.assert_not_called()
+
+
+def test_cli_prefetch_gaia_subcommand(tmp_path):
+    """Verify 'prefetch-gaia' subcommand scans footprints and outputs prefetch summary."""
+    runner = CliRunner()
+    file_list = tmp_path / "files.txt"
+    file_list.write_text("file1.asdf\n")
+
+    mock_summary = {
+        "total_files": 1,
+        "scanned_files": 1,
+        "unique_tiles": 5,
+        "cached_tiles": 5,
+        "missing_tiles": 0,
+        "downloaded_tiles": 0,
+        "cache_dir": tmp_path / "gaia",
+    }
+
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch:
+        res = runner.invoke(cli, ["prefetch-gaia", "--file-list", str(file_list), "--sca", "1"])
+        assert res.exit_code == 0
+        assert "Gaia prefetch complete: 0 downloaded, 5 already cached, 5 total required tiles" in res.output
+        mock_prefetch.assert_called_once()
 

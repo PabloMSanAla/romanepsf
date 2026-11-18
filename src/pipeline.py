@@ -11,6 +11,9 @@ from romanepsf.pipeline import (
     export_single_detector_fits,
     run_single_detector,
     run_pipeline,
+    run_sca_batch_pipeline,
+    prefetch_gaia_for_files,
+    fast_scan_asdf_footprint,
 )
 
 __all__ = [
@@ -22,4 +25,7 @@ __all__ = [
     "export_single_detector_fits",
     "run_single_detector",
     "run_pipeline",
+    "run_sca_batch_pipeline",
+    "prefetch_gaia_for_files",
+    "fast_scan_asdf_footprint",
 ]

@@ -1239,6 +1239,148 @@ def _sca_file_worker_task(
         gc.collect()
 
 
+def prefetch_gaia_for_files(
+    files: Union[Sequence[Union[str, Path]], str, Path],
+    sca_id: Optional[str] = None,
+    cfg: Optional[Union[Config, str, Path]] = None,
+    gaia_cache_dir: Optional[Union[str, Path]] = None,
+    master_catalog_path: Optional[Union[str, Path]] = None,
+    delay_seconds: float = 1.5,
+) -> Dict[str, Any]:
+    """
+    Rapidly scan celestial footprints across input ASDF detector files and prefetch
+    all required Gaia DR3 HEALPix Parquet tiles into local cache using polite rate-limited TAP.
+
+    Parameters
+    ----------
+    files : list of Path, or Path to .txt file list, or directory
+        Input Level 2 ASDF detector files or text file listing them.
+    sca_id : str, optional
+        Filter files to a specific SCA (e.g. 'wfi01', 1). If None, scans all files in input.
+    cfg : Config or path, optional
+        Pipeline configuration.
+    gaia_cache_dir : Path, optional
+        Directory for local HEALPix Parquet cache (default: cfg.data.gaia_cache_dir).
+    master_catalog_path : Path, optional
+        Path to local precomputed master catalog CSV/Parquet for offline partitioning.
+    delay_seconds : float, default 1.5
+        Polite pause between TAP queries to prevent HTTP 429 rate limits.
+
+    Returns
+    -------
+    dict
+        Summary with keys:
+        - "total_files": int
+        - "scanned_files": int
+        - "unique_tiles": int
+        - "cached_tiles": int
+        - "missing_tiles": int
+        - "downloaded_tiles": int
+        - "cache_dir": Path
+    """
+    if cfg is None or isinstance(cfg, (str, Path)):
+        resolved_cfg = load_config(cfg) if cfg is not None else load_config()
+    else:
+        resolved_cfg = cfg
+
+    resolved_cache = Path(gaia_cache_dir) if gaia_cache_dir else resolved_cfg.data.gaia_cache_dir
+    resolved_cache.mkdir(parents=True, exist_ok=True)
+    master_cat = Path(master_catalog_path) if master_catalog_path else resolved_cfg.data.catalog_path
+
+    # Parse and expand files
+    raw_files: List[Path] = []
+    if isinstance(files, (str, Path)):
+        p_files = Path(files)
+        if p_files.is_file() and p_files.suffix.lower() in [".txt", ".lst", ".list", ".csv"]:
+            with open(p_files, "r", encoding="utf-8") as f_obj:
+                for line in f_obj:
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith("#"):
+                        p_cand = Path(stripped)
+                        if not p_cand.is_file() and (p_files.parent / stripped).is_file():
+                            p_cand = p_files.parent / stripped
+                        raw_files.append(p_cand)
+        elif p_files.is_file():
+            raw_files.append(p_files)
+        elif p_files.is_dir():
+            raw_files.extend(sorted(p_files.glob("*_cal.asdf")))
+            if not raw_files:
+                raw_files.extend(sorted(p_files.glob("*.asdf")))
+        else:
+            raise FileNotFoundError(f"Specified input path does not exist: {p_files}")
+    else:
+        for f in files:
+            p = Path(f)
+            if p.is_file():
+                raw_files.append(p)
+
+    if not raw_files:
+        raise ValueError("No valid input L2 ASDF files found to prefetch.")
+
+    from romanepsf.config import normalize_sca_id
+    target_sca = normalize_sca_id(sca_id) if sca_id else None
+
+    file_footprints: List[Tuple[Path, Tuple[float, float, float, float, float, float, float]]] = []
+    logger.info(f"Scanning celestial footprints across {len(raw_files)} ASDF file(s)...")
+    for f in raw_files:
+        try:
+            det, fp = fast_scan_asdf_footprint(f)
+            if target_sca is None or det == target_sca:
+                file_footprints.append((f, fp))
+        except Exception as err:
+            logger.warning(f"Error scanning footprint for {f.name}: {err}")
+
+    if not file_footprints:
+        if target_sca is not None:
+            raise ValueError(f"No files matched target SCA '{target_sca.upper()}' out of {len(raw_files)} inputs.")
+        else:
+            raise ValueError(f"No valid files to scan out of {len(raw_files)} inputs.")
+
+    mgr = GaiaSpatialManager(
+        cache_dir=resolved_cache,
+        precomputed_catalog=master_cat,
+        mag_col=resolved_cfg.catalog.mag_col,
+    )
+
+    all_required_tiles: set[int] = set()
+    for _, (ra_c, dec_c, rad, _, _, _, _) in file_footprints:
+        tiles = mgr.query_disc_tiles(ra_c, dec_c, rad)
+        all_required_tiles.update(tiles)
+
+    missing_tiles = mgr.get_missing_tiles(sorted(all_required_tiles))
+    initial_missing_count = len(missing_tiles)
+    cached_count = len(all_required_tiles) - initial_missing_count
+
+    logger.info(
+        f"Footprint scan complete: {len(all_required_tiles)} total HEALPix tiles required across {len(file_footprints)} matching file(s). "
+        f"Already cached: {cached_count}, Missing: {initial_missing_count}."
+    )
+
+    downloaded_count = 0
+    if missing_tiles:
+        if master_cat and master_cat.is_file():
+            logger.info("Partitioning missing tiles from local master catalog...")
+            mgr.partition_from_master_catalog(target_tiles=missing_tiles)
+            missing_tiles = mgr.get_missing_tiles(missing_tiles)
+
+        if missing_tiles:
+            logger.info(
+                f"Fetching {len(missing_tiles)} missing tiles via rate-limited TAP (polite mode: {delay_seconds:.1f}s delay)..."
+            )
+            downloaded_count = mgr.fetch_missing_tiles_polite(missing_tiles, delay_seconds=delay_seconds)
+
+    summary = {
+        "total_files": len(raw_files),
+        "scanned_files": len(file_footprints),
+        "unique_tiles": len(all_required_tiles),
+        "cached_tiles": cached_count + downloaded_count,
+        "missing_tiles": max(0, initial_missing_count - downloaded_count),
+        "downloaded_tiles": downloaded_count,
+        "cache_dir": resolved_cache,
+    }
+    return summary
+
+
 def run_sca_batch_pipeline(
     files: Union[Sequence[Union[str, Path]], str, Path],
     sca_id: Optional[str] = None,
@@ -1250,6 +1392,7 @@ def run_sca_batch_pipeline(
     master_catalog_path: Optional[Union[str, Path]] = None,
     device: Optional[str] = None,
     max_stamps_per_tier: Optional[Dict[str, int]] = None,
+    prefetch_only: bool = False,
 ) -> PipelineOutputs:
     """
     High-throughput batch pipeline for synthesizing a composite extended PSF model
@@ -1350,35 +1493,21 @@ def run_sca_batch_pipeline(
 
     # 4. Pre-Flight Spatial Harvesting (Zero Gaia API Overload)
     logger.info("Starting Pre-Flight celestial coverage scan...")
-    mgr = GaiaSpatialManager(
-        cache_dir=resolved_hpx_dir,
-        precomputed_catalog=resolved_cfg.data.catalog_path,
-        mag_col=resolved_cfg.catalog.mag_col,
+    prefetch_summary = prefetch_gaia_for_files(
+        files=matching_files,
+        cfg=resolved_cfg,
+        gaia_cache_dir=resolved_hpx_dir,
+        master_catalog_path=resolved_cfg.data.catalog_path,
+        delay_seconds=1.5,
     )
 
-    all_required_tiles: set[int] = set()
-    for f in matching_files:
-        _, (ra_c, dec_c, rad, _, _, _, _) = fast_scan_asdf_footprint(f)
-        tiles = mgr.query_disc_tiles(ra_c, dec_c, rad)
-        all_required_tiles.update(tiles)
-
-    missing_tiles = mgr.get_missing_tiles(sorted(all_required_tiles))
-    logger.info(
-        f"Pre-Flight scan: {len(all_required_tiles)} HEALPix tiles cover all footprints. "
-        f"Missing from local cache: {len(missing_tiles)}."
-    )
-
-    if missing_tiles:
-        if resolved_cfg.data.catalog_path and resolved_cfg.data.catalog_path.is_file():
-            logger.info("Partitioning missing tiles from local master catalog...")
-            mgr.partition_from_master_catalog(target_tiles=missing_tiles)
-            missing_tiles = mgr.get_missing_tiles(missing_tiles)
-
-        if missing_tiles:
-            logger.info(
-                f"Fetching {len(missing_tiles)} missing tiles via rate-limited TAP (polite single-threaded)..."
-            )
-            mgr.fetch_missing_tiles_polite(missing_tiles, delay_seconds=1.5)
+    if prefetch_only:
+        logger.info(f"Gaia prefetch-only completed: {prefetch_summary}")
+        return PipelineOutputs(
+            composite_epsf=np.zeros((1, 1), dtype=np.float32),
+            fits_path=resolved_cfg.data.output_dir / f"roman_epsf_{target_sca}_prefetch.fits",
+            diagnostics={"prefetch_summary": prefetch_summary},
+        )
 
     # 5. Multiprocessing Parallel Stamp Extraction
     n_cpus = os.cpu_count() or 4
@@ -1606,6 +1735,7 @@ __all__ = [
     "run_single_detector",
     "run_pipeline",
     "fast_scan_asdf_footprint",
+    "prefetch_gaia_for_files",
     "run_sca_batch_pipeline",
     "allocate_debug_stars_per_tier",
 ]

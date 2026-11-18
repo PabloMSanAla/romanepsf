@@ -113,6 +113,13 @@ from .report import (
 from .debug_plots import (
     generate_all_debug_plots,
 )
+from .pipeline import (
+    run_pipeline,
+    run_single_detector,
+    run_sca_batch_pipeline,
+    prefetch_gaia_for_files,
+    fast_scan_asdf_footprint,
+)
 
 __all__ = [
     "__version__",
@@ -183,4 +190,9 @@ __all__ = [
     "ReportDataBundle",
     "generate_publication_pdf_report",
     "generate_all_debug_plots",
+    "run_pipeline",
+    "run_single_detector",
+    "run_sca_batch_pipeline",
+    "prefetch_gaia_for_files",
+    "fast_scan_asdf_footprint",
 ]

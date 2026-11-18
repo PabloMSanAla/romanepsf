@@ -228,6 +228,14 @@ def cli(
     default=None,
     help="Debug mode: process X stars across tiers and generate debug plots in output/debug/.",
 )
+@click.option(
+    "--prefetch-only",
+    "--prefetch-gaia-only",
+    "prefetch_only",
+    is_flag=True,
+    default=False,
+    help="Scan footprints and prefetch missing Gaia HEALPix tiles only, then exit without synthesizing PSF.",
+)
 @click.pass_context
 def run_command(
     ctx: click.Context,
@@ -243,6 +251,7 @@ def run_command(
     detectors: Optional[str],
     num_workers: Optional[int],
     debug_stars: Optional[int] = None,
+    prefetch_only: bool = False,
 ):
     """Execute complete end-to-end ePSF pipeline across all designated detectors or file list."""
     if sub_config is not None:
@@ -293,6 +302,29 @@ def run_command(
         logger.error(f"Configuration validation failed: {e}")
         click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
+
+    if prefetch_only:
+        from romanepsf.pipeline import prefetch_gaia_for_files
+
+        target_source = cfg.data.file_list if cfg.data.file_list is not None else (input_dir or cfg.data.detectors_dir)
+        target_sca = normalize_sca_id(sca or cfg.data.sca) if (sca or cfg.data.sca) else None
+        logger.info(
+            f"Executing Gaia prefetch-only for {target_source} "
+            + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
+        )
+        summary = prefetch_gaia_for_files(
+            files=target_source,
+            sca_id=target_sca,
+            cfg=cfg,
+            gaia_cache_dir=cfg.data.gaia_cache_dir,
+            master_catalog_path=cfg.data.catalog_path,
+        )
+        click.echo(
+            f"Gaia prefetch complete: {summary['downloaded_tiles']} downloaded, "
+            f"{summary['cached_tiles']} already cached, "
+            f"{summary['unique_tiles']} total required tiles across {summary['scanned_files']} files."
+        )
+        return
 
     # If file list is specified, run the high-throughput batch SCA pipeline
     if cfg.data.file_list is not None:
@@ -410,6 +442,14 @@ def run_command(
     default=None,
     help="Debug mode: process X stars across tiers and generate debug plots in output/debug/.",
 )
+@click.option(
+    "--prefetch-only",
+    "--prefetch-gaia-only",
+    "prefetch_only",
+    is_flag=True,
+    default=False,
+    help="Scan footprints and prefetch missing Gaia HEALPix tiles only, then exit without synthesizing PSF.",
+)
 @click.pass_context
 def batch_command(
     ctx: click.Context,
@@ -423,6 +463,7 @@ def batch_command(
     device: Optional[str],
     num_workers: Optional[int],
     debug_stars: Optional[int] = None,
+    prefetch_only: bool = False,
 ):
     """Execute high-throughput batch pipeline synthesizing 1 composite ePSF model for a specific SCA."""
     if sub_config is not None:
@@ -461,6 +502,28 @@ def batch_command(
         click.echo(f"Configuration validation failed: {e}", err=True)
         sys.exit(1)
 
+    if prefetch_only:
+        from romanepsf.pipeline import prefetch_gaia_for_files
+
+        target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")) if (sca or cfg.data.sca) else None
+        logger.info(
+            f"Executing Gaia prefetch-only across file list: {file_list} "
+            + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
+        )
+        summary = prefetch_gaia_for_files(
+            files=file_list,
+            sca_id=target_sca,
+            cfg=cfg,
+            gaia_cache_dir=cfg.data.gaia_cache_dir,
+            master_catalog_path=cfg.data.catalog_path,
+        )
+        click.echo(
+            f"Gaia prefetch complete: {summary['downloaded_tiles']} downloaded, "
+            f"{summary['cached_tiles']} already cached, "
+            f"{summary['unique_tiles']} total required tiles across {summary['scanned_files']} files."
+        )
+        return
+
     target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01"))
     cfg.data.sca = target_sca
     cfg.data.detectors = [target_sca]
@@ -495,6 +558,117 @@ def batch_command(
 
 
 cli.add_command(batch_command, name="batch-run")
+
+
+@cli.command("prefetch-gaia", help="Scan celestial footprints and prefetch missing Gaia HEALPix tiles.")
+@click.option(
+    "--file-list",
+    "-fl",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Text file listing input Level 2 ASDF detector files.",
+)
+@click.option(
+    "--input-dir",
+    "-i",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Directory containing Level 2 ASDF detector files.",
+)
+@click.option(
+    "--sca",
+    "-s",
+    type=SCA_PARAM,
+    default=None,
+    help="Target SCA number (1-18, e.g. 1 or 'wfi01'). Default: all SCAs in input.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory for local HEALPix Parquet cache (default: 'cache/gaia_healpix').",
+)
+@click.option(
+    "--catalog",
+    "-cat",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to precomputed Gaia master catalog CSV/Parquet (optional).",
+)
+@click.option(
+    "--config",
+    "-c",
+    "sub_config",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Path to YAML configuration file.",
+)
+@click.option(
+    "--delay",
+    type=float,
+    default=1.5,
+    show_default=True,
+    help="Pause in seconds between TAP queries to prevent rate limits.",
+)
+@click.pass_context
+def prefetch_gaia_command(
+    ctx: click.Context,
+    file_list: Optional[Path],
+    input_dir: Optional[Path],
+    sca: Optional[str],
+    cache_dir: Optional[Path],
+    catalog: Optional[Path],
+    sub_config: Optional[Path],
+    delay: float,
+):
+    """Scan celestial footprints across files and prefetch missing Gaia HEALPix tiles."""
+    if sub_config is not None:
+        cfg = load_config(sub_config)
+        ctx.obj["config"] = cfg
+    else:
+        cfg: Config = ctx.obj["config"]
+
+    logger: logging.Logger = ctx.obj["logger"]
+
+    if file_list is not None:
+        cfg.data.file_list = file_list
+    if cache_dir is not None:
+        cfg.data.gaia_cache_dir = cache_dir
+    if catalog is not None:
+        cfg.data.catalog_path = catalog
+
+    target_source = cfg.data.file_list if cfg.data.file_list is not None else (input_dir or cfg.data.detectors_dir)
+
+    try:
+        from romanepsf.pipeline import prefetch_gaia_for_files
+
+        target_sca = normalize_sca_id(sca) if sca else None
+        logger.info(
+            f"Prefetching Gaia tiles for {target_source} "
+            + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
+        )
+        summary = prefetch_gaia_for_files(
+            files=target_source,
+            sca_id=target_sca,
+            cfg=cfg,
+            gaia_cache_dir=cfg.data.gaia_cache_dir,
+            master_catalog_path=cfg.data.catalog_path,
+            delay_seconds=delay,
+        )
+        click.echo(
+            f"Gaia prefetch complete: {summary['downloaded_tiles']} downloaded, "
+            f"{summary['cached_tiles']} already cached, "
+            f"{summary['unique_tiles']} total required tiles across {summary['scanned_files']} files."
+        )
+    except Exception as exc:
+        logger.error(f"Prefetch Gaia command failed: {exc}")
+        if ctx.obj.get("verbose"):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+cli.add_command(prefetch_gaia_command, name="prefetch")
 
 
 @cli.command("single", help="Run single-detector validation (default: WFI01).")
