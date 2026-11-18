@@ -256,7 +256,7 @@ def estimate_stamp_background(
                 maxiters=maxiters,
             )
             bkg_val = float(med) if np.isfinite(med) else 0.0
-            bkg_rms = float(std) if (np.isfinite(std) and std > 0.0) else 1.0
+            bkg_rms = float(std) if (np.isfinite(std) and std >= 0.0) else 0.0
             return bkg_val, bkg_rms
 
     # Fallback to outer pixels or all valid pixels
@@ -274,7 +274,7 @@ def estimate_stamp_background(
         maxiters=maxiters,
     )
     bkg_val = float(med) if np.isfinite(med) else float(np.percentile(outer_pix, percentile_val))
-    bkg_rms = float(std) if (np.isfinite(std) and std > 0.0) else (float(np.nanstd(outer_pix)) if len(outer_pix) > 1 else 1.0)
+    bkg_rms = float(std) if (np.isfinite(std) and std >= 0.0) else (float(np.nanstd(outer_pix)) if len(outer_pix) > 1 else 0.0)
     return bkg_val, bkg_rms
 
 
@@ -705,7 +705,8 @@ def process_star_stamps(
                 shift_px = float(row["centroid_shift_px"])
 
             debug_dict = {
-                "raw_stamp": flux_cutout,
+                "raw_stamp": raw_cutout,
+                "flux_cutout": flux_cutout,
                 "unaligned_mask": mask,
                 "residual": res_map if res_map is not None else np.zeros_like(flux_cutout),
                 "radial_model": rad_model,
@@ -722,6 +723,10 @@ def process_star_stamps(
                 "gaia_companions": stamp_companions,
                 "dq_mask": dq_mask_bool,
                 "spike_details": spike_diag,
+                "bkg_val": bkg_val,
+                "bkg_rms": bkg_rms,
+                "bkg_depth": bkg_depth,
+                "bkg_subtracted": subtract_background,
             }
 
             stamp_obj = StellarStamp(

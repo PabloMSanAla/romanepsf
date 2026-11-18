@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.lines import Line2D
-from matplotlib.patches import Circle, Patch
+from matplotlib.patches import Circle, Patch, Wedge
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 
@@ -254,6 +254,44 @@ def generate_debug_figure2_apertures_and_profile(
     ra_val = info.get("gaia_ra", None)
     dec_val = info.get("gaia_dec", None)
 
+    # Sky background estimation parameters
+    bkg_val = float(info.get("bkg_val", 0.0))
+    bkg_rms = float(info.get("bkg_rms", 0.0))
+    bkg_depth = info.get("bkg_depth", (27.0, 28.0))
+    d1, d2 = float(bkg_depth[0]), float(bkg_depth[1])
+    d_in, d_out = min(d1, d2), max(d1, d2)
+
+    # Calculate sky annulus radii from Moffat depth extension (27-28 mag)
+    from romanepsf.catalog import get_psf_extension_moffat
+    if mag > 0:
+        r_in_arc = get_psf_extension_moffat(mag, depth=d_in)
+        r_out_arc = get_psf_extension_moffat(mag, depth=d_out)
+        r_in_sky = float(r_in_arc / pix_scale)
+        r_out_sky = float(r_out_arc / pix_scale)
+    else:
+        r_in_sky = 0.80 * min(cx, cy)
+        r_out_sky = 0.98 * min(cx, cy)
+
+    r_max = max(cx, cy, (nx - 1) / 2.0, (ny - 1) / 2.0)
+    if r_out_sky > 0.98 * r_max:
+        r_out_sky = 0.98 * r_max
+    if r_in_sky >= r_out_sky - 1.0:
+        r_in_sky = max(1.0, 0.75 * r_out_sky)
+    if r_in_sky < 3.0:
+        r_in_sky = 3.0
+    if r_out_sky <= r_in_sky + 1.0:
+        r_out_sky = min(r_max, r_in_sky + 5.0)
+
+    # Fallback for bkg_rms if missing or zero
+    if bkg_rms <= 0.0:
+        from astropy.stats import sigma_clipped_stats
+        valid_stamp = stamp[np.isfinite(stamp)]
+        if len(valid_stamp) > 10:
+            _, _, std_est = sigma_clipped_stats(valid_stamp, sigma=3.0, maxiters=5)
+            bkg_rms = float(std_est) if (np.isfinite(std_est) and std_est > 0) else 1.0
+        else:
+            bkg_rms = 1.0
+
     if dq_mask is None and star_info is not None:
         dq_mask = star_info.get("dq_mask", None)
 
@@ -288,6 +326,25 @@ def generate_debug_figure2_apertures_and_profile(
     ax1.set_xlabel("X (pixels)", color="#e6edf3", fontsize=10)
     ax1.set_ylabel("Y (pixels)", color="#e6edf3", fontsize=10)
     ax1.tick_params(colors="#8b949e", labelsize=9)
+
+    # Overlay background measurement annular aperture (27-28 mag depth)
+    sky_wedge = Wedge(
+        (cx, cy),
+        r_out_sky,
+        0,
+        360,
+        width=max(0.1, r_out_sky - r_in_sky),
+        facecolor="#ff4081",
+        edgecolor="#ff4081",
+        alpha=0.25,
+        linestyle="--",
+        linewidth=1.8,
+    )
+    ax1.add_patch(sky_wedge)
+    circ_sky_in = Circle((cx, cy), r_in_sky, fill=False, edgecolor="#ff4081", linestyle="--", linewidth=1.5, alpha=0.9)
+    circ_sky_out = Circle((cx, cy), r_out_sky, fill=False, edgecolor="#ff4081", linestyle="--", linewidth=1.5, alpha=0.9)
+    ax1.add_patch(circ_sky_in)
+    ax1.add_patch(circ_sky_out)
 
     # Overlay cyan contaminant mask (alpha=0.5)
     if np.any(is_contam):
@@ -333,6 +390,15 @@ def generate_debug_figure2_apertures_and_profile(
     ]
     if has_gaia_pos:
         legend_elements1.append(plt.Line2D([0], [0], color="#ff9100", marker="s", markerfacecolor="none", linestyle="none", markersize=7, markeredgewidth=1.5, label="Gaia Center"))
+    # Add Sky Annulus entry
+    legend_elements1.append(
+        Patch(
+            facecolor=(1.0, 0.25, 0.51, 0.25),
+            edgecolor="#ff4081",
+            linestyle="--",
+            label=f"Sky Annulus ({d_in:.0f}-{d_out:.0f} mag: [{r_in_sky:.1f}, {r_out_sky:.1f}] px)",
+        )
+    )
     if np.any(is_contam):
         legend_elements1.append(Patch(facecolor=(0.0, 0.9, 1.0, 0.5), edgecolor="#00e5ff", label="Mask (Cyan, $\\alpha=0.5$)"))
     if np.any(is_dq):
@@ -429,28 +495,96 @@ def generate_debug_figure2_apertures_and_profile(
     cbar2.ax.invert_yaxis()
 
     # =========================================================================
-    # Panel 3: Measured Radial Profile in AB mag / arcsec^2
+    # Panel 3: Measured Radial Profile with Sky Uncertainty Fill
     # =========================================================================
     ax3.set_facecolor("#161b22")
-    valid_p = np.isfinite(prof_mag) & (rad_centers > 0)
+
+    # Determine net profile (profile - sky)
+    bkg_subtracted = bool(info.get("bkg_subtracted", True))
+    if bkg_subtracted:
+        net_profile = np.asarray(rad_flux, dtype=np.float64)
+    else:
+        net_profile = np.asarray(rad_flux, dtype=np.float64) - bkg_val
+
+    # profile - sky + 1skystd and profile - sky - 1skystd
+    upper_flux = net_profile + bkg_rms
+    lower_flux = net_profile - bkg_rms
+
+    prof_mag = convert_to_ab_mag_arcsec2(net_profile, conversion_factor, is_calibrated)
+    upper_mag = convert_to_ab_mag_arcsec2(upper_flux, conversion_factor, is_calibrated)
+    lower_mag = convert_to_ab_mag_arcsec2(np.maximum(lower_flux, 1e-12), conversion_factor, is_calibrated)
+
+    valid_p = (rad_centers > 0) & (np.isfinite(prof_mag) | (np.isfinite(upper_mag) & (upper_flux > 0)))
     if np.any(valid_p):
         r_plot = rad_centers[valid_p]
         m_plot = prof_mag[valid_p]
-        ax3.plot(r_plot, m_plot, color="#00e5ff", lw=2.2, marker="o", markersize=3, label="Radial Profile")
+        m_up = upper_mag[valid_p]
+        m_lo = lower_mag[valid_p]
+
+        valid_m = m_plot[np.isfinite(m_plot)]
+        y_top = max(float(np.min(valid_m)) - 1.0, 8.0) if len(valid_m) else 10.0
+        y_bottom = min(max(float(np.nanmax(valid_m)) + 1.5, 29.0), 32.0) if len(valid_m) else 30.0
+
+        # Clamp lower bound for fill_between when lower_flux <= 0
+        m_lo_clamped = np.where(np.isfinite(m_lo) & (lower_flux[valid_p] > 0), m_lo, y_bottom)
+        m_up_clamped = np.where(np.isfinite(m_up), m_up, y_top)
+
+        # Fill between profile - sky + 1skystd and profile - sky - 1skystd
+        ax3.fill_between(
+            r_plot,
+            m_up_clamped,
+            m_lo_clamped,
+            color="#00e5ff",
+            alpha=0.25,
+            label=r"$({\rm profile} - {\rm sky}) \pm 1\sigma_{\rm sky}$",
+        )
+        ax3.plot(r_plot, m_up_clamped, color="#00e5ff", linestyle="--", lw=1.0, alpha=0.5)
+        ax3.plot(r_plot, m_lo_clamped, color="#00e5ff", linestyle="--", lw=1.0, alpha=0.5)
+
+        # Plot central profile curve
+        has_prof = np.isfinite(m_plot)
+        if np.any(has_prof):
+            ax3.plot(
+                r_plot[has_prof],
+                m_plot[has_prof],
+                color="#00e5ff",
+                lw=2.2,
+                marker="o",
+                markersize=3,
+                label="Profile - Sky",
+            )
+
+        # Highlight sky background measurement annular region
+        ax3.axvspan(
+            r_in_sky,
+            r_out_sky,
+            color="#ff4081",
+            alpha=0.15,
+            label=f"Sky Annulus ({d_in:.0f}-{d_out:.0f} mag: [{r_in_sky:.1f}, {r_out_sky:.1f}] px)",
+        )
+
+        # Reference 1-sigma sky level in AB mag/arcsec^2
+        if bkg_rms > 0:
+            m_sky_1sig = float(convert_to_ab_mag_arcsec2(np.array([bkg_rms]), conversion_factor, is_calibrated)[0])
+            if np.isfinite(m_sky_1sig):
+                ax3.axhline(
+                    m_sky_1sig,
+                    color="#ff4081",
+                    linestyle=":",
+                    lw=1.5,
+                    alpha=0.85,
+                    label=f"$1\\sigma_{{\\rm sky}}$ Floor ({m_sky_1sig:.2f} mag/arcsec$^2$)",
+                )
 
         ax3.set_xscale("log")
         ax3.set_xlabel("Radius from Centroid (pixels)", color="#e6edf3", fontsize=11, labelpad=8)
         ax3.set_ylabel("Surface Brightness (AB mag / arcsec$^2$)", color="#e6edf3", fontsize=11, labelpad=8)
-        ax3.set_title("3. Radial Surface Brightness Profile", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
+        ax3.set_title("3. Radial Profile & Sky Uncertainty", color="#58a6ff", fontsize=12, fontweight="bold", pad=8)
         ax3.tick_params(colors="#8b949e", labelsize=9.5, which="both")
         ax3.grid(True, which="both", color="#30363d", alpha=0.4, linestyle=":")
-
-        # Invert y-axis: brighter magnitudes (smaller numbers) at the top!
-        y_top = max(float(np.min(m_plot)) - 1.0, 8.0)
-        y_bottom = min(float(np.max(m_plot)) + 1.0, 30.0)
         ax3.set_ylim(y_bottom, y_top)
 
-        leg3 = ax3.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", fontsize=9.5)
+        leg3 = ax3.legend(loc="upper right", facecolor="#161b22", edgecolor="#30363d", fontsize=8.5)
         for t in leg3.get_texts():
             t.set_color("#e6edf3")
 
@@ -1156,6 +1290,10 @@ def generate_all_debug_plots(
             "gaia_detector_xy": dbg.get("gaia_detector_xy", None),
             "meas_detector_xy": dbg.get("meas_detector_xy", None),
             "spike_details": dbg.get("spike_details", None),
+            "bkg_val": float(dbg.get("bkg_val", 0.0)),
+            "bkg_rms": float(dbg.get("bkg_rms", 0.0)),
+            "bkg_depth": dbg.get("bkg_depth", (27.0, 28.0)),
+            "bkg_subtracted": dbg.get("bkg_subtracted", True),
         }
 
         # Measure 1D profile for the star stamp

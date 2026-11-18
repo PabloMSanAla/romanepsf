@@ -177,3 +177,45 @@ def test_generate_all_debug_plots_end_to_end(tmp_path):
     assert (debug_dir / "debug_2_apertures_and_profile_bright_101.png").is_file()
     assert (debug_dir / "debug_3_profile_normalization_bright_101.png").is_file()
     assert (debug_dir / "debug_1_wfi01_masking_procedure_bright_101.png").is_file()
+
+
+def test_debug_figure2_sky_annulus_and_profile_fill_between(tmp_path):
+    """
+    Verify Figure 2 renders the sky background annular aperture (27-28 mag depth)
+    on the left panel and the (profile - sky) +/- 1*skystd uncertainty envelope on the right panel.
+    """
+    sz = 101
+    stamp = np.ones((sz, sz), dtype=np.float32) * 5.0
+    mask = np.zeros((sz, sz), dtype=bool)
+    rad_centers = np.geomspace(0.5, 45.0, 30)
+    rad_bins = np.geomspace(0.4, 50.0, 31)
+    rad_flux = 100.0 / (1.0 + (rad_centers / 3.0) ** 2)
+
+    out_file = tmp_path / "debug_2_test_annulus_profile.png"
+    star_info = {
+        "source_id": "test_star_42",
+        "tier": "medium",
+        "mag": 16.5,
+        "pixel_scale": 0.11,
+        "bkg_val": 0.15,
+        "bkg_rms": 0.08,
+        "bkg_depth": (27.0, 28.0),
+        "bkg_subtracted": True,
+        "center_stamp": (50.0, 50.0),
+        "gaia_center_stamp": (50.2, 49.8),
+    }
+
+    res_path = generate_debug_figure2_apertures_and_profile(
+        stamp=stamp,
+        mask=mask,
+        rad_bins=rad_bins,
+        rad_centers=rad_centers,
+        rad_flux=rad_flux,
+        conversion_factor=1.0,
+        output_path=out_file,
+        star_info=star_info,
+        is_calibrated=True,
+    )
+
+    assert res_path.is_file()
+    assert res_path.stat().st_size > 50000  # valid high-resolution plot generated
