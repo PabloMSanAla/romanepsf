@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 from scipy.ndimage import shift, map_coordinates, uniform_filter
 
-from romanepsf.loader import RomanL2Data, DQ_FLAGS, get_dq_mask
+from romanepsf.loader import RomanL2Data, DQ_FLAGS, get_dq_mask, NOMINAL_PIXEL_SCALE
 from romanepsf.catalog import get_psf_extension_moffat
 from romanepsf.masking import mask_contaminants_with_spikes_protected
 
@@ -159,14 +159,21 @@ def extract_cutout(
 def estimate_stamp_background(
     stamp: np.ndarray,
     mask: Optional[np.ndarray] = None,
+    mag: Optional[float] = None,
+    pixel_scale: float = NOMINAL_PIXEL_SCALE,
+    annulus_depth: Tuple[float, float] = (27.0, 28.0),
+    sigma_lower: float = 3.0,
+    sigma_upper: float = 2.0,
+    maxiters: int = 10,
     method: str = "annulus",
     r_inner_frac: float = 0.80,
     r_outer_frac: float = 0.98,
-    sigma_clip: float = 3.0,
     percentile_val: float = 10.0,
 ) -> Tuple[float, float]:
     """
-    Robustly estimate the local sky background level and RMS noise in a postage stamp.
+    Robustly estimate the local sky background level (median) and RMS noise (std)
+    in a postage stamp using an annular aperture defined by surface brightness depth
+    (27-28 mag/arcsec^2 from get_psf_extension_moffat) and astropy.stats.sigma_clipped_stats.
 
     Parameters
     ----------
@@ -174,26 +181,37 @@ def estimate_stamp_background(
         2D flux array.
     mask : np.ndarray, optional
         Boolean mask where True denotes bad/masked pixels to ignore.
+    mag : float, optional
+        Magnitude of the target star. If provided, calculates the annulus radii
+        at annulus_depth[0] and annulus_depth[1] via get_psf_extension_moffat.
+    pixel_scale : float, default NOMINAL_PIXEL_SCALE (0.11)
+        Pixel scale in arcsec/pixel.
+    annulus_depth : tuple of float, default (27.0, 28.0)
+        Surface brightness depths in mag arcsec^-2 defining the annulus inner/outer boundaries.
+    sigma_lower : float, default 3.0
+        Lower sigma clipping threshold for astropy.stats.sigma_clipped_stats.
+    sigma_upper : float, default 2.0
+        Upper sigma clipping threshold for astropy.stats.sigma_clipped_stats.
+    maxiters : int, default 10
+        Maximum clipping iterations for astropy.stats.sigma_clipped_stats.
     method : {'annulus', 'percentile'}, default 'annulus'
-        Background estimation strategy:
-        - 'annulus': Sigma-clipped median in outer circular/elliptical annulus.
-        - 'percentile': Lower percentile of valid unmasked pixels.
+        Background estimation strategy.
     r_inner_frac : float, default 0.80
-        Inner radius of background annulus as a fraction of stamp half-width.
+        Fallback inner radius fraction of stamp half-width if mag is None.
     r_outer_frac : float, default 0.98
-        Outer radius of background annulus as a fraction of stamp half-width.
-    sigma_clip : float, default 3.0
-        Outlier rejection threshold for iterative sigma clipping.
+        Fallback outer radius fraction of stamp half-width if mag is None.
     percentile_val : float, default 10.0
-        Percentile value used if method='percentile' or annular fallback occurs.
+        Percentile value if method='percentile' or fallback occurs.
 
     Returns
     -------
     bkg_val : float
-        Estimated background level.
+        Robust median background level.
     bkg_rms : float
-        Estimated background RMS noise.
+        Robust standard deviation (RMS noise) of the background.
     """
+    from astropy.stats import sigma_clipped_stats
+
     ny, nx = stamp.shape
     cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
     r_max = max(cx, cy)
@@ -206,29 +224,42 @@ def estimate_stamp_background(
         valid &= (~mask)
 
     if method == "annulus":
-        r_in = r_inner_frac * r_max
-        r_out = r_outer_frac * r_max
+        if mag is not None and np.isfinite(mag):
+            d1, d2 = float(annulus_depth[0]), float(annulus_depth[1])
+            d_in, d_out = min(d1, d2), max(d1, d2)
+            r_in_arc = get_psf_extension_moffat(mag, depth=d_in)
+            r_out_arc = get_psf_extension_moffat(mag, depth=d_out)
+            r_in = float(r_in_arc / pixel_scale)
+            r_out = float(r_out_arc / pixel_scale)
+
+            # Safety clamping to stamp dimensions
+            if r_out > 0.98 * r_max:
+                r_out = 0.98 * r_max
+            if r_in >= r_out - 1.0:
+                r_in = max(1.0, 0.75 * r_out)
+            if r_in < 3.0:
+                r_in = 3.0
+            if r_out <= r_in + 1.0:
+                r_out = min(r_max, r_in + 5.0)
+        else:
+            r_in = r_inner_frac * r_max
+            r_out = r_outer_frac * r_max
+
         annulus_mask = valid & (r >= r_in) & (r <= r_out)
         annulus_pix = stamp[annulus_mask]
 
-        if len(annulus_pix) >= 15:
-            # Iterative sigma clipping
-            vals = annulus_pix.copy()
-            for _ in range(3):
-                med = float(np.median(vals))
-                mad = float(np.median(np.abs(vals - med)))
-                std = 1.4826 * mad
-                if std <= 1e-12:
-                    break
-                clip = np.abs(vals - med) <= (sigma_clip * std)
-                if np.sum(clip) < 5 or np.all(clip):
-                    break
-                vals = vals[clip]
-            bkg_val = float(np.median(vals))
-            bkg_rms = float(1.4826 * np.median(np.abs(vals - bkg_val))) if len(vals) > 1 else 0.0
+        if len(annulus_pix) >= 10:
+            _, med, std = sigma_clipped_stats(
+                annulus_pix,
+                sigma_lower=sigma_lower,
+                sigma_upper=sigma_upper,
+                maxiters=maxiters,
+            )
+            bkg_val = float(med) if np.isfinite(med) else 0.0
+            bkg_rms = float(std) if (np.isfinite(std) and std > 0.0) else 1.0
             return bkg_val, bkg_rms
 
-    # Fallback to percentile on outer pixels or all valid pixels
+    # Fallback to outer pixels or all valid pixels
     outer_pix = stamp[valid & (r >= 0.5 * r_max)]
     if len(outer_pix) < 10:
         outer_pix = stamp[valid]
@@ -236,8 +267,14 @@ def estimate_stamp_background(
     if len(outer_pix) == 0:
         return 0.0, 0.0
 
-    bkg_val = float(np.percentile(outer_pix, percentile_val))
-    bkg_rms = float(np.nanstd(outer_pix)) if len(outer_pix) > 1 else 0.0
+    _, med, std = sigma_clipped_stats(
+        outer_pix,
+        sigma_lower=sigma_lower,
+        sigma_upper=sigma_upper,
+        maxiters=maxiters,
+    )
+    bkg_val = float(med) if np.isfinite(med) else float(np.percentile(outer_pix, percentile_val))
+    bkg_rms = float(std) if (np.isfinite(std) and std > 0.0) else (float(np.nanstd(outer_pix)) if len(outer_pix) > 1 else 1.0)
     return bkg_val, bkg_rms
 
 
@@ -444,23 +481,36 @@ def process_star_stamps(
     dq_hard_bad = get_dq_mask(l2_data.dq, ["DO_NOT_USE", "DROPOUT"])
     dq_saturated = get_dq_mask(l2_data.dq, ["SATURATED"])
 
-    # Ensure NoiseChisel detector sky background and noise have been measured once for this detector
-    if l2_data is not None and getattr(l2_data, "sky_std_val", None) is None:
-        try:
-            if hasattr(l2_data, "measure_sky_noisechisel"):
-                l2_data.measure_sky_noisechisel()
-            else:
-                from romanepsf.background import estimate_detector_sky_noisechisel
-                s_map, n_map, s_val, n_val = estimate_detector_sky_noisechisel(
-                    l2_data.data,
-                    dq_mask=l2_data.get_effective_mask() if hasattr(l2_data, "get_effective_mask") else None
-                )
-                l2_data.data = (l2_data.data - s_map).astype(np.float32)
-                l2_data.sky_bkg_val = float(s_val)
-                l2_data.sky_std_val = float(n_val)
-                del s_map, n_map
-        except Exception as e:
-            logger.warning(f"Could not run NoiseChisel on detector ({e}); falling back to local stamp background.")
+    bkg_depth = (27.0, 28.0)
+    bkg_sig_upper = 2.0
+    bkg_sig_lower = 3.0
+    bkg_maxiters = 10
+
+    # Extract background configuration from stamps_cfg or spikes_cfg if provided
+    bkg_cfg = None
+    for cand_cfg in [stamps_cfg, spikes_cfg]:
+        if cand_cfg is not None:
+            if hasattr(cand_cfg, "background"):
+                bkg_cfg = getattr(cand_cfg, "background")
+                break
+            elif isinstance(cand_cfg, dict) and "background" in cand_cfg:
+                bkg_cfg = cand_cfg["background"]
+                break
+            elif hasattr(cand_cfg, "stamps") and hasattr(cand_cfg.stamps, "background"):
+                bkg_cfg = getattr(cand_cfg.stamps, "background")
+                break
+
+    if bkg_cfg is not None:
+        if hasattr(bkg_cfg, "annulus_depth"):
+            bkg_depth = getattr(bkg_cfg, "annulus_depth", bkg_depth)
+            bkg_sig_upper = getattr(bkg_cfg, "sigma_upper", bkg_sig_upper)
+            bkg_sig_lower = getattr(bkg_cfg, "sigma_lower", bkg_sig_lower)
+            bkg_maxiters = getattr(bkg_cfg, "max_iters", bkg_maxiters)
+        elif isinstance(bkg_cfg, dict):
+            bkg_depth = bkg_cfg.get("annulus_depth", bkg_depth)
+            bkg_sig_upper = bkg_cfg.get("sigma_upper", bkg_sig_upper)
+            bkg_sig_lower = bkg_cfg.get("sigma_lower", bkg_sig_lower)
+            bkg_maxiters = bkg_cfg.get("max_iters", bkg_maxiters)
 
     for tier in ["bright", "medium", "faint"]:
         if "tier" in catalog_df.columns:
@@ -540,21 +590,25 @@ def process_star_stamps(
 
             dq_mask_bool |= sat_bool
 
-            # 4. Background estimation & optional subtraction (NoiseChisel detector sky)
-            if l2_data is not None and getattr(l2_data, "sky_std_val", None) is not None:
-                bkg_val = float(l2_data.sky_bkg_val) if l2_data.sky_bkg_val is not None else 0.0
-                bkg_rms = float(l2_data.sky_std_val)
-                # Science array was already sky-subtracted at detector level
-                flux_cutout = raw_cutout.copy()
-                sky_std_scalar = bkg_rms
+            # 4. Background estimation & subtraction (Annular aperture at 27-28 mag depth)
+            if subtract_background:
+                bkg_val, bkg_rms = estimate_stamp_background(
+                    raw_cutout,
+                    mask=dq_mask_bool,
+                    mag=mag,
+                    pixel_scale=pixel_scale,
+                    annulus_depth=bkg_depth,
+                    sigma_lower=bkg_sig_lower,
+                    sigma_upper=bkg_sig_upper,
+                    maxiters=bkg_maxiters,
+                    method=bkg_method,
+                )
+                flux_cutout = subtract_stamp_background(raw_cutout, bkg_val)
             else:
-                if subtract_background:
-                    bkg_val, bkg_rms = estimate_stamp_background(raw_cutout, mask=dq_mask_bool, method=bkg_method)
-                    flux_cutout = subtract_stamp_background(raw_cutout, bkg_val)
-                else:
-                    bkg_val, bkg_rms = 0.0, 1.0
-                    flux_cutout = raw_cutout.copy()
-                sky_std_scalar = bkg_rms
+                bkg_val, bkg_rms = 0.0, 1.0
+                flux_cutout = raw_cutout.copy()
+
+            sky_std_scalar = bkg_rms
 
             # 5. Apply dual-prior spike protection & contaminant masking
             comps_table = companion_stars if companion_stars is not None else catalog_df

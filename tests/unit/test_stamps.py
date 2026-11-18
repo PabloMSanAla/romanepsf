@@ -246,6 +246,43 @@ class TestBackgroundEstimation:
         assert bkg_val == 0.0
         assert bkg_rms == 0.0
 
+    def test_annular_background_moffat_depth_and_sigma_clipping(self, stamps_module):
+        """Test annular background around 27-28 mag depth using astropy sigma_clipped_stats."""
+        from romanepsf.catalog import get_psf_extension_moffat
+        np.random.seed(42)
+        sz = 201
+        cx, cy = (sz - 1) / 2.0, (sz - 1) / 2.0
+        true_bkg = 1.25
+        true_noise = 0.15
+        stamp = true_bkg + np.random.normal(0.0, true_noise, size=(sz, sz)).astype(np.float32)
+
+        # Inject bright star in center
+        gy, gx = np.indices((sz, sz))
+        r = np.hypot(gx - cx, gy - cy)
+        stamp += 50.0 / (1.0 + (r / 2.0)**2)
+
+        # Inject positive outliers in the annulus (e.g. cosmic rays or faint contaminants)
+        mag = 16.0
+        r_in = get_psf_extension_moffat(mag, 27.0) / 0.11
+        r_out = get_psf_extension_moffat(mag, 28.0) / 0.11
+        in_annulus = (r >= r_in) & (r <= r_out)
+        annulus_indices = np.where(in_annulus)
+        # Add 5 large positive outliers
+        stamp[annulus_indices[0][:5], annulus_indices[1][:5]] += 15.0
+
+        bkg_val, bkg_rms = stamps_module.estimate_stamp_background(
+            stamp,
+            mag=mag,
+            annulus_depth=(27.0, 28.0),
+            sigma_lower=3.0,
+            sigma_upper=2.0,
+            maxiters=10,
+        )
+
+        # Background median should reject positive outliers and recover ~true_bkg
+        assert np.isclose(bkg_val, true_bkg, atol=0.05)
+        assert np.isclose(bkg_rms, true_noise, atol=0.04)
+
 
 # ==============================================================================
 # 4. Subpixel Bicubic Realignment (Feature 10)

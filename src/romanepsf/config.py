@@ -199,15 +199,33 @@ class StampSizes:
 
 
 @dataclass
+class BackgroundSection:
+    annulus_depth: List[float] = field(default_factory=lambda: [27.0, 28.0])
+    sigma_upper: float = 2.0
+    sigma_lower: float = 3.0
+    max_iters: int = 10
+
+    def __post_init__(self):
+        if isinstance(self.annulus_depth, (tuple, list)):
+            self.annulus_depth = [float(x) for x in self.annulus_depth]
+        self.sigma_upper = float(self.sigma_upper)
+        self.sigma_lower = float(self.sigma_lower)
+        self.max_iters = int(self.max_iters)
+
+
+@dataclass
 class StampsSection:
     sizes: StampSizes = field(default_factory=StampSizes)
     subpixel_interpolation_order: int = 3
     dq_flags_to_mask: List[str] = field(default_factory=lambda: ["DO_NOT_USE", "SATURATED", "DROPOUT"])
     faint_core_protect_finite: bool = True
+    background: BackgroundSection = field(default_factory=BackgroundSection)
 
     def __post_init__(self):
         if isinstance(self.sizes, dict):
             self.sizes = StampSizes(**self.sizes)
+        if isinstance(self.background, dict):
+            self.background = BackgroundSection(**self.background)
 
 
 @dataclass
@@ -417,6 +435,7 @@ class PipelineConfig:
     assembly: AssemblySection = field(default_factory=AssemblySection)
     validation: ValidationSection = field(default_factory=ValidationSection)
     reporting: ReportingSection = field(default_factory=ReportingSection)
+    background: BackgroundSection = field(default_factory=BackgroundSection)
 
     def __post_init__(self):
         if isinstance(self.pipeline, dict):
@@ -441,6 +460,15 @@ class PipelineConfig:
             self.validation = ValidationSection(**self.validation)
         if isinstance(self.reporting, dict):
             self.reporting = ReportingSection(**self.reporting)
+        if isinstance(self.background, dict):
+            self.background = BackgroundSection(**self.background)
+
+        # Synchronize background settings between root and stamps
+        if hasattr(self, "stamps") and hasattr(self.stamps, "background"):
+            if self.background != BackgroundSection() and self.stamps.background == BackgroundSection():
+                self.stamps.background = self.background
+            elif self.stamps.background != BackgroundSection() and self.background == BackgroundSection():
+                self.background = self.stamps.background
 
         # Propagate tier limits and stamp footprints to assembly section
         if hasattr(self, "tiers") and hasattr(self, "assembly"):

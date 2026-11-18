@@ -53,6 +53,11 @@ stamps:
   subpixel_interpolation_order: 3
   dq_flags_to_mask: ["DO_NOT_USE", "SATURATED", "DROPOUT"]
   faint_core_protect_finite: true
+  background:
+    annulus_depth: [27.0, 28.0] # Surface brightness depth (mag/arcsec^2) for annular sky estimation
+    sigma_upper: 2.0           # astropy.stats.sigma_clipped_stats upper threshold
+    sigma_lower: 3.0           # astropy.stats.sigma_clipped_stats lower threshold
+    max_iters: 10              # Maximum clipping iterations
 
 spikes:
   spike_order: "both"

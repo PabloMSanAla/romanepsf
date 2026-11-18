@@ -132,24 +132,26 @@ class RomanL2Data:
         if self.sky_std_val is not None and not overwrite:
             return self.sky_bkg_val, self.sky_std_val
 
-        from romanepsf.background import estimate_detector_sky_noisechisel
+        from astropy.stats import sigma_clipped_stats
 
         dq_mask = self.get_effective_mask()
-        sky_map, std_map, sky_val, std_val = estimate_detector_sky_noisechisel(
-            self.data,
-            dq_mask=dq_mask,
-            device=device,
-            verbose=verbose,
-            **kwargs,
-        )
+        valid = self.data[np.isfinite(self.data) & (~dq_mask)] if dq_mask is not None else self.data[np.isfinite(self.data)]
+        if len(valid) > 0:
+            sample = valid if len(valid) <= 100000 else np.random.choice(valid, size=100000, replace=False)
+            _, med, std = sigma_clipped_stats(sample, sigma_lower=3.0, sigma_upper=2.0, maxiters=10)
+            sky_val = float(med) if np.isfinite(med) else 0.0
+            std_val = float(std) if (np.isfinite(std) and std > 0.0) else 1.0
+        else:
+            sky_val = 0.0
+            std_val = 1.0
+
         if subtract_sky:
-            self.data = (self.data - sky_map).astype(np.float32)
+            self.data = (self.data - sky_val).astype(np.float32)
 
         self.sky_bkg_val = float(sky_val)
         self.sky_std_val = float(std_val)
         self.sky_bkg = None
         self.sky_std = None
-        del sky_map, std_map
 
         return self.sky_bkg_val, self.sky_std_val
 
@@ -244,7 +246,7 @@ def load_l2_image(
     asdf_path: Union[str, Path],
     calibrate: bool = True,
     validate_shape: bool = True,
-    subtract_sky: bool = True,
+    subtract_sky: bool = False,
     device: Optional[str] = "auto",
 ) -> RomanL2Data:
     """
@@ -383,25 +385,30 @@ def load_l2_image(
         sky_bkg_val: Optional[float] = None
         sky_std_val: Optional[float] = None
 
-        # Run NoiseChisel and subtract sky directly from data, returning only scalar values
+        # Background estimation & optional detector-level subtraction
         if subtract_sky and calibrate:
             try:
-                from romanepsf.background import estimate_detector_sky_noisechisel
+                from astropy.stats import sigma_clipped_stats
+
                 dq_effective = get_effective_mask(cal_data, dq)
-                sky_map, std_map, s_val, n_val = estimate_detector_sky_noisechisel(
-                    cal_data, dq_mask=dq_effective, device=device
-                )
-                cal_data = (cal_data - sky_map).astype(np.float32)
-                sky_bkg_val = float(s_val)
-                sky_std_val = float(n_val)
-                del sky_map, std_map
+                valid = cal_data[np.isfinite(cal_data) & (~dq_effective)]
+                if len(valid) > 0:
+                    sample = valid if len(valid) <= 100000 else np.random.choice(valid, size=100000, replace=False)
+                    _, med, std = sigma_clipped_stats(sample, sigma_lower=3.0, sigma_upper=2.0, maxiters=10)
+                    sky_bkg_val = float(med) if np.isfinite(med) else 0.0
+                    sky_std_val = float(std) if (np.isfinite(std) and std > 0.0) else 1.0
+                else:
+                    sky_bkg_val = 0.0
+                    sky_std_val = 1.0
+
+                cal_data = (cal_data - sky_bkg_val).astype(np.float32)
                 logger.info(
-                    f"Subtracted NoiseChisel detector sky background ({sky_bkg_val:.5f} MJy/sr), "
-                    f"sky std: {sky_std_val:.5f} [device={device}]"
+                    f"Subtracted detector sky background ({sky_bkg_val:.5f} MJy/sr), "
+                    f"sky std: {sky_std_val:.5f}"
                 )
             except Exception as exc:
                 logger.warning(
-                    f"NoiseChisel execution during load_l2_image failed: {exc}. "
+                    f"Sky estimation during load_l2_image failed: {exc}. "
                     "Skipping sky subtraction."
                 )
                 sky_bkg_val = 0.0
