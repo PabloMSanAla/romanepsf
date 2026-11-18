@@ -443,3 +443,27 @@ class TestAssembleCompositeExtendedPSF:
         assert b_start < b_end
         assert r_max <= b_end
         assert r_min < r_max
+
+    def test_medium_bright_blend_never_collapses_to_single_pixel(self):
+        """Verify Medium-Bright blend maintains proper blend width (e.g. [30, 48] px) and never collapses to 1 px."""
+        from romanepsf.config import OverlapAnnulusConfig
+
+        # Test with medium stamp size 201 (radius 100.5 px) under auto/depth mode
+        cfg_mb_auto = OverlapAnnulusConfig(
+            r_min=22.0, r_max=45.0, blend_start=30.0, blend_end=48.0,
+            mode="auto", norm_depth=(20.0, 23.0), blend_depth=(25.0, 27.0),
+        )
+        r_min, r_max, b_start, b_end = cfg_mb_auto.resolve_radii(mag=11.0, pixel_scale=0.11, max_stamp_radius=100.5)
+        blend_width = b_end - b_start
+        assert blend_width >= 10.0, f"Blend width collapsed to {blend_width} px ({b_start}-{b_end})"
+        assert b_start == 30.0 and b_end == 48.0
+
+        # Test with pixel mode (default for overlap_mb)
+        cfg_mb_pixel = OverlapAnnulusConfig(
+            r_min=22.0, r_max=45.0, blend_start=30.0, blend_end=48.0,
+            mode="pixel",
+        )
+        r_min_p, r_max_p, b_start_p, b_end_p = cfg_mb_pixel.resolve_radii(mag=11.0, pixel_scale=0.11, max_stamp_radius=100.5)
+        assert b_start_p == 30.0
+        assert b_end_p == 48.0
+        assert b_end_p - b_start_p == 18.0

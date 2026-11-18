@@ -348,10 +348,33 @@ class OverlapAnnulusConfig:
             # Safety clamping to stay inside the inner stamp footprint
             if max_stamp_radius is not None and max_stamp_radius > 2.0:
                 cap = float(max_stamp_radius) * 0.95
-                b_end_calc = min(b_end_calc, cap)
-                b_start_calc = min(b_start_calc, b_end_calc - 1.0)
-                r_max_calc = min(r_max_calc, b_end_calc)
-                r_min_calc = min(r_min_calc, r_max_calc - 1.0)
+                if b_start_calc >= cap - 5.0 or b_end_calc > cap:
+                    if (
+                        self.blend_start is not None
+                        and self.blend_end is not None
+                        and float(self.blend_end) <= cap
+                    ):
+                        b_start_calc = float(self.blend_start)
+                        b_end_calc = float(self.blend_end)
+                    else:
+                        b_end_calc = min(b_end_calc, cap)
+                        min_width = max(15.0, min(25.0, 0.25 * cap))
+                        b_start_calc = max(2.0, b_end_calc - min_width)
+                else:
+                    b_end_calc = min(b_end_calc, cap)
+                    b_start_calc = min(b_start_calc, b_end_calc - 1.0)
+
+                if r_max_calc > cap:
+                    if (
+                        self.r_min is not None
+                        and self.r_max is not None
+                        and float(self.r_max) <= cap
+                    ):
+                        r_min_calc = float(self.r_min)
+                        r_max_calc = float(self.r_max)
+                    else:
+                        r_max_calc = min(r_max_calc, b_start_calc)
+                        r_min_calc = min(r_min_calc, r_max_calc - 1.0)
 
             return float(r_min_calc), float(r_max_calc), float(b_start_calc), float(b_end_calc)
 
@@ -373,7 +396,7 @@ class AssemblySection:
     ))
     overlap_mb: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(
         r_min=22.0, r_max=45.0, blend_start=30.0, blend_end=48.0,
-        mode="auto", norm_depth=(20.0, 23.0), blend_depth=(25.0, 27.0)
+        mode="pixel", norm_depth=None, blend_depth=None
     ))
     normalize_flux: bool = True
     oversampling_faint: int = 4
