@@ -88,6 +88,8 @@ def normalize_sca_id(sca: Union[int, str, None], default: str = "wfi01") -> str:
         num = int(sca)
     elif isinstance(sca, str):
         s = sca.strip().lower()
+        if s in ("composite", "all", "mosaic"):
+            return s
         if s.startswith("wfi"):
             s = s[3:]
         elif s.startswith("sca"):
@@ -220,6 +222,7 @@ class StampsSection:
     dq_flags_to_mask: List[str] = field(default_factory=lambda: ["DO_NOT_USE", "SATURATED", "DROPOUT"])
     faint_core_protect_finite: bool = True
     background: BackgroundSection = field(default_factory=BackgroundSection)
+    include_debug_cutouts: bool = False
 
     def __post_init__(self):
         if isinstance(self.sizes, dict):

@@ -409,6 +409,7 @@ def process_star_stamps(
     faint_core_protect_finite: bool = True,
     companion_stars: Optional[pd.DataFrame] = None,
     companion_depth: float = 28.0,
+    include_debug_cutouts: bool = False,
 ) -> Dict[str, List[StellarStamp]]:
     """
     Extract, mask, recenter, and align postage stamps for isolated stars grouped by tier.
@@ -466,6 +467,9 @@ def process_star_stamps(
         faint_size = getattr(stamps_cfg.sizes, "faint", faint_size)
         medium_size = getattr(stamps_cfg.sizes, "medium", medium_size)
         faint_core_protect_finite = getattr(stamps_cfg, "faint_core_protect_finite", faint_core_protect_finite)
+        include_debug_cutouts = getattr(stamps_cfg, "include_debug_cutouts", include_debug_cutouts)
+    elif isinstance(stamps_cfg, dict) and "include_debug_cutouts" in stamps_cfg:
+        include_debug_cutouts = bool(stamps_cfg["include_debug_cutouts"])
 
     if max_stars_per_tier is None:
         max_stars_per_tier = {"bright": 20, "medium": 50, "faint": 100}
@@ -704,12 +708,7 @@ def process_star_stamps(
             if shift_px == 0.0 and "centroid_shift_px" in row and pd.notna(row["centroid_shift_px"]):
                 shift_px = float(row["centroid_shift_px"])
 
-            debug_dict = {
-                "raw_stamp": raw_cutout,
-                "flux_cutout": flux_cutout,
-                "unaligned_mask": mask,
-                "residual": res_map if res_map is not None else np.zeros_like(flux_cutout),
-                "radial_model": rad_model,
+            debug_dict: Dict[str, Any] = {
                 "conversion_factor": float(getattr(l2_data, "conversion_factor", 1.0)),
                 "is_calibrated": bool(getattr(l2_data, "is_calibrated", True)),
                 "center_stamp": (meas_x_stamp, meas_y_stamp),
@@ -721,13 +720,24 @@ def process_star_stamps(
                 "shift_px": shift_px,
                 "pixel_scale": pixel_scale,
                 "gaia_companions": stamp_companions,
-                "dq_mask": dq_mask_bool,
                 "spike_details": spike_diag,
                 "bkg_val": bkg_val,
                 "bkg_rms": bkg_rms,
                 "bkg_depth": bkg_depth,
                 "bkg_subtracted": subtract_background,
             }
+            if include_debug_cutouts:
+                debug_dict.update({
+                    "raw_stamp": raw_cutout,
+                    "flux_cutout": flux_cutout,
+                    "unaligned_mask": mask,
+                    "residual": res_map if res_map is not None else np.zeros_like(flux_cutout),
+                    "radial_model": rad_model,
+                    "dq_mask": dq_mask_bool,
+                })
+
+            # Clean up intermediate cutout references to lower worker memory
+            del raw_cutout, flux_cutout, mask, res_map, rad_model, dq_mask_bool
 
             stamp_obj = StellarStamp(
                 source_id=row.get("source_id", None),

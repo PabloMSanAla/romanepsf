@@ -334,12 +334,14 @@ def process_single_detector_stamps(
             logger.warning(f"Could not load full Gaia companions for masking ({e}); falling back to target catalog.")
 
         t_stamps_start = time.perf_counter()
+        is_debug = bool(getattr(cfg.pipeline, "debug", None) is not None)
         stamps_dict = process_star_stamps(
             l2_data=l2_data,
             catalog_df=tiered,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
             companion_stars=full_companions,
+            include_debug_cutouts=is_debug,
         )
         t_stamps = time.perf_counter() - t_stamps_start
 
@@ -670,12 +672,14 @@ def run_single_detector(
 
         # 12. Extract Stamps, Bicubic Subpixel Align, and Mask Contaminants (with Spike Protection)
         logger.info(f"Extracting postage stamps for detector {resolved_detector.upper()}...")
+        is_debug = bool(getattr(cfg.pipeline, "debug", None) is not None)
         stamps_by_tier = process_star_stamps(
             l2_data=l2_data,
             catalog_df=tiered_df,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
             companion_stars=full_companions_df,
+            include_debug_cutouts=is_debug,
         )
 
     finally:
@@ -1190,12 +1194,14 @@ def _sca_file_worker_task(
             mag_col=cfg.catalog.mag_col,
         )
 
+        is_debug = bool(getattr(cfg.pipeline, "debug", None) is not None)
         stamps_dict = process_star_stamps(
             l2_data=l2_data,
             catalog_df=tiered,
             spikes_cfg=cfg.spikes,
             stamps_cfg=cfg.stamps,
             companion_stars=refined,
+            include_debug_cutouts=is_debug,
         )
 
         n_b = len(stamps_dict.get("bright", []))
@@ -1566,12 +1572,40 @@ def run_sca_batch_pipeline(
 
     debug_x = int(resolved_cfg.pipeline.debug) if resolved_cfg.pipeline.debug is not None else None
 
+    # Resolve tier caps for streaming reservoir pruning
+    caps = max_stamps_per_tier or {}
+    tier_caps: Dict[str, Optional[int]] = {}
+    for tier in ["bright", "medium", "faint"]:
+        cap = caps.get(tier)
+        if cap is None and hasattr(resolved_cfg.tiers.max_stars_per_tier, tier):
+            cap = getattr(resolved_cfg.tiers.max_stars_per_tier, tier)
+        tier_caps[tier] = int(cap) if cap is not None else None
+
+    def _prune_pooled_stamps(pool: Dict[str, List[StellarStamp]], force: bool = False) -> None:
+        """Streaming reservoir pruning by SNR to keep memory strictly bounded."""
+        if debug_x is not None:
+            return
+        for tier_name in ["bright", "medium", "faint"]:
+            c = tier_caps.get(tier_name)
+            if not c:
+                continue
+            thresh = c if force else int(c * 1.25)
+            if len(pool[tier_name]) > thresh:
+                pool[tier_name].sort(
+                    key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
+                    reverse=True,
+                )
+                pool[tier_name] = pool[tier_name][:c]
+
     if effective_workers <= 1:
         for task in tasks:
             det_name, stamps_dict, stats = _sca_file_worker_task(task)
             detector_summaries.append(stats)
             for tier in ["bright", "medium", "faint"]:
                 pooled_stamps[tier].extend(stamps_dict.get(tier, []))
+            del stamps_dict
+            _prune_pooled_stamps(pooled_stamps)
+
             if debug_x is not None:
                 needed = max(1, debug_x // 3)
                 if (
@@ -1591,6 +1625,8 @@ def run_sca_batch_pipeline(
                 detector_summaries.append(stats)
                 for tier in ["bright", "medium", "faint"]:
                     pooled_stamps[tier].extend(stamps_dict.get(tier, []))
+                del stamps_dict
+                _prune_pooled_stamps(pooled_stamps)
 
                 if completed_count % 10 == 0 or completed_count == len(matching_files):
                     logger.info(
@@ -1599,6 +1635,8 @@ def run_sca_batch_pipeline(
                         f"M={len(pooled_stamps['medium'])}, "
                         f"F={len(pooled_stamps['faint'])}"
                     )
+                    gc.collect()
+
                 if debug_x is not None:
                     needed = max(1, debug_x // 3)
                     if (
@@ -1635,20 +1673,12 @@ def run_sca_batch_pipeline(
             f"stars across tiers: B={len(pooled_stamps['bright'])}, M={len(pooled_stamps['medium'])}, F={len(pooled_stamps['faint'])}"
         )
     else:
-        caps = max_stamps_per_tier or {}
+        _prune_pooled_stamps(pooled_stamps, force=True)
+        gc.collect()
         for tier in ["bright", "medium", "faint"]:
-            cap = caps.get(tier)
-            if cap is None and hasattr(resolved_cfg.tiers.max_stars_per_tier, tier):
-                cap = getattr(resolved_cfg.tiers.max_stars_per_tier, tier)
-
-            if cap and len(pooled_stamps[tier]) > cap:
-                # Keep highest SNR / cleanest stamps
-                pooled_stamps[tier].sort(
-                    key=lambda s: float(np.max(s.data) / max(s.bkg_rms, 1e-4)),
-                    reverse=True,
-                )
-                pooled_stamps[tier] = pooled_stamps[tier][:cap]
-                logger.info(f"Reservoir sampled '{tier}' tier to top {cap} highest SNR stamps.")
+            cap = tier_caps.get(tier)
+            if cap and len(pooled_stamps[tier]) >= cap:
+                logger.info(f"Reservoir sampled '{tier}' tier to top {len(pooled_stamps[tier])} highest SNR stamps.")
 
     logger.info(
         f"Final stamp pool for {target_sca.upper()}: "

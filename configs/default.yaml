@@ -35,7 +35,7 @@ catalog:
 
 tiers:
   bright_limit: 11.0          # F146 < 11.0: Extended Wings & 6-fold Diffraction Spikes
-  faint_limit: 19.0           # 11.0 <= F146 < 19.0: Transition Overlap; F146 >= 19.0: Unsaturated Core
+  faint_limit: 13.0           # 11.0 <= F146 < 13.0: Transition Overlap; F146 >= 13.0: Unsaturated Core
   max_stars_per_tier:
     bright: 20
     medium: 50

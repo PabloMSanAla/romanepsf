@@ -468,3 +468,41 @@ class TestProcessStarStampsIntegration:
         assert len(stamps_dict["faint"]) == 1
         assert stamps_dict["medium"][0].size == 821
         assert stamps_dict["faint"][0].size == 51
+
+    def test_process_star_stamps_debug_cutouts_toggle(self, stamps_module, synthetic_l2_data):
+        """Verify 2D heavy cutouts are stripped when include_debug_cutouts=False, and preserved when True."""
+        df = pd.DataFrame({
+            "source_id": [1],
+            "mag_lambda": [15.0],
+            "x": [250.0],
+            "y": [250.0],
+            "tier": ["medium"],
+        })
+
+        # 1. Default (production mode): include_debug_cutouts=False
+        res_prod = stamps_module.process_star_stamps(
+            synthetic_l2_data, df, include_debug_cutouts=False
+        )
+        dbg_prod = res_prod["medium"][0].debug_info
+        assert dbg_prod is not None
+        assert "center_stamp" in dbg_prod
+        assert "bkg_val" in dbg_prod
+        assert "raw_stamp" not in dbg_prod
+        assert "flux_cutout" not in dbg_prod
+        assert "residual" not in dbg_prod
+        assert "radial_model" not in dbg_prod
+        assert "unaligned_mask" not in dbg_prod
+        assert "dq_mask" not in dbg_prod
+
+        # 2. Debug mode: include_debug_cutouts=True
+        res_dbg = stamps_module.process_star_stamps(
+            synthetic_l2_data, df, include_debug_cutouts=True
+        )
+        dbg_debug = res_dbg["medium"][0].debug_info
+        assert dbg_debug is not None
+        assert "raw_stamp" in dbg_debug
+        assert "flux_cutout" in dbg_debug
+        assert "residual" in dbg_debug
+        assert "radial_model" in dbg_debug
+        assert "unaligned_mask" in dbg_debug
+        assert "dq_mask" in dbg_debug
