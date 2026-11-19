@@ -1314,14 +1314,47 @@ def prefetch_gaia_for_files(
     target_sca = normalize_sca_id(sca_id) if sca_id else None
 
     file_footprints: List[Tuple[Path, Tuple[float, float, float, float, float, float, float]]] = []
-    logger.info(f"Scanning celestial footprints across {len(raw_files)} ASDF file(s)...")
-    for f in raw_files:
+    num_files = len(raw_files)
+    num_workers = min(32, max(4, os.cpu_count() or 8))
+    logger.info(
+        f"Scanning celestial footprints across {num_files} ASDF file(s) "
+        f"using {num_workers} parallel I/O threads..."
+    )
+
+    def _scan_worker(f_path: Path) -> Optional[Tuple[Path, str, Any]]:
+        if target_sca is not None:
+            # Fast-path: skip files for other SCAs if detector is encoded in filename
+            fname_lower = f_path.name.lower()
+            m = re.search(r"_wfi(\d{2})[_\.]", fname_lower)
+            if m and f"wfi{m.group(1)}" != target_sca:
+                return None
         try:
-            det, fp = fast_scan_asdf_footprint(f)
-            if target_sca is None or det == target_sca:
-                file_footprints.append((f, fp))
+            det, fp = fast_scan_asdf_footprint(f_path)
+            return (f_path, det, fp)
         except Exception as err:
-            logger.warning(f"Error scanning footprint for {f.name}: {err}")
+            logger.warning(f"Error scanning footprint for {f_path.name}: {err}")
+            return None
+
+    import concurrent.futures
+
+    completed = 0
+    log_interval = max(50, num_files // 10)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_scan_worker, f): f for f in raw_files}
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            if res is not None:
+                f_path, det, fp = res
+                if target_sca is None or det == target_sca:
+                    file_footprints.append((f_path, fp))
+            completed += 1
+            if completed % log_interval == 0 or completed == num_files:
+                pct = (completed / num_files) * 100.0
+                logger.info(
+                    f"Footprint scan progress: {completed}/{num_files} files scanned "
+                    f"({pct:.0f}% | {len(file_footprints)} matched)..."
+                )
 
     if not file_footprints:
         if target_sca is not None:
