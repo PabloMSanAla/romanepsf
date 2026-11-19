@@ -396,7 +396,7 @@ class AssemblySection:
     ))
     overlap_mb: OverlapAnnulusConfig = field(default_factory=lambda: OverlapAnnulusConfig(
         r_min=22.0, r_max=45.0, blend_start=30.0, blend_end=48.0,
-        mode="pixel", norm_depth=None, blend_depth=None
+        mode="auto", norm_depth=(20.0, 23.0), blend_depth=(25.0, 27.0)
     ))
     normalize_flux: bool = True
     oversampling_faint: int = 4
