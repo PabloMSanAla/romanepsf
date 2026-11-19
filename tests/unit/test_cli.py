@@ -278,3 +278,39 @@ def test_cli_prefetch_gaia_subcommand(tmp_path):
         assert "Gaia prefetch complete: 0 downloaded, 5 already cached, 5 total required tiles" in res.output
         mock_prefetch.assert_called_once()
 
+
+def test_cli_prefetch_all_scas(tmp_path):
+    """Verify '--sca all' or omitted '--sca' passes sca_id=None to prefetch across all SCAs."""
+    runner = CliRunner()
+    file_list = tmp_path / "files.txt"
+    file_list.write_text("file1.asdf\nfile2.asdf\n")
+
+    mock_summary = {
+        "total_files": 2,
+        "scanned_files": 2,
+        "unique_tiles": 12,
+        "cached_tiles": 12,
+        "missing_tiles": 0,
+        "downloaded_tiles": 0,
+        "cache_dir": tmp_path / "gaia",
+    }
+
+    # 1. 'prefetch' with omitted '--sca' -> defaults to all SCAs (sca_id=None)
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch:
+        res = runner.invoke(cli, ["prefetch", "--file-list", str(file_list)])
+        assert res.exit_code == 0
+        assert mock_prefetch.call_args.kwargs["sca_id"] is None
+
+    # 2. 'prefetch --sca all' -> explicitly all SCAs (sca_id=None)
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch:
+        res = runner.invoke(cli, ["prefetch", "--file-list", str(file_list), "--sca", "all"])
+        assert res.exit_code == 0
+        assert mock_prefetch.call_args.kwargs["sca_id"] is None
+
+    # 3. 'run --prefetch-only --sca all' -> explicitly all SCAs (sca_id=None)
+    with patch("romanepsf.pipeline.prefetch_gaia_for_files", return_value=mock_summary) as mock_prefetch:
+        res = runner.invoke(cli, ["run", "--file-list", str(file_list), "--prefetch-only", "--sca", "all"])
+        assert res.exit_code == 0
+        assert mock_prefetch.call_args.kwargs["sca_id"] is None
+
+

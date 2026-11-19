@@ -35,11 +35,13 @@ from romanepsf.config import load_config, Config, resolve_device, normalize_sca_
 
 
 class SCAParamType(click.ParamType):
-    name = "INTEGER (1-18)"
+    name = "INTEGER (1-18) or 'all'"
 
     def convert(self, value, param, ctx):
         if value is None:
             return None
+        if isinstance(value, str) and value.strip().lower() in ("all", "any", "*"):
+            return "all"
         try:
             return normalize_sca_id(value)
         except ValueError as e:
@@ -307,7 +309,10 @@ def run_command(
         from romanepsf.pipeline import prefetch_gaia_for_files
 
         target_source = cfg.data.file_list if cfg.data.file_list is not None else (input_dir or cfg.data.detectors_dir)
-        target_sca = normalize_sca_id(sca or cfg.data.sca) if (sca or cfg.data.sca) else None
+        if sca == "all":
+            target_sca = None
+        else:
+            target_sca = normalize_sca_id(sca or cfg.data.sca) if (sca or cfg.data.sca) else None
         logger.info(
             f"Executing Gaia prefetch-only for {target_source} "
             + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
@@ -325,6 +330,13 @@ def run_command(
             f"{summary['unique_tiles']} total required tiles across {summary['scanned_files']} files."
         )
         return
+
+    if sca == "all":
+        raise click.BadParameter(
+            "Cannot run single-SCA PSF synthesis for 'all' SCAs in 'run' command. "
+            "Please specify a single SCA (1-18) or use 'batch-run' for multi-SCA processing.",
+            param_hint="--sca",
+        )
 
     # If file list is specified, run the high-throughput batch SCA pipeline
     if cfg.data.file_list is not None:
@@ -505,7 +517,10 @@ def batch_command(
     if prefetch_only:
         from romanepsf.pipeline import prefetch_gaia_for_files
 
-        target_sca = normalize_sca_id(cfg.data.sca or (cfg.data.detectors[0] if cfg.data.detectors else "wfi01")) if (sca or cfg.data.sca) else None
+        if sca == "all":
+            target_sca = None
+        else:
+            target_sca = normalize_sca_id(sca or cfg.data.sca) if (sca or cfg.data.sca) else None
         logger.info(
             f"Executing Gaia prefetch-only across file list: {file_list} "
             + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
@@ -642,7 +657,7 @@ def prefetch_gaia_command(
     try:
         from romanepsf.pipeline import prefetch_gaia_for_files
 
-        target_sca = normalize_sca_id(sca) if sca else None
+        target_sca = normalize_sca_id(sca) if (sca and sca != "all") else None
         logger.info(
             f"Prefetching Gaia tiles for {target_source} "
             + (f"for SCA: {target_sca.upper()}" if target_sca else "across all SCAs")
