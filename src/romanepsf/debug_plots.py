@@ -674,13 +674,13 @@ def generate_debug_figure3_profile_normalization(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(0.1, 520.0)
-    ax.set_ylim(1e-11, 1e-2)
+    ax.set_ylim(1e-11, 1.0)
 
     ax.set_xlabel("Radius from Centroid (pixels)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_ylabel("Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_title(
         "Debug Figure 3: Radial Profile Normalization & Overlap Calibration\n"
-        "(Unnormalized Dotted vs. Normalized Solid Curves in Shaded Fitting Zones) [Scale: $10^{-11}$ to $10^{-2}$]",
+        "(Unnormalized Dotted vs. Normalized Solid Curves in Shaded Fitting Zones) [Scale: $10^{-11}$ to $1$]",
         color="#58a6ff",
         fontsize=13,
         fontweight="bold",
@@ -829,7 +829,7 @@ def generate_debug_figure5_final_profile(
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlim(0.1, 520.0)
-    ax.set_ylim(1e-11, 1e-2)
+    ax.set_ylim(1e-11, 1.0)
 
     ax.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=11, labelpad=8)
     ax.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=11, labelpad=8)
@@ -838,7 +838,7 @@ def generate_debug_figure5_final_profile(
 
     ax.set_title(
         f"Debug Figure 5: Final Composite Profile & Contributing Stars ({sca_name.upper()})\n"
-        f"[Scale: $10^{{-11}}$ to $10^{{-2}}$ | Total Normalized Stars: {len(star_profiles)}]",
+        f"[Scale: $10^{{-11}}$ to $1$ | Total Normalized Stars: {len(star_profiles)}]",
         color="#58a6ff",
         fontsize=13,
         fontweight="bold",

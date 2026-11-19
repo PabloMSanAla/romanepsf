@@ -390,7 +390,7 @@ def generate_diagnostic_plots(
     ax1.set_xscale("log")
     ax1.set_yscale("log")
     ax1.set_xlim(0.1, 520.0)
-    ax1.set_ylim(1e-11, 1e-2)
+    ax1.set_ylim(1e-11, 1.0)
 
     ax1.set_xlabel("Radius from Centroid (pixels, 0.11\"/px)", color="#e6edf3", fontsize=12, labelpad=8)
     ax1.set_ylabel("Normalized Surface Brightness (pixel$^{-1}$)", color="#e6edf3", fontsize=12, labelpad=8)
