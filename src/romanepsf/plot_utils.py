@@ -451,10 +451,10 @@ def generate_diagnostic_plots(
     )
 
     # Highlight annular blending circles
-    circle_fm1 = Circle((0, 0), 10.0 * pixel_scale, fill=False, edgecolor="#00e5ff", linestyle="--", linewidth=1.0, alpha=0.7)
-    circle_fm2 = Circle((0, 0), 18.0 * pixel_scale, fill=False, edgecolor="#00e5ff", linestyle="-", linewidth=1.0, alpha=0.7)
-    circle_mb1 = Circle((0, 0), 30.0 * pixel_scale, fill=False, edgecolor="#ffd600", linestyle="--", linewidth=1.0, alpha=0.7)
-    circle_mb2 = Circle((0, 0), 48.0 * pixel_scale, fill=False, edgecolor="#ffd600", linestyle="-", linewidth=1.0, alpha=0.7)
+    circle_fm1 = Circle((0, 0), blend_fm_start * pixel_scale, fill=False, edgecolor="#00e5ff", linestyle="--", linewidth=1.0, alpha=0.7)
+    circle_fm2 = Circle((0, 0), blend_fm_end * pixel_scale, fill=False, edgecolor="#00e5ff", linestyle="-", linewidth=1.0, alpha=0.7)
+    circle_mb1 = Circle((0, 0), blend_mb_start * pixel_scale, fill=False, edgecolor="#ffd600", linestyle="--", linewidth=1.0, alpha=0.7)
+    circle_mb2 = Circle((0, 0), blend_mb_end * pixel_scale, fill=False, edgecolor="#ffd600", linestyle="-", linewidth=1.0, alpha=0.7)
     ax2.add_patch(circle_fm1)
     ax2.add_patch(circle_fm2)
     ax2.add_patch(circle_mb1)
@@ -506,7 +506,7 @@ def generate_diagnostic_plots(
         f"Filter: F146 ({pixel_scale:.2f}\"/px)\n"
         f"Total Stars: {n_stars_total} [B:{n_bright}, M:{n_med}, F:{n_faint}]\n"
         f"Dynamic Range: > 10$^6$\n"
-        f"Annular Blends: [10, 18] & [30, 48] px"
+        f"Annular Blends: [{blend_fm_start:.0f}, {blend_fm_end:.0f}] & [{blend_mb_start:.0f}, {blend_mb_end:.0f}] px"
     )
     ax2.text(
         0.03, 0.04, info_text, transform=ax2.transAxes, color="#e6edf3", fontsize=8.5,

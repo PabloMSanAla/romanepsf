@@ -467,3 +467,55 @@ class TestAssembleCompositeExtendedPSF:
         assert b_start_p == 30.0
         assert b_end_p == 48.0
         assert b_end_p - b_start_p == 18.0
+
+
+class TestNormalizeStampsWithinTier:
+    """Test within-tier photometric normalization to a random reference star."""
+
+    def test_within_tier_normalization_aligns_different_flux_stars(self):
+        from romanepsf.assembly import normalize_stamps_within_tier
+        from romanepsf.stamps import StellarStamp
+
+        # Generate a base 2D Gaussian/Moffat stamp
+        sz = 81
+        cy, cx = (sz - 1) / 2.0, (sz - 1) / 2.0
+        y, x = np.ogrid[:sz, :sz]
+        r = np.hypot(x - cx, y - cy)
+        base_psf = 1.0 / (1.0 + (r / 3.0) ** 2) ** 1.5
+
+        # Create two stars with 4x flux difference in the same tier
+        s1 = StellarStamp(
+            source_id="star_1",
+            tier="medium",
+            mag=15.0,
+            data=(base_psf * 100.0).astype(np.float32),
+            mask=np.zeros((sz, sz), dtype=bool),
+            center_original=(cx, cy),
+            size=sz,
+        )
+        s2 = StellarStamp(
+            source_id="star_2",
+            tier="medium",
+            mag=13.5,
+            data=(base_psf * 400.0).astype(np.float32),
+            mask=np.zeros((sz, sz), dtype=bool),
+            center_original=(cx, cy),
+            size=sz,
+        )
+
+        norm_stamps = normalize_stamps_within_tier(
+            [s1, s2],
+            tier_name="medium",
+            norm_depth=(20.0, 23.0),
+            pixel_scale=0.11,
+            random_seed=42,
+        )
+
+        assert len(norm_stamps) == 2
+        # After normalization, both stamps should have nearly identical flux profiles
+        np.testing.assert_allclose(norm_stamps[0].data, norm_stamps[1].data, rtol=1e-3, atol=1e-5)
+        # One star's norm_factor is 1.0, the other's is ~0.25 (or 4.0 depending on which was chosen as reference)
+        factors = [s.norm_factor for s in norm_stamps]
+        assert 1.0 in factors
+        other_factor = [f for f in factors if f != 1.0][0]
+        assert np.isclose(other_factor, 0.25, rtol=1e-2) or np.isclose(other_factor, 4.0, rtol=1e-2)

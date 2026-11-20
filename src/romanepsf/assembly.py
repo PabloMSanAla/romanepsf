@@ -15,6 +15,7 @@ for saturation plateau detection and cross-tier flux scaling factors.
 from typing import Dict, List, Tuple, Optional, Any, Union
 from datetime import datetime, timezone
 from pathlib import Path
+import copy
 import numpy as np
 import torch
 from astropy.io import fits
@@ -270,6 +271,110 @@ def determine_overlap_scale_factor_dual(
     return scale if (np.isfinite(scale) and scale > 0.0) else 1.0
 
 
+def normalize_stamps_within_tier(
+    stamp_list: List[StellarStamp],
+    tier_name: str = "medium",
+    norm_depth: Union[Tuple[float, float], List[float]] = (20.0, 23.0),
+    pixel_scale: float = 0.11,
+    device: Union[str, torch.device] = "cpu",
+    growth_rate: float = 1.03,
+    random_seed: int = 42,
+) -> List[StellarStamp]:
+    """
+    Normalize individual 2D stamps within a magnitude bin (tier) to a common reference star.
+
+    1. Select a random star from the tier to serve as the reference.
+    2. Extract the reference star's 1D radial profile on valid unmasked pixels.
+    3. For each star s_i in the tier:
+       a. Convert norm_depth into a radial range [r_min, r_max] using get_psf_extension_moffat
+          and star s_i's magnitude.
+       b. Extract star s_i's 1D radial profile.
+       c. Compute normalization scale factor k_i = median(P_ref / P_i) across [r_min, r_max].
+       d. Apply k_i to star s_i's 2D stamp data: s_i.data = s_i.data * k_i.
+       e. Record s_i.norm_factor = k_i.
+
+    Returns
+    -------
+    List[StellarStamp]
+        Photometrically aligned stamps within the tier ready for stacking.
+    """
+    if not stamp_list or len(stamp_list) <= 1:
+        return stamp_list
+
+    # Filter candidates that have valid positive data
+    cand_indices = [
+        idx for idx, s in enumerate(stamp_list)
+        if s.data is not None and np.any(np.isfinite(s.data) & (s.data > 0))
+    ]
+    if not cand_indices:
+        return stamp_list
+
+    rng = np.random.RandomState(random_seed)
+    ref_idx = int(rng.choice(cand_indices))
+    ref_star = stamp_list[ref_idx]
+
+    r_ref, p_ref = measure_radial_profile_1d(
+        ref_star.data,
+        mask=ref_star.mask,
+        device=device,
+        growth_rate=growth_rate,
+    )[:2]
+
+    from romanepsf.profile import get_psf_extension_moffat
+
+    d_min = float(norm_depth[0]) if norm_depth else 20.0
+    d_max = float(norm_depth[1]) if norm_depth and len(norm_depth) > 1 else 23.0
+    if d_max <= d_min:
+        d_max = d_min + 1.0
+
+    normalized_stamps: List[StellarStamp] = []
+    for idx, s in enumerate(stamp_list):
+        if idx == ref_idx or s.data is None:
+            s_copy = copy.copy(s)
+            s_copy.norm_factor = 1.0
+            normalized_stamps.append(s_copy)
+            continue
+
+        mag_val = float(s.mag) if (s.mag is not None and np.isfinite(s.mag)) else 15.0
+        r_min_arc = float(get_psf_extension_moffat(mag_val, depth=d_min))
+        r_max_arc = float(get_psf_extension_moffat(mag_val, depth=d_max))
+        r_min = r_min_arc / pixel_scale
+        r_max = r_max_arc / pixel_scale
+
+        max_stamp_r = float(s.data.shape[0] - 1) / 2.0
+        r_min = max(1.0, min(r_min, max_stamp_r - 2.0))
+        r_max = max(r_min + 1.0, min(r_max, max_stamp_r - 0.5))
+
+        r_s, p_s = measure_radial_profile_1d(
+            s.data,
+            mask=s.mask,
+            device=device,
+            growth_rate=growth_rate,
+        )[:2]
+
+        scale = determine_overlap_scale_factor_dual(p_ref, p_s, r_ref, r_s, r_min=r_min, r_max=r_max)
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            mask_ref = ref_star.mask if ref_star.mask is not None else np.zeros_like(ref_star.data, dtype=bool)
+            mask_s = s.mask if s.mask is not None else np.zeros_like(s.data, dtype=bool)
+            v_ref = ref_star.data[(~mask_ref) & np.isfinite(ref_star.data) & (ref_star.data > 0)]
+            v_s = s.data[(~mask_s) & np.isfinite(s.data) & (s.data > 0)]
+            if len(v_ref) > 0 and len(v_s) > 0:
+                scale = float(np.median(v_ref) / np.median(v_s))
+            else:
+                scale = 1.0
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+
+        s_norm = copy.copy(s)
+        s_norm.data = (s.data * float(scale)).astype(s.data.dtype)
+        s_norm.norm_factor = float(scale)
+        normalized_stamps.append(s_norm)
+
+    return normalized_stamps
+
+
 def determine_overlap_scale_factor(
     prof_inner: np.ndarray,
     prof_outer: np.ndarray,
@@ -477,6 +582,60 @@ def assemble_composite_extended_psf(
     if not (has_f or has_m or has_b):
         raise ValueError("Cannot assemble composite extended PSF: all tiers are empty.")
 
+    profile_growth_rate = 1.03
+    if cfg is not None:
+        profile_growth_rate = getattr(cfg, "growth_rate", getattr(cfg, "profile_growth_rate", 1.03))
+
+    faint_mag = float(getattr(cfg, "faint_limit", 19.0)) if cfg is not None else 19.0
+    bright_mag = float(getattr(cfg, "bright_limit", 11.0)) if cfg is not None else 11.0
+    pixel_scale = float(getattr(cfg, "pixel_scale", 0.11)) if cfg is not None else 0.11
+    rand_seed = int(getattr(cfg, "random_seed", 42)) if cfg is not None else 42
+
+    # 1.5. Normalize stamps within each tier to a random reference star using profile
+    # across radii derived from norm_depth and each star's magnitude
+    norm_depth_fm = getattr(fm, "norm_depth", None) if fm is not None else None
+    if norm_depth_fm is None and isinstance(fm, dict):
+        norm_depth_fm = fm.get("norm_depth", None)
+    if norm_depth_fm is None:
+        norm_depth_fm = (20.0, 23.0)
+
+    norm_depth_mb = getattr(mb, "norm_depth", None) if mb is not None else None
+    if norm_depth_mb is None and isinstance(mb, dict):
+        norm_depth_mb = mb.get("norm_depth", None)
+    if norm_depth_mb is None:
+        norm_depth_mb = (20.0, 23.0)
+
+    if has_f:
+        stamps_f = normalize_stamps_within_tier(
+            stamps_f,
+            tier_name="faint",
+            norm_depth=norm_depth_fm,
+            pixel_scale=pixel_scale,
+            device=device,
+            growth_rate=profile_growth_rate,
+            random_seed=rand_seed,
+        )
+    if has_m:
+        stamps_m = normalize_stamps_within_tier(
+            stamps_m,
+            tier_name="medium",
+            norm_depth=norm_depth_mb,
+            pixel_scale=pixel_scale,
+            device=device,
+            growth_rate=profile_growth_rate,
+            random_seed=rand_seed + 1,
+        )
+    if has_b:
+        stamps_b = normalize_stamps_within_tier(
+            stamps_b,
+            tier_name="bright",
+            norm_depth=norm_depth_mb,
+            pixel_scale=pixel_scale,
+            device=device,
+            growth_rate=profile_growth_rate,
+            random_seed=rand_seed + 2,
+        )
+
     # 2. Stack available tiers individually in 2D
     psf_faint, cov_faint = (
         stack_tier_stamps_torch(stamps_f, device=device, sigma_clip=stack_sigma)
@@ -494,10 +653,6 @@ def assemble_composite_extended_psf(
         else (None, None)
     )
 
-    profile_growth_rate = 1.03
-    if cfg is not None:
-        profile_growth_rate = getattr(cfg, "growth_rate", getattr(cfg, "profile_growth_rate", 1.03))
-
     # 3. Extract 1D radial profiles strictly with coverage masks (Defect 1 fix)
     r_f, prof_f = (
         measure_radial_profile_1d(psf_faint, mask=(cov_faint == 0), device=device, growth_rate=profile_growth_rate)[:2]
@@ -514,11 +669,6 @@ def assemble_composite_extended_psf(
         if has_b
         else (None, None)
     )
-
-    # Resolve normalization and blending radii (from depths or explicit pixels)
-    faint_mag = float(getattr(cfg, "faint_limit", 19.0)) if cfg is not None else 19.0
-    bright_mag = float(getattr(cfg, "bright_limit", 11.0)) if cfg is not None else 11.0
-    pixel_scale = float(getattr(cfg, "pixel_scale", 0.11)) if cfg is not None else 0.11
 
     max_faint_r = (psf_faint.shape[0] / 2.0) if psf_faint is not None else None
     max_medium_r = (psf_medium.shape[0] / 2.0) if psf_medium is not None else None
@@ -867,6 +1017,7 @@ __all__ = [
     "measure_radial_profile_1d",
     "determine_overlap_scale_factor_dual",
     "determine_overlap_scale_factor",
+    "normalize_stamps_within_tier",
     "blend_2d_annular_profiles",
     "_embed_or_crop_canvas",
     "assemble_composite_extended_psf",
